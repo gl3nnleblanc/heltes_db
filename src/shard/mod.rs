@@ -72,6 +72,10 @@ pub struct ShardState {
     pub versions: HashMap<Key, Vec<Version>>,
     /// Buffered (uncommitted) writes per transaction.
     pub write_buff: HashMap<TxId, HashMap<Key, Value>>,
+    /// O(1) write-lock index: maps each key to the transaction that currently holds
+    /// a buffered write for it (write_key_owner in TLA+).
+    /// Invariant: write_keys[k] = tx_id  iff  write_buff[tx_id][k] exists.
+    pub write_keys: HashMap<Key, TxId>,
     /// Prepared transactions and their prepare timestamps.
     pub prepared: HashMap<TxId, Timestamp>,
     /// Transactions that have been aborted at this shard.
@@ -86,6 +90,7 @@ impl ShardState {
             clock: 0,
             versions: HashMap::new(),
             write_buff: HashMap::new(),
+            write_keys: HashMap::new(),
             prepared: HashMap::new(),
             aborted: HashSet::new(),
         }
@@ -223,12 +228,8 @@ impl ShardState {
             return UpdateResult::Abort;
         }
 
-        // WriteBuffConflict: any other non-aborted tx already buffered a write to this key,
-        // regardless of whether it is prepared. A prepared tx retains its write in write_buff
-        // until commit, so the lock persists.
-        let write_buff_conflict = self.write_buff.iter().any(|(&other, wb)| {
-            other != tx_id && !self.aborted.contains(&other) && wb.contains_key(&key)
-        });
+        // WriteBuffConflict: O(1) index lookup — any other tx holds the write lock for key.
+        let write_buff_conflict = self.write_keys.get(&key).map(|&owner| owner != tx_id).unwrap_or(false);
         if write_buff_conflict {
             self.aborted.insert(tx_id);
             return UpdateResult::Abort;
@@ -239,6 +240,8 @@ impl ShardState {
             .entry(tx_id)
             .or_default()
             .insert(key, value);
+        // Acquire the write lock for this key in the O(1) index.
+        self.write_keys.insert(key, tx_id);
         self.clock = self.clock.max(start_ts);
         UpdateResult::Ok
     }
@@ -268,6 +271,8 @@ impl ShardState {
     pub fn handle_commit(&mut self, tx_id: TxId, commit_ts: Timestamp) {
         if let Some(writes) = self.write_buff.remove(&tx_id) {
             for (key, value) in writes {
+                // Release write lock.
+                self.write_keys.remove(&key);
                 let vs = self.versions.entry(key).or_default();
                 // Idempotent: skip if this timestamp is already installed.
                 if !vs.iter().any(|v| v.timestamp == commit_ts) {
@@ -285,7 +290,11 @@ impl ShardState {
     /// `prepared`.
     pub fn handle_abort(&mut self, tx_id: TxId) {
         self.aborted.insert(tx_id);
-        self.write_buff.remove(&tx_id);
+        if let Some(writes) = self.write_buff.remove(&tx_id) {
+            for key in writes.into_keys() {
+                self.write_keys.remove(&key);
+            }
+        }
         self.prepared.remove(&tx_id);
     }
 }

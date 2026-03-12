@@ -10,7 +10,6 @@
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
-- **WriteBuffConflict scan is O(write_buff size)** — currently a linear scan over all buffered writes; a per-key index would make conflict detection O(1) _(3 pts)_
 
 ## Durability
 

@@ -1390,3 +1390,176 @@
             last_ct = ct;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // write_keys index — TLA+ trace corpus
+    // Traces: WriteKeyOwnerConsistent invariant, ShardHandleUpdate (success +
+    // conflict), ShardHandleCommit, ShardHandleAbort paths.
+    // -----------------------------------------------------------------------
+
+    // Trace: Init — write_key_owner[k] = NONE for all k.
+    #[test]
+    fn write_keys_empty_initially() {
+        let s = shard();
+        assert!(s.write_keys.is_empty());
+    }
+
+    // Trace: ShardHandleUpdate OK — write_key_owner[K1] set to T1.
+    #[test]
+    fn write_keys_populated_on_successful_update() {
+        let mut s = shard();
+        assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+    }
+
+    // Trace: ShardHandleUpdate OK for a different key — only that key indexed.
+    #[test]
+    fn write_keys_only_indexes_written_key() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+        assert!(!s.write_keys.contains_key(&K2));
+    }
+
+    // Trace: WriteBuffConflictFast — T1 holds K1; T2 update to K1 aborts.
+    #[test]
+    fn write_keys_detects_conflict_for_second_writer() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        // T2 starts later, tries to write same key.
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Abort);
+        // Index still points to T1 (the original holder).
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+    }
+
+    // Trace: ShardHandleCommit — write_key_owner cleared after commit.
+    #[test]
+    fn write_keys_cleared_after_commit() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 5);
+        assert!(!s.write_keys.contains_key(&K1));
+    }
+
+    // Trace: ShardHandleAbort — write_key_owner cleared after abort.
+    #[test]
+    fn write_keys_cleared_after_abort() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_abort(T1);
+        assert!(!s.write_keys.contains_key(&K1));
+    }
+
+    // Trace: same tx overwrites its own key — index stays pointing to same tx.
+    #[test]
+    fn write_keys_same_tx_overwrite_retains_owner() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        // T1 updates K1 again (idempotent write semantics).
+        assert_eq!(s.handle_update(T1, 1, K1, v(99)), UpdateResult::Ok);
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+    }
+
+    // Trace: sequential writers — T1 commits K1, then T2 can acquire K1.
+    #[test]
+    fn write_keys_sequential_writers_after_commit() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 2);
+        // T2 starts after T1's commit_ts; no conflict.
+        assert_eq!(s.handle_update(T2, 3, K1, v(20)), UpdateResult::Ok);
+        assert_eq!(s.write_keys.get(&K1), Some(&T2));
+    }
+
+    // Trace: sequential writers — T1 aborts, then T2 can acquire K1.
+    #[test]
+    fn write_keys_sequential_writers_after_abort() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_abort(T1);
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
+        assert_eq!(s.write_keys.get(&K1), Some(&T2));
+    }
+
+    // Trace: multi-key tx — all written keys are indexed; commit clears all.
+    #[test]
+    fn write_keys_multi_key_tx_all_indexed_then_cleared() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T1, 1, K2, v(20));
+        s.handle_update(T1, 1, K3, v(30));
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+        assert_eq!(s.write_keys.get(&K2), Some(&T1));
+        assert_eq!(s.write_keys.get(&K3), Some(&T1));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 5);
+        assert!(s.write_keys.is_empty());
+    }
+
+    // Trace: WriteKeyOwnerConsistent — index matches write_buff at every step.
+    #[test]
+    fn write_keys_consistent_with_write_buff_throughout() {
+        let mut s = shard();
+
+        let consistent = |s: &ShardState| {
+            // Every entry in write_keys must point to a tx that has that key in write_buff.
+            for (&key, &owner) in &s.write_keys {
+                assert!(
+                    s.write_buff.get(&owner).map(|wb| wb.contains_key(&key)).unwrap_or(false),
+                    "write_keys[{key}] = {owner} but write_buff[{owner}] has no key {key}"
+                );
+            }
+            // Every key in every write_buff must be in write_keys pointing back to its tx.
+            for (&tx_id, wb) in &s.write_buff {
+                for &key in wb.keys() {
+                    assert_eq!(
+                        s.write_keys.get(&key),
+                        Some(&tx_id),
+                        "write_buff[{tx_id}] has key {key} but write_keys[{key}] != {tx_id}"
+                    );
+                }
+            }
+        };
+
+        consistent(&s);
+        s.handle_update(T1, 1, K1, v(10));
+        consistent(&s);
+        s.handle_update(T1, 1, K2, v(20));
+        consistent(&s);
+        s.handle_prepare(T1);
+        consistent(&s);
+        s.handle_commit(T1, 5);
+        consistent(&s);
+        s.handle_update(T2, 6, K1, v(30));
+        consistent(&s);
+        s.handle_abort(T2);
+        consistent(&s);
+    }
+
+    // Trace: index preserved through prepare phase — write lock held until commit.
+    #[test]
+    fn write_keys_held_through_prepare_phase() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        // After prepare, T1 still holds the write lock.
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+        // T2 attempting to write K1 while T1 is prepared → abort.
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Abort);
+    }
+
+    // Trace: aborted tx that never successfully wrote — index not polluted.
+    #[test]
+    fn write_keys_failed_update_does_not_pollute_index() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        // T2 fails to write K1 (conflict with T1).
+        s.handle_update(T2, 2, K1, v(20));
+        // Index still has T1, not T2.
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+        // Explicit abort of T2 (coordinator sends ABORT) doesn't disturb T1's lock.
+        s.handle_abort(T2);
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+    }

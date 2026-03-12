@@ -59,17 +59,21 @@ VARIABLES
     tx_state,       \* tx_state[id]      : TxStateSet (see below)
 
     \* -- Shard state --
-    s_clock,        \* s_clock[shard]    : Nat
-    versions,       \* versions[k]       : SUBSET (Value x Timestamp)  (MVCC history)
-    write_buff,     \* write_buff[id]    : SUBSET (Key x Value)         (buffered writes)
-    s_prepared,     \* s_prepared[shard] : SUBSET (TxId x Timestamp)   (id -> prep_t)
-    s_aborted,      \* s_aborted[shard]  : SUBSET TxIds
+    s_clock,        \* s_clock[shard]       : Nat
+    versions,       \* versions[k]          : SUBSET (Value x Timestamp)  (MVCC history)
+    write_buff,     \* write_buff[id]       : SUBSET (Key x Value)         (buffered writes)
+    write_key_owner,\* write_key_owner[k]   : TxId | NONE  (O(1) write-lock index; NONE = unlocked)
+                    \*   Refinement of write_buff: write_key_owner[k] = id iff
+                    \*   ∃ kv ∈ write_buff[id] : kv[1] = k ∧ id ∉ s_aborted[ShardOf[k]]
+                    \*   Maintained by ShardHandleUpdate (set), ShardHandleCommit/Abort (clear).
+    s_prepared,     \* s_prepared[shard]    : SUBSET (TxId x Timestamp)   (id -> prep_t)
+    s_aborted,      \* s_aborted[shard]     : SUBSET TxIds
 
     \* -- Network --
     msgs            \* msgs : SUBSET Message  (unordered, duplicates allowed)
 
 vars == <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-          s_clock, versions, write_buff, s_prepared, s_aborted, msgs>>
+          s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
 
 ------------------------------------------------------------------------
 (* Types *)
@@ -84,10 +88,11 @@ TypeInvariant ==
     /\ participants  \in [TxIds -> SUBSET Shards]
     /\ tx_state      \in [TxIds -> TxStateSet]
     /\ s_clock       \in [Shards -> Timestamps]
-    /\ versions      \in [Keys -> SUBSET (Values \X Timestamps)]
-    /\ write_buff    \in [TxIds -> SUBSET (Keys \X Values)]
-    /\ s_prepared    \in [Shards -> SUBSET (TxIds \X Timestamps)]
-    /\ s_aborted     \in [Shards -> SUBSET TxIds]
+    /\ versions         \in [Keys -> SUBSET (Values \X Timestamps)]
+    /\ write_buff       \in [TxIds -> SUBSET (Keys \X Values)]
+    /\ write_key_owner  \in [Keys -> TxIds \cup {NONE}]
+    /\ s_prepared       \in [Shards -> SUBSET (TxIds \X Timestamps)]
+    /\ s_aborted        \in [Shards -> SUBSET TxIds]
 
 ------------------------------------------------------------------------
 (* Message constructors *)
@@ -137,6 +142,21 @@ WriteBuffConflict(s, k, id) ==
         /\ other \notin s_aborted[s]
         /\ \E kv \in write_buff[other] : kv[1] = k
 
+\* O(1) equivalent of WriteBuffConflict using the write_key_owner index.
+\* Correct whenever WriteKeyOwnerConsistent holds.
+WriteBuffConflictFast(k, id) ==
+    write_key_owner[k] # NONE /\ write_key_owner[k] # id
+
+\* Consistency invariant for the write_key_owner index:
+\*   - If write_key_owner[k] = NONE then no non-aborted tx has k in its write_buff.
+\*   - If write_key_owner[k] = id  then id has k in its write_buff.
+WriteKeyOwnerConsistent ==
+    \A k \in Keys :
+        IF write_key_owner[k] = NONE
+        THEN \A id \in TxIds :
+                 \A kv \in write_buff[id] : kv[1] # k
+        ELSE \E kv \in write_buff[write_key_owner[k]] : kv[1] = k
+
 \* Max of a non-empty set of naturals
 MaxOf(S) == CHOOSE x \in S : \A y \in S : y <= x
 
@@ -150,12 +170,13 @@ Init ==
     /\ is_committed = [id \in TxIds |-> FALSE]
     /\ participants = [id \in TxIds |-> {}]
     /\ tx_state     = [id \in TxIds |-> "IDLE"]
-    /\ s_clock      = [s \in Shards |-> 0]
-    /\ versions     = [k \in Keys |-> {}]
-    /\ write_buff   = [id \in TxIds |-> {}]
-    /\ s_prepared   = [s \in Shards |-> {}]
-    /\ s_aborted    = [s \in Shards |-> {}]
-    /\ msgs         = {}
+    /\ s_clock          = [s  \in Shards |-> 0]
+    /\ versions         = [k  \in Keys   |-> {}]
+    /\ write_buff       = [id \in TxIds  |-> {}]
+    /\ write_key_owner  = [k  \in Keys   |-> NONE]
+    /\ s_prepared       = [s  \in Shards |-> {}]
+    /\ s_aborted        = [s  \in Shards |-> {}]
+    /\ msgs             = {}
 
 ------------------------------------------------------------------------
 (* Coordinator actions *)
@@ -172,14 +193,14 @@ CoordStartTx(id) ==
     /\ c_clock'      = [c_clock      EXCEPT ![coord] = t]
     /\ is_committed' = [is_committed EXCEPT ![id]    = FALSE]
     /\ participants' = [participants EXCEPT ![id]    = {}]
-    /\ UNCHANGED <<commit_t, s_clock, versions, write_buff, s_prepared, s_aborted, msgs>>
+    /\ UNCHANGED <<commit_t, s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
 
 \* read(id, k): send READ_KEY to the owning shard
 CoordRead(id, k) ==
     /\ tx_state[id] = "ACTIVE"
     /\ Send(ReadKeyMsg(id, start_t[id], k))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* update(id, k, v): track participant shard, send UPDATE_KEY
 CoordUpdate(id, k, v) ==
@@ -187,7 +208,7 @@ CoordUpdate(id, k, v) ==
     /\ participants' = [participants EXCEPT ![id] = @ \cup {ShardOf[k]}]
     /\ Send(UpdateKeyMsg(id, start_t[id], k, v))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, tx_state,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* Coordinator receives an ABORT reply from a read or update operation
 CoordAbortOnReply(id) ==
@@ -197,7 +218,7 @@ CoordAbortOnReply(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
     /\ SendAll({AbortMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* commit_tx(id): send PREPARE to all participant shards (2PC phase 1)
 \* Guard: all UPDATE_KEY messages for this tx have received OK replies,
@@ -211,7 +232,7 @@ CoordBeginCommit(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "PREPARING"]
     /\ SendAll({PrepareMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* After receiving all PREPARE_REPLYs: compute commit_t, enter COMMIT_WAIT
 \* commit_t = max(clock, all prepare timestamps)
@@ -234,7 +255,7 @@ CoordFinalizePrepare(id) ==
     \* ensuring SI2 (unique commit timestamps).
     /\ c_clock'   = [c_clock   EXCEPT ![coord] = ct + 1]
     /\ UNCHANGED <<start_t, is_committed, participants, s_clock, versions,
-                   write_buff, s_prepared, s_aborted, msgs>>
+                   write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
 
 \* Commit-wait passes (now().earliest > commit_t): send COMMIT to all participants.
 \* In the logical clock model we abstract TrueTime commit-wait as: some other
@@ -249,7 +270,7 @@ CoordSendCommit(id) ==
     /\ is_committed'  = [is_committed  EXCEPT ![id] = TRUE]
     /\ SendAll({CommitMsg(id, ct)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, participants,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* Coordinator handles INQUIRE(id, t) from shard s
 CoordHandleInquire(id, s) ==
@@ -267,7 +288,7 @@ CoordHandleInquire(id, s) ==
                       IF m.ts > c_clock[coord] THEN m.ts ELSE c_clock[coord]]
     /\ Send(reply)
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 ------------------------------------------------------------------------
 (* Shard actions *)
@@ -306,7 +327,7 @@ ShardHandleRead(s, id, k) ==
     /\ s_clock' = [s_clock EXCEPT ![s] = IF t > s_clock[s] THEN t ELSE s_clock[s]]
     /\ Send(reply)
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   versions, write_buff, s_prepared, s_aborted>>
+                   versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* Shard initiates INQUIRE for a prepared writer of k before replying to a read.
 \* (Separate action so model checker can interleave it.)
@@ -326,7 +347,7 @@ ShardSendInquire(s, id, prepId, k) ==
              /\ r.to   = s)
     /\ Send(InquireMsg(prepId, t, s))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
 \* Shard handles UPDATE_KEY(id, t, k, v)
 \*
@@ -344,16 +365,17 @@ ShardHandleUpdate(s, id, k, v) ==
        THEN \* Already aborted at this shard
             /\ Send(UpdateKeyReply(id, k, ABORT))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                           s_clock, versions, write_buff, s_prepared, s_aborted>>
-       ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t) \/ WriteBuffConflict(s, k, id)
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+       ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t) \/ WriteBuffConflictFast(k, id)
             THEN \* Write-write conflict — abort
                  /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
                  /\ Send(UpdateKeyReply(id, k, ABORT))
                  /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                                tx_state, s_clock, versions, write_buff, s_prepared>>
+                                tx_state, s_clock, versions, write_buff, write_key_owner, s_prepared>>
             ELSE \* No conflict — buffer the write (overwrite any prior write to k by id)
                  /\ write_buff' = [write_buff EXCEPT ![id] =
                         (@ \ {kv \in @ : kv[1] = k}) \cup {<<k, v>>}]
+                 /\ write_key_owner' = [write_key_owner EXCEPT ![k] = id]
                  /\ s_clock' = [s_clock EXCEPT ![s] =
                         IF t > s_clock[s] THEN t ELSE s_clock[s]]
                  /\ Send(UpdateKeyReply(id, k, "OK"))
@@ -374,7 +396,7 @@ ShardHandlePrepare(s, id) ==
     /\ s_clock'    = [s_clock    EXCEPT ![s] = t]
     /\ Send(PrepareReply(id, t))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   versions, write_buff, s_aborted>>
+                   versions, write_buff, write_key_owner, s_aborted>>
 
 \* Shard handles COMMIT(id, ct) — install buffered writes as new MVCC versions
 ShardHandleCommit(s, id) ==
@@ -388,17 +410,21 @@ ShardHandleCommit(s, id) ==
            IN IF kWrites # {}
               THEN versions[k] \cup {<<(CHOOSE kv \in kWrites : TRUE)[2], ct>>}
               ELSE versions[k]]
-    /\ write_buff'  = [write_buff  EXCEPT ![id] = {}]
-    /\ s_prepared'  = [s_prepared  EXCEPT ![s]  = {p \in @ : p[1] # id}]
+    /\ write_buff'      = [write_buff      EXCEPT ![id] = {}]
+    /\ write_key_owner' = [k \in Keys |->
+           IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
+    /\ s_prepared'      = [s_prepared      EXCEPT ![s]  = {p \in @ : p[1] # id}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, s_aborted, msgs>>
 
-\* Shard handles ABORT(id) — discard buffered writes, release prepared entry
+\* Shard handles ABORT(id) — discard buffered writes, release prepared entry, unlock write_key_owner
 ShardHandleAbort(s, id) ==
     /\ AbortMsg(id) \in msgs
-    /\ s_aborted'  = [s_aborted  EXCEPT ![s]  = @ \cup {id}]
-    /\ write_buff' = [write_buff EXCEPT ![id] = {}]
-    /\ s_prepared' = [s_prepared EXCEPT ![s]  = {p \in @ : p[1] # id}]
+    /\ s_aborted'       = [s_aborted       EXCEPT ![s]  = @ \cup {id}]
+    /\ write_buff'      = [write_buff       EXCEPT ![id] = {}]
+    /\ write_key_owner' = [k \in Keys |->
+           IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
+    /\ s_prepared'      = [s_prepared       EXCEPT ![s]  = {p \in @ : p[1] # id}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, msgs>>
 
@@ -477,7 +503,7 @@ SI4 ==
             /\ commit_t[id1] > start_t[id2]
             /\ commit_t[id2] > start_t[id1])
 
-HeltesDBInvariant == TypeInvariant /\ SI2 /\ SI3 /\ SI4
+HeltesDBInvariant == TypeInvariant /\ WriteKeyOwnerConsistent /\ SI2 /\ SI3 /\ SI4
 
 ------------------------------------------------------------------------
 
