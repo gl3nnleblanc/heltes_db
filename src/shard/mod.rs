@@ -51,6 +51,14 @@ pub enum PrepareResult {
     Abort,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum FastCommitResult {
+    /// All writes installed; returned commit_ts = shard_clock + 1 at call time.
+    Ok(Timestamp),
+    /// Transaction was already aborted.
+    Abort,
+}
+
 /// The coordinator's answer to an INQUIRE for a prepared transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InquiryStatus {
@@ -298,6 +306,36 @@ impl ShardState {
         }
         self.prepared.remove(&tx_id);
         self.prune_aborted();
+    }
+
+    /// Handle FAST_COMMIT(id) — single-shard optimisation.
+    ///
+    /// Atomically prepares and commits the transaction: assigns
+    /// `commit_ts = clock + 1`, installs all buffered writes as MVCC versions,
+    /// clears the write buffer, advances the shard clock, and calls
+    /// `prune_aborted`. This replaces the separate PREPARE + COMMIT round trip.
+    ///
+    /// Returns `Abort` if the transaction is already aborted at this shard;
+    /// `Ok(commit_ts)` otherwise.
+    pub fn handle_fast_commit(&mut self, tx_id: TxId) -> FastCommitResult {
+        if self.aborted.contains(&tx_id) {
+            return FastCommitResult::Abort;
+        }
+        let commit_ts = self.clock + 1;
+        self.clock = commit_ts;
+        if let Some(writes) = self.write_buff.remove(&tx_id) {
+            for (key, value) in writes {
+                self.write_keys.remove(&key);
+                let vs = self.versions.entry(key).or_default();
+                if !vs.iter().any(|v| v.timestamp == commit_ts) {
+                    vs.push(Version { value, timestamp: commit_ts });
+                    vs.sort_by_key(|v| v.timestamp);
+                }
+            }
+        }
+        self.prepared.remove(&tx_id);
+        self.prune_aborted();
+        FastCommitResult::Ok(commit_ts)
     }
 
     /// Prune entries from `aborted` that are safe to discard.

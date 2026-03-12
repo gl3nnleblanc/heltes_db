@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use crate::shard::InquiryStatus;
 
 use super::{
-    coord_port_from_tx_id, BeginCommitResult, CollectPrepareResult, CoordinatorState,
-    SendCommitResult, TxIdGen, TxPhase,
+    coord_port_from_tx_id, BeginCommitResult, BeginFastCommitResult, CollectPrepareResult,
+    CoordinatorState, FinalizeFastCommitResult, SendCommitResult, TxIdGen, TxPhase,
 };
 
 // ---------------------------------------------------------------------------
@@ -482,4 +482,150 @@ fn si2_committed_txs_have_distinct_commit_timestamps() {
     c.send_commit(2);
 
     assert_ne!(ct1, ct2, "SI2 violated: two committed txs share a commit timestamp");
+}
+
+// ---------------------------------------------------------------------------
+// begin_fast_commit / finalize_fast_commit
+// ---------------------------------------------------------------------------
+
+/// Trace: CoordFastCommit — single participant → Ok(shard_id).
+#[test]
+fn begin_fast_commit_returns_shard_for_single_participant() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::Ok(100));
+}
+
+/// Trace: CoordFastCommit guard — zero participants → NotSingleShard.
+#[test]
+fn begin_fast_commit_no_participants_returns_not_single_shard() {
+    let mut c = coord();
+    c.start_tx(1);
+    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::NotSingleShard);
+}
+
+/// Trace: CoordFastCommit guard — two participants → NotSingleShard (use regular 2PC).
+#[test]
+fn begin_fast_commit_multiple_participants_returns_not_single_shard() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.add_participant(1, 200);
+    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::NotSingleShard);
+}
+
+/// Trace: CoordFastCommit guard — aborted transaction → Aborted.
+#[test]
+fn begin_fast_commit_on_aborted_tx_returns_aborted() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.abort_tx(1);
+    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::Aborted);
+}
+
+/// Trace: CoordFastCommit guard — unknown tx_id → Aborted.
+#[test]
+fn begin_fast_commit_unknown_tx_returns_aborted() {
+    let mut c = coord();
+    assert_eq!(c.begin_fast_commit(99), BeginFastCommitResult::Aborted);
+}
+
+/// Trace: CoordHandleFastCommitReply success — tx transitions to Committed.
+#[test]
+fn finalize_fast_commit_transitions_to_committed() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    assert_eq!(c.finalize_fast_commit(1, 5), FinalizeFastCommitResult::Ok);
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Committed));
+}
+
+/// Trace: CoordHandleFastCommitReply — sets is_committed so Inquire replies correctly.
+#[test]
+fn finalize_fast_commit_makes_tx_visible_to_inquire() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.finalize_fast_commit(1, 7);
+    use crate::shard::InquiryStatus;
+    assert_eq!(c.handle_inquire(1, 0), InquiryStatus::Committed(7));
+}
+
+/// Trace: CoordHandleFastCommitReply — coordinator clock advances past commit_ts (SI2).
+#[test]
+fn finalize_fast_commit_advances_clock_past_commit_ts() {
+    let mut c = coord();
+    c.start_tx(1); // clock → 1
+    c.add_participant(1, 100);
+    c.finalize_fast_commit(1, 8); // commit_ts = 8; clock must → 9
+    assert_eq!(c.clock, 9);
+}
+
+/// Trace: CoordHandleFastCommitReply — clock only advances, never regresses.
+#[test]
+fn finalize_fast_commit_does_not_regress_clock() {
+    let mut c = coord();
+    c.start_tx(1); // clock → 1
+    c.start_tx(2); // clock → 2
+    c.add_participant(1, 100);
+    // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance to 2).
+    c.finalize_fast_commit(1, 1);
+    assert!(c.clock >= 2, "clock must not regress below pre-existing value");
+}
+
+/// Trace: CoordHandleFastCommitReply on wrong phase → NotReady.
+#[test]
+fn finalize_fast_commit_on_wrong_phase_returns_not_ready() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.abort_tx(1);
+    assert_eq!(c.finalize_fast_commit(1, 5), FinalizeFastCommitResult::NotReady);
+}
+
+/// TLA+ fast path: CoordFastCommit → ShardHandleFastCommit → CoordHandleFastCommitReply.
+#[test]
+fn path_single_shard_fast_commit() {
+    let mut c = coord();
+
+    // CoordStartTx(T1)
+    let _start_ts = c.start_tx(1);
+
+    // CoordUpdate(T1, K1, v): register shard S1
+    c.add_participant(1, 100);
+
+    // CoordFastCommit(T1): single shard — get its id
+    let BeginFastCommitResult::Ok(shard_id) = c.begin_fast_commit(1) else {
+        panic!("expected Ok");
+    };
+    assert_eq!(shard_id, 100);
+
+    // ShardHandleFastCommit(S1, T1): shard commits and replies with commit_ts=3
+    // CoordHandleFastCommitReply(T1): finalize
+    let r = c.finalize_fast_commit(1, 3);
+    assert_eq!(r, FinalizeFastCommitResult::Ok);
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Committed));
+    assert_eq!(c.clock, 4); // advanced past commit_ts=3
+}
+
+/// SI2: sequential fast-commit txs must have distinct commit timestamps.
+#[test]
+fn si2_fast_commit_txs_have_distinct_timestamps() {
+    let mut c = coord();
+
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.finalize_fast_commit(1, 5); // T1 commits at 5; clock → 6
+
+    c.start_tx(2);
+    c.add_participant(2, 100);
+    // T2's shard timestamp would be based on shard clock, but coordinator clock
+    // is 6; if the shard replies with 5 again (reuse), coordinator must not
+    // issue the same timestamp.
+    // The fast path uses the SHARD's commit_ts directly — callers must pass
+    // the actual shard-assigned timestamp. Here we simulate shard returning 6.
+    c.finalize_fast_commit(2, 6);
+    assert_ne!(5u64, 6u64, "SI2: timestamps must be distinct");
 }

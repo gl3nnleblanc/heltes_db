@@ -8,13 +8,15 @@ use tonic::{Request, Response, Status};
 
 use crate::coordinator::{
     coord_port_from_tx_id, routing::ConsistentHashRouter, BeginCommitResult,
-    CollectPrepareResult, CoordinatorState, SendCommitResult, TxIdGen,
+    BeginFastCommitResult, CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult,
+    SendCommitResult, TxIdGen,
 };
 use crate::proto::coordinator_service_client::CoordinatorServiceClient;
 use crate::proto::coordinator_service_server::CoordinatorService;
 use crate::proto::shard_service_client::ShardServiceClient;
 use crate::proto::{
     Abort, AbortRequest as ShardAbortRequest, Active, CommitRequest as ShardCommitRequest,
+    FastCommitRequest as ShardFastCommitRequest,
     InquireReply, InquireRequest, InquiryResult, NeedsInquirySet, PrepareRequest, ReadRequest,
     TxAbortReply, TxAbortRequest, TxBeginReply, TxBeginRequest, TxCommitReply, TxCommitRequest,
     TxReadReply, TxReadRequest, TxUpdateReply, TxUpdateRequest, UpdateRequest,
@@ -231,11 +233,14 @@ impl CoordinatorService for CoordinatorServer {
         Ok(Response::new(TxUpdateReply { result: Some(result) }))
     }
 
-    /// CoordBeginCommit → CoordFinalizePrepare → CoordSendCommit, all blocking.
+    /// Commit a transaction.
     ///
-    /// Dispatches PREPARE to all participant shards concurrently, computes
-    /// commit_ts = max(all prep_ts, c_clock), then dispatches COMMIT
-    /// concurrently. Returns commit_ts on success or Abort if any shard rejects.
+    /// If the transaction touches exactly one shard, the single-shard fast path
+    /// is used: a single `FastCommit` RPC atomically prepares and commits,
+    /// saving one network round trip compared to full 2PC.
+    ///
+    /// For multi-shard transactions the standard 2PC path is used: PREPARE to
+    /// all shards concurrently, then COMMIT concurrently once commit_ts is known.
     async fn commit(
         &self,
         request: Request<TxCommitRequest>,
@@ -244,6 +249,44 @@ impl CoordinatorService for CoordinatorServer {
 
         use crate::proto::tx_commit_reply::Result as TR;
 
+        // ── Fast path: single-shard transaction ──────────────────────────────
+
+        let fast_shard = self.state.lock().unwrap().begin_fast_commit(tx_id);
+        match fast_shard {
+            BeginFastCommitResult::Ok(shard_port) => {
+                let mut client = self.shard_client(shard_port)?;
+                let reply = client
+                    .fast_commit(ShardFastCommitRequest { tx_id })
+                    .await?
+                    .into_inner();
+
+                use crate::proto::fast_commit_reply::Result as R;
+                return match reply.result {
+                    Some(R::CommitTs(commit_ts)) => {
+                        match self.state.lock().unwrap().finalize_fast_commit(tx_id, commit_ts) {
+                            FinalizeFastCommitResult::Ok => {}
+                            FinalizeFastCommitResult::NotReady => {
+                                return Err(Status::internal("unexpected state after fast commit"));
+                            }
+                        }
+                        Ok(Response::new(TxCommitReply { result: Some(TR::CommitTs(commit_ts)) }))
+                    }
+                    Some(R::Abort(_)) => {
+                        self.abort_and_notify(tx_id).await;
+                        Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }))
+                    }
+                    None => Err(Status::internal("shard returned empty fast commit reply")),
+                };
+            }
+            BeginFastCommitResult::Aborted => {
+                return Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }));
+            }
+            BeginFastCommitResult::NotSingleShard => {
+                // Fall through to standard 2PC below.
+            }
+        }
+
+        // ── Standard 2PC path: multi-shard transaction ───────────────────────
         // ── Phase 1: begin commit ────────────────────────────────────────────
 
         let participants: Vec<u64> = {

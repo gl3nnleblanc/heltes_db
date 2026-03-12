@@ -24,5 +24,4 @@
 ## Protocol extensions
 
 - **Read-only transactions** — currently unmodelled and unimplemented; read-only txns don't need 2PC and can be significantly cheaper _(5 pts)_
-- **Single-shard transaction fast path** — skip 2PC entirely when all writes land on one shard; just a single Prepare+Commit round _(3 pts)_
 - **Multi-key atomic reads** — the current Read RPC is per-key; a snapshot read of multiple keys requires multiple round trips with no atomicity guarantee across them _(8 pts)_

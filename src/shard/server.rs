@@ -6,6 +6,7 @@ use tonic::{Request, Response, Status};
 use crate::proto::shard_service_server::ShardService;
 use crate::proto::{
     Abort, Active, CommitReply, CommitRequest, AbortReply, AbortRequest,
+    FastCommitReply, FastCommitRequest,
     InquiryResult, NeedsInquirySet, PrepareReply, PrepareRequest,
     ReadReply, ReadRequest, UpdateReply, UpdateRequest,
 };
@@ -133,6 +134,24 @@ impl ShardService for ShardServer {
         let req = request.into_inner();
         self.state.lock().unwrap().handle_abort(req.tx_id);
         Ok(Response::new(AbortReply {}))
+    }
+
+    async fn fast_commit(
+        &self,
+        request: Request<FastCommitRequest>,
+    ) -> Result<Response<FastCommitReply>, Status> {
+        let req = request.into_inner();
+        let result = self.state.lock().unwrap().handle_fast_commit(req.tx_id);
+
+        use crate::shard::FastCommitResult;
+        use crate::proto::fast_commit_reply::Result as R;
+
+        let proto_result = match result {
+            FastCommitResult::Ok(commit_ts) => R::CommitTs(commit_ts),
+            FastCommitResult::Abort => R::Abort(Abort {}),
+        };
+
+        Ok(Response::new(FastCommitReply { result: Some(proto_result) }))
     }
 }
 

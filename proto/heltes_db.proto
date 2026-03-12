@@ -7,11 +7,13 @@ package heltes_db;
 // RPCs to drive the Heltes SI protocol on behalf of transactions.
 
 service ShardService {
-  rpc Read    (ReadRequest)    returns (ReadReply);
-  rpc Update  (UpdateRequest)  returns (UpdateReply);
-  rpc Prepare (PrepareRequest) returns (PrepareReply);
-  rpc Commit  (CommitRequest)  returns (CommitReply);
-  rpc Abort   (AbortRequest)   returns (AbortReply);
+  rpc Read        (ReadRequest)        returns (ReadReply);
+  rpc Update      (UpdateRequest)      returns (UpdateReply);
+  rpc Prepare     (PrepareRequest)     returns (PrepareReply);
+  rpc Commit      (CommitRequest)      returns (CommitReply);
+  rpc Abort       (AbortRequest)       returns (AbortReply);
+  // Single-shard fast path: atomically prepare + commit in one round trip.
+  rpc FastCommit  (FastCommitRequest)  returns (FastCommitReply);
 }
 
 // ── Coordinator service ───────────────────────────────────────────────────────
@@ -103,6 +105,21 @@ message PrepareReply {
   oneof result {
     uint64 timestamp = 1;  // Timestamp(t)
     Abort  abort     = 2;  // Abort
+  }
+}
+
+// ── FastCommit ────────────────────────────────────────────────────────────────
+// Single-shard optimisation: shard atomically prepares + commits, returning
+// the shard-clock-assigned commit timestamp (or Abort on conflict).
+
+message FastCommitRequest {
+  uint64 tx_id = 1;
+}
+
+message FastCommitReply {
+  oneof result {
+    uint64 commit_ts = 1;  // committed at this shard-assigned timestamp
+    Abort  abort     = 2;  // transaction was already aborted at this shard
   }
 }
 

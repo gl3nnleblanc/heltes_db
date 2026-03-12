@@ -1724,3 +1724,137 @@
         s.prune_aborted();
         assert!(s.aborted.contains(&P1_S2), "P1_S2 must be retained: P1_S1 (seq=1) still active");
     }
+
+    // -----------------------------------------------------------------------
+    // handle_fast_commit — single-shard fast path
+    //
+    // TLA+ trace: CoordFastCommit → ShardHandleFastCommit → CoordHandleFastCommitReply
+    // -----------------------------------------------------------------------
+
+    // Trace: normal path — tx writes K1, fast commit installs version.
+    // ShardHandleFastCommit success case (id ∉ s_aborted, write_buff[id] ≠ {}).
+    #[test]
+    fn handle_fast_commit_installs_version() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        let r = s.handle_fast_commit(T1);
+        // Ok(commit_ts) where commit_ts = s_clock + 1 at call time.
+        let FastCommitResult::Ok(commit_ts) = r else { panic!("expected Ok") };
+        // Version must be installed.
+        let installed = s.versions.get(&K1)
+            .map(|vs| vs.iter().any(|ver| ver.timestamp == commit_ts && ver.value == v(42)))
+            .unwrap_or(false);
+        assert!(installed, "version not installed after fast commit");
+    }
+
+    // Trace: ShardHandleFastCommit — commit_ts = s_clock + 1 at time of call.
+    #[test]
+    fn handle_fast_commit_uses_shard_clock_plus_one() {
+        let mut s = shard();
+        s.handle_update(T1, 5, K1, v(10)); // s_clock advances to 5
+        let FastCommitResult::Ok(ct) = s.handle_fast_commit(T1) else { panic!() };
+        assert_eq!(ct, 6, "commit_ts must be s_clock+1 = 6");
+    }
+
+    // Trace: ShardHandleFastCommit advances shard clock to commit_ts.
+    #[test]
+    fn handle_fast_commit_advances_shard_clock() {
+        let mut s = shard();
+        s.handle_update(T1, 3, K1, v(10)); // s_clock = 3
+        s.handle_fast_commit(T1);
+        assert_eq!(s.clock, 4, "s_clock must advance to commit_ts=4");
+    }
+
+    // Trace: ShardHandleFastCommit clears write_buff for the tx.
+    #[test]
+    fn handle_fast_commit_clears_write_buff() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_fast_commit(T1);
+        assert!(
+            s.write_buff.get(&T1).map(|b| b.is_empty()).unwrap_or(true),
+            "write_buff must be cleared after fast commit"
+        );
+    }
+
+    // Trace: ShardHandleFastCommit releases write_key_owner for committed keys.
+    #[test]
+    fn handle_fast_commit_releases_write_keys() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        assert_eq!(s.write_keys.get(&K1), Some(&T1));
+        s.handle_fast_commit(T1);
+        assert_eq!(s.write_keys.get(&K1), None, "write lock must be released after fast commit");
+    }
+
+    // Trace: ShardHandleFastCommit with multiple keys — all versions installed.
+    #[test]
+    fn handle_fast_commit_installs_all_writes() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T1, 1, K2, v(20));
+        s.handle_update(T1, 1, K3, v(30));
+        let FastCommitResult::Ok(ct) = s.handle_fast_commit(T1) else { panic!() };
+        for (key, val) in [(K1, v(10)), (K2, v(20)), (K3, v(30))] {
+            let installed = s.versions.get(&key)
+                .map(|vs| vs.iter().any(|ver| ver.timestamp == ct && ver.value == val))
+                .unwrap_or(false);
+            assert!(installed, "version for key {key} not installed");
+        }
+    }
+
+    // Trace: ShardHandleFastCommit — aborted tx returns Abort (id ∈ s_aborted).
+    #[test]
+    fn handle_fast_commit_on_aborted_tx_returns_abort() {
+        let mut s = shard();
+        let t_older: TxId = 50; // prevents T1=101 from being pruned
+        s.write_buff.entry(t_older).or_default().insert(K2, v(99));
+        s.handle_update(T1, 1, K1, v(42));
+        s.handle_abort(T1);
+        // T1 is aborted and (with older tx holding the watermark) still in s.aborted.
+        assert_eq!(s.handle_fast_commit(T1), FastCommitResult::Abort);
+    }
+
+    // Trace: after ShardHandleFastCommit, committed version is visible to readers.
+    #[test]
+    fn handle_fast_commit_version_is_readable() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(99));
+        let FastCommitResult::Ok(ct) = s.handle_fast_commit(T1) else { panic!() };
+        // T2 with start_ts > ct sees T1's value.
+        assert_eq!(
+            s.handle_read(T2, ct + 1, K1, &no_inquiries()),
+            ReadResult::Value(v(99)),
+        );
+    }
+
+    // Trace: ShardHandleFastCommit — concurrent write by T2 after T1 fast-commits
+    // sees the new committed version.
+    #[test]
+    fn handle_fast_commit_committed_version_blocks_past_writers() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        let FastCommitResult::Ok(ct) = s.handle_fast_commit(T1) else { panic!() };
+        // T2 with start_ts <= ct — CommittedConflict prevents the write.
+        assert_eq!(
+            s.handle_update(T2, ct - 1, K1, v(20)),
+            UpdateResult::Abort,
+            "write with start_ts < commit_ts must be aborted"
+        );
+    }
+
+    // Trace: fast-commit doesn't interfere with a concurrently buffered tx.
+    // T2 buffers a write to K2; T1 fast-commits K1. T2's write_buff is intact.
+    #[test]
+    fn handle_fast_commit_does_not_disturb_other_tx_write_buff() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T2, 1, K2, v(20));
+        s.handle_fast_commit(T1);
+        // T2's buffered write must be unchanged.
+        assert_eq!(
+            s.write_buff.get(&T2).and_then(|b| b.get(&K2)),
+            Some(&v(20)),
+        );
+    }
+

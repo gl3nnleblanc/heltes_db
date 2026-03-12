@@ -51,6 +51,26 @@ pub enum SendCommitResult {
     NotReady,
 }
 
+/// Returned by `begin_fast_commit`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BeginFastCommitResult {
+    /// Send FastCommit to this single shard.
+    Ok(ShardId),
+    /// Transaction was already aborted (or unknown).
+    Aborted,
+    /// Transaction has zero or more than one participant shard — use regular 2PC.
+    NotSingleShard,
+}
+
+/// Returned by `finalize_fast_commit`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FinalizeFastCommitResult {
+    /// tx_state → COMMITTED; `is_committed` set.
+    Ok,
+    /// Transaction is not in the expected Active phase.
+    NotReady,
+}
+
 // ---------------------------------------------------------------------------
 // Coordinator state
 // ---------------------------------------------------------------------------
@@ -190,6 +210,50 @@ impl CoordinatorState {
         tx.phase = TxPhase::Committed;
         tx.is_committed = true;
         SendCommitResult::Ok { commit_ts, participants: tx.participants.clone() }
+    }
+
+    /// CoordFastCommit (phase 1): validate that this is a single-shard transaction
+    /// and return the sole participant so the caller can send a FastCommit RPC.
+    ///
+    /// Does NOT change the transaction phase (the coordinator goes ACTIVE →
+    /// COMMITTED atomically in `finalize_fast_commit` once the shard replies).
+    pub fn begin_fast_commit(&mut self, tx_id: TxId) -> BeginFastCommitResult {
+        let tx = match self.transactions.get(&tx_id) {
+            Some(t) => t,
+            None => return BeginFastCommitResult::Aborted,
+        };
+        match tx.phase {
+            TxPhase::Active => {}
+            TxPhase::Aborted => return BeginFastCommitResult::Aborted,
+            _ => return BeginFastCommitResult::Aborted,
+        }
+        if tx.participants.len() != 1 {
+            return BeginFastCommitResult::NotSingleShard;
+        }
+        let shard_id = *tx.participants.iter().next().unwrap();
+        BeginFastCommitResult::Ok(shard_id)
+    }
+
+    /// CoordHandleFastCommitReply: record the shard's assigned commit_ts and
+    /// transition ACTIVE → COMMITTED. Advances the coordinator clock to
+    /// `commit_ts + 1` to maintain SI2.
+    pub fn finalize_fast_commit(
+        &mut self,
+        tx_id: TxId,
+        commit_ts: Timestamp,
+    ) -> FinalizeFastCommitResult {
+        let tx = match self.transactions.get_mut(&tx_id) {
+            Some(t) => t,
+            None => return FinalizeFastCommitResult::NotReady,
+        };
+        if tx.phase != TxPhase::Active {
+            return FinalizeFastCommitResult::NotReady;
+        }
+        tx.phase = TxPhase::Committed;
+        tx.is_committed = true;
+        tx.commit_ts = Some(commit_ts);
+        self.clock = self.clock.max(commit_ts + 1);
+        FinalizeFastCommitResult::Ok
     }
 
     /// CoordAbortOnReply / manual abort: mark ABORTED.

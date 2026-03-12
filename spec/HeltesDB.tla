@@ -108,6 +108,10 @@ AbortMsg(id)             == [type |-> "ABORT",            txid |-> id]
 InquireMsg(id, t, asker) == [type |-> "INQUIRE",          txid |-> id, ts |-> t,    from |-> asker]
 InquireReply(id, r, t, dest) ==
     [type |-> "INQUIRE_REPLY", txid |-> id, result |-> r, ts |-> t, to |-> dest]
+\* Fast-path: combines Prepare+Commit into a single shard-side operation.
+\* Reply ts = NONE means the shard aborted; ts ≠ NONE is the assigned commit timestamp.
+FastCommitMsg(id)        == [type |-> "FAST_COMMIT",       txid |-> id]
+FastCommitReply(id, ct)  == [type |-> "FAST_COMMIT_REPLY", txid |-> id, ts |-> ct]
 
 Send(m)  == msgs' = msgs \cup {m}
 SendAll(S) == msgs' = msgs \cup S
@@ -219,6 +223,50 @@ CoordAbortOnReply(id) ==
     /\ SendAll({AbortMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+
+\* Single-shard fast path: coordinator sends FAST_COMMIT to the sole participant
+\* shard, skipping the two-round-trip Prepare → Commit sequence.
+\* Guard conditions mirror CoordBeginCommit (all update acks received).
+\* Reuses the PREPARING phase while waiting for FastCommitReply.
+CoordFastCommit(id) ==
+    /\ tx_state[id] = "ACTIVE"
+    /\ participants[id] # {}
+    /\ Cardinality(participants[id]) = 1
+    /\ \A m \in msgs :
+           (m.type = "UPDATE_KEY" /\ m.txid = id)
+           => UpdateKeyReply(id, m.key, "OK") \in msgs
+    /\ tx_state' = [tx_state EXCEPT ![id] = "PREPARING"]
+    /\ Send(FastCommitMsg(id))
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+
+\* Coordinator receives a FastCommitReply.
+\* ts = NONE means the shard aborted; ts ≠ NONE is the assigned commit timestamp.
+CoordHandleFastCommitReply(id) ==
+    LET coord == CoordOf[id]
+        reply == CHOOSE m \in msgs :
+                     /\ m.type = "FAST_COMMIT_REPLY"
+                     /\ m.txid = id
+    IN
+    /\ \E m \in msgs : m.type = "FAST_COMMIT_REPLY" /\ m.txid = id
+    /\ tx_state[id] = "PREPARING"
+    /\ IF reply.ts = NONE
+       THEN \* shard aborted
+            /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
+            /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+       ELSE \* shard committed — finalise at the coordinator
+            LET ct == reply.ts
+            IN
+            /\ ct \in Timestamps
+            /\ ct + 1 \in Timestamps
+            /\ tx_state'     = [tx_state     EXCEPT ![id]    = "COMMITTED"]
+            /\ is_committed' = [is_committed EXCEPT ![id]    = TRUE]
+            /\ commit_t'     = [commit_t     EXCEPT ![id]    = ct]
+            /\ c_clock'      = [c_clock      EXCEPT ![coord] =
+                                    IF ct + 1 > c_clock[coord] THEN ct + 1 ELSE c_clock[coord]]
+            /\ UNCHANGED <<start_t, participants, s_clock, versions,
+                           write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
 
 \* commit_tx(id): send PREPARE to all participant shards (2PC phase 1)
 \* Guard: all UPDATE_KEY messages for this tx have received OK replies,
@@ -398,6 +446,36 @@ ShardHandlePrepare(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    versions, write_buff, write_key_owner, s_aborted>>
 
+\* Shard handles FAST_COMMIT(id) — atomically prepare + commit for single-shard txns.
+\* Combines ShardHandlePrepare + ShardHandleCommit in one step.
+\* Guard write_buff[id] ≠ {} prevents re-firing after the first successful commit.
+ShardHandleFastCommit(s, id) ==
+    LET ct == s_clock[s] + 1
+    IN
+    /\ FastCommitMsg(id) \in msgs
+    /\ s \in participants[id]
+    /\ write_buff[id] # {}          \* idempotency: nothing left to commit after first fire
+    /\ ct \in Timestamps
+    /\ IF id \in s_aborted[s]
+       THEN \* tx was aborted before the fast-commit arrived — reply abort
+            /\ Send(FastCommitReply(id, NONE))
+            /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+       ELSE \* prepare + commit atomically
+            /\ versions' = [k \in Keys |->
+                   LET kWrites == {kv \in write_buff[id] : kv[1] = k}
+                   IN IF kWrites # {}
+                      THEN versions[k] \cup {<<(CHOOSE kv \in kWrites : TRUE)[2], ct>>}
+                      ELSE versions[k]]
+            /\ write_buff'      = [write_buff      EXCEPT ![id] = {}]
+            /\ write_key_owner' = [k \in Keys |->
+                   IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
+            /\ s_prepared'      = [s_prepared      EXCEPT ![s]  = {p \in @ : p[1] # id}]
+            /\ s_clock'         = [s_clock         EXCEPT ![s]  = ct]
+            /\ Send(FastCommitReply(id, ct))
+            /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                           tx_state, s_aborted>>
+
 \* Shard handles COMMIT(id, ct) — install buffered writes as new MVCC versions
 ShardHandleCommit(s, id) ==
     LET ct == commit_t[id]
@@ -447,6 +525,8 @@ ShardPruneAborted(s, id) ==
 Next ==
     \/ \E id \in TxIds :
            \/ CoordStartTx(id)
+           \/ CoordFastCommit(id)
+           \/ CoordHandleFastCommitReply(id)
            \/ CoordBeginCommit(id)
            \/ CoordFinalizePrepare(id)
            \/ CoordSendCommit(id)
@@ -463,6 +543,7 @@ Next ==
     \/ \E id \in TxIds, s \in Shards :
            \/ CoordHandleInquire(id, s)
            \/ ShardPruneAborted(s, id)
+           \/ ShardHandleFastCommit(s, id)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :
            ShardSendInquire(s, id, prepId, k)
 
