@@ -26,6 +26,8 @@ pub struct Version {
 pub enum ReadResult {
     /// Returned the value visible at start_ts.
     Value(Value),
+    /// No committed version of this key exists before start_ts (key not yet inserted).
+    NotFound,
     /// Transaction was already aborted.
     Abort,
     /// One or more prepared writers of this key have prep_t < start_ts and
@@ -66,7 +68,7 @@ pub struct ShardState {
     /// Logical clock (s_clock in TLA+).
     pub clock: Timestamp,
     /// MVCC version history per key. Each vec is sorted ascending by timestamp.
-    /// Invariant: every key that exists has at least the initial version at t=0.
+    /// Keys are absent from the map until their first write is committed (insert semantics).
     pub versions: HashMap<Key, Vec<Version>>,
     /// Buffered (uncommitted) writes per transaction.
     pub write_buff: HashMap<TxId, HashMap<Key, Value>>,
@@ -77,25 +79,12 @@ pub struct ShardState {
 }
 
 impl ShardState {
-    /// Create a new shard. All provided keys are initialised with `init_val`
-    /// at timestamp 0 (matching TLA+ `versions = [k \in Keys |-> {<<InitVal, 0>>}]`).
-    pub fn new(keys: impl IntoIterator<Item = Key>, init_val: Value) -> Self {
-        let versions = keys
-            .into_iter()
-            .map(|k| {
-                (
-                    k,
-                    vec![Version {
-                        value: init_val.clone(),
-                        timestamp: 0,
-                    }],
-                )
-            })
-            .collect();
-
+    /// Create a new shard with no committed versions.
+    /// Keys come into existence on first commit (matching TLA+ `versions = [k \in Keys |-> {}]`).
+    pub fn new() -> Self {
         ShardState {
             clock: 0,
-            versions,
+            versions: HashMap::new(),
             write_buff: HashMap::new(),
             prepared: HashMap::new(),
             aborted: HashSet::new(),
@@ -176,21 +165,19 @@ impl ShardState {
             return ReadResult::NeedsInquiry(needs_inquiry);
         }
 
-        // Return the latest version with timestamp < start_ts.
-        let versions = self.versions.get(&key).expect("key not found in shard");
-        let best = versions
-            .iter()
-            .filter(|v| v.timestamp < start_ts)
-            .max_by_key(|v| v.timestamp);
-
-        // If nothing strictly before start_ts, fall back to the init version (ts=0).
-        let result = best
-            .or_else(|| versions.first())
-            .cloned()
-            .expect("every key has at least the init version");
+        // Return the latest version with timestamp strictly before start_ts.
+        // If none exists the key has not been inserted at this snapshot.
+        let best = self
+            .versions
+            .get(&key)
+            .and_then(|vs| vs.iter().filter(|v| v.timestamp < start_ts).max_by_key(|v| v.timestamp))
+            .cloned();
 
         self.clock = self.clock.max(start_ts);
-        ReadResult::Value(result.value)
+        match best {
+            Some(ver) => ReadResult::Value(ver.value),
+            None => ReadResult::NotFound,
+        }
     }
 
     /// Handle UPDATE_KEY(id, start_ts, key, value).
@@ -327,9 +314,8 @@ mod tests {
         Value(n)
     }
 
-    /// Shard owning K1, K2, K3 with initial value v(0).
     fn shard() -> ShardState {
-        ShardState::new([K1, K2, K3], v(0))
+        ShardState::new()
     }
 
     fn no_inquiries() -> HashMap<TxId, InquiryStatus> {
@@ -341,11 +327,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn read_returns_init_val_when_no_committed_writes() {
+    fn read_returns_not_found_when_key_has_no_versions() {
         let mut s = shard();
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
@@ -354,8 +340,8 @@ mod tests {
         // Manually install two committed versions: v(10) at t=2, v(20) at t=4.
         // A read with start_ts=5 should see v(20) (latest strictly before 5).
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 2 });
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(20), timestamp: 4 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 2 });
+        s.versions.entry(K1).or_default().push(Version { value: v(20), timestamp: 4 });
 
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
@@ -367,31 +353,31 @@ mod tests {
     fn read_does_not_see_version_exactly_at_start_ts() {
         // Version at t=5, read with start_ts=5 — NOT visible (strictly less than).
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(99), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(99), timestamp: 5 });
 
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
     #[test]
     fn read_does_not_see_version_after_start_ts() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(99), timestamp: 10 });
+        s.versions.entry(K1).or_default().push(Version { value: v(99), timestamp: 10 });
 
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
     #[test]
     fn read_picks_latest_of_multiple_eligible_versions() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(1), timestamp: 1 });
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(2), timestamp: 2 });
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 1 });
+        s.versions.entry(K1).or_default().push(Version { value: v(2), timestamp: 2 });
+        s.versions.entry(K1).or_default().push(Version { value: v(3), timestamp: 3 });
         // start_ts=4: should see v(3) at t=3
         assert_eq!(
             s.handle_read(T1, 4, K1, &no_inquiries()),
@@ -417,7 +403,7 @@ mod tests {
     #[test]
     fn read_own_write_shadows_committed_version() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 2 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 2 });
         s.write_buff.entry(T1).or_default().insert(K1, v(99));
         // T1's buffered write should win over the committed v(10).
         assert_eq!(
@@ -463,9 +449,9 @@ mod tests {
         s.prepared.insert(T2, 5);
         s.write_buff.entry(T2).or_default().insert(K1, v(77));
 
-        // Should NOT need inquiry — returns a value directly.
+        // Should NOT need inquiry — no NeedsInquiry (key has no prior versions so NotFound).
         let result = s.handle_read(T1, 5, K1, &no_inquiries());
-        assert!(matches!(result, ReadResult::Value(_)));
+        assert!(!matches!(result, ReadResult::NeedsInquiry(_)));
     }
 
     #[test]
@@ -475,7 +461,7 @@ mod tests {
         s.write_buff.entry(T2).or_default().insert(K1, v(77));
 
         let result = s.handle_read(T1, 5, K1, &no_inquiries());
-        assert!(matches!(result, ReadResult::Value(_)));
+        assert!(!matches!(result, ReadResult::NeedsInquiry(_)));
     }
 
     #[test]
@@ -491,7 +477,7 @@ mod tests {
 
         assert_eq!(
             s.handle_read(T1, 5, K1, &inq),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
@@ -522,7 +508,7 @@ mod tests {
         s.write_buff.entry(T2).or_default().insert(K1, v(77));
 
         // Simulate T2's commit being installed.
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(77), timestamp: 4 });
+        s.versions.entry(K1).or_default().push(Version { value: v(77), timestamp: 4 });
         s.prepared.remove(&T2);
 
         let mut inq = HashMap::new();
@@ -543,7 +529,7 @@ mod tests {
 
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
@@ -603,7 +589,7 @@ mod tests {
     fn update_no_conflict_when_committed_version_strictly_before_start_ts() {
         // Committed version at t=4, start_ts=5 → t < start_ts → no conflict.
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 4 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 4 });
 
         assert_eq!(s.handle_update(T1, 5, K1, v(99)), UpdateResult::Ok);
     }
@@ -612,7 +598,7 @@ mod tests {
     fn update_conflict_when_committed_version_at_start_ts() {
         // Committed version at t=5 == start_ts=5 → conflict → ABORT.
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 5 });
 
         assert_eq!(s.handle_update(T1, 5, K1, v(99)), UpdateResult::Abort);
     }
@@ -621,7 +607,7 @@ mod tests {
     fn update_conflict_when_committed_version_after_start_ts() {
         // Committed version at t=6 > start_ts=5 → conflict → ABORT.
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 6 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 6 });
 
         assert_eq!(s.handle_update(T1, 5, K1, v(99)), UpdateResult::Abort);
     }
@@ -629,7 +615,7 @@ mod tests {
     #[test]
     fn update_conflict_marks_tx_aborted() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 6 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 6 });
         s.handle_update(T1, 5, K1, v(99));
         assert!(s.aborted.contains(&T1));
     }
@@ -936,10 +922,10 @@ mod tests {
         s.prepared.insert(T1, 2);
         s.handle_commit(T1, 3);
 
-        // T2 starts exactly at ct=3 — should NOT see T1's write.
+        // T2 starts exactly at ct=3 — should NOT see T1's write (no prior version either).
         assert_eq!(
             s.handle_read(T2, 3, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
@@ -1022,10 +1008,10 @@ mod tests {
         };
         let commit_ts = prep_t + 1;
         s.handle_commit(T1, commit_ts);
-        // T2 started BEFORE T1 committed — snapshot at start_ts=2 < commit_ts.
+        // T2 started BEFORE T1 committed — snapshot at start_ts=2 < commit_ts; key not yet inserted.
         assert_eq!(
             s.handle_read(T2, 2, K1, &no_inquiries()),
-            ReadResult::Value(v(0)),
+            ReadResult::NotFound,
         );
     }
 
@@ -1074,8 +1060,8 @@ mod tests {
         let prep_t = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
         let ct = prep_t + 1;
         s.handle_commit(T1, ct);
-        // start_ts == ct: must NOT see the version.
-        assert_eq!(s.handle_read(T2, ct, K1, &no_inquiries()), ReadResult::Value(v(0)));
+        // start_ts == ct: must NOT see the version (and no prior version exists).
+        assert_eq!(s.handle_read(T2, ct, K1, &no_inquiries()), ReadResult::NotFound);
     }
 
     /// Path: commit, then read at commit_ts + 1 IS visible.
@@ -1093,13 +1079,13 @@ mod tests {
     // Path family 2: Abort paths
     // -------------------------------------------------------------------
 
-    /// Path: update → abort; subsequent read sees init value.
+    /// Path: update → abort; subsequent read sees key as not found (never committed).
     #[test]
-    fn path_update_abort_read_sees_init() {
+    fn path_update_abort_read_sees_not_found() {
         let mut s = shard();
         s.handle_update(T1, 1, K1, v(42));
         s.handle_abort(T1);
-        assert_eq!(s.handle_read(T2, 5, K1, &no_inquiries()), ReadResult::Value(v(0)));
+        assert_eq!(s.handle_read(T2, 5, K1, &no_inquiries()), ReadResult::NotFound);
     }
 
     /// Path: update → abort; another tx can then write the same key.
@@ -1282,14 +1268,14 @@ mod tests {
     fn path_snapshot_reads_across_multiple_versions() {
         let mut s = shard();
         // Version v(1) at t=2.
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(1), timestamp: 2 });
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 2 });
         // Version v(2) at t=5.
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(2), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(2), timestamp: 5 });
         // Version v(3) at t=9.
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 9 });
+        s.versions.entry(K1).or_default().push(Version { value: v(3), timestamp: 9 });
 
-        assert_eq!(s.handle_read(T1, 1,  K1, &no_inquiries()), ReadResult::Value(v(0)));
-        assert_eq!(s.handle_read(T1, 2,  K1, &no_inquiries()), ReadResult::Value(v(0)));
+        assert_eq!(s.handle_read(T1, 1,  K1, &no_inquiries()), ReadResult::NotFound);
+        assert_eq!(s.handle_read(T1, 2,  K1, &no_inquiries()), ReadResult::NotFound);
         assert_eq!(s.handle_read(T1, 3,  K1, &no_inquiries()), ReadResult::Value(v(1)));
         assert_eq!(s.handle_read(T1, 5,  K1, &no_inquiries()), ReadResult::Value(v(1)));
         assert_eq!(s.handle_read(T1, 6,  K1, &no_inquiries()), ReadResult::Value(v(2)));
@@ -1304,17 +1290,17 @@ mod tests {
         let mut s = shard();
         // T2 has a snapshot at ts=3.
         // Simulate T1 committing K1 at ts=5 by installing the version directly.
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(99), timestamp: 5 });
-        // T2 (start_ts=3) reads K1 — must not see v(99) committed at ts=5.
-        assert_eq!(s.handle_read(T2, 3, K1, &no_inquiries()), ReadResult::Value(v(0)));
+        s.versions.entry(K1).or_default().push(Version { value: v(99), timestamp: 5 });
+        // T2 (start_ts=3) reads K1 — must not see v(99) committed at ts=5; no prior version.
+        assert_eq!(s.handle_read(T2, 3, K1, &no_inquiries()), ReadResult::NotFound);
     }
 
     /// Path: T2 snapshot at ts=5 sees commit at ts=4 but not at ts=5.
     #[test]
     fn path_snapshot_sees_version_committed_one_before_start_ts() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(7), timestamp: 4 });
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(8), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(7), timestamp: 4 });
+        s.versions.entry(K1).or_default().push(Version { value: v(8), timestamp: 5 });
         // start_ts=5: sees t=4 but not t=5 (strict <).
         assert_eq!(s.handle_read(T2, 5, K1, &no_inquiries()), ReadResult::Value(v(7)));
     }
@@ -1323,7 +1309,7 @@ mod tests {
     #[test]
     fn path_two_txs_same_snapshot_read_agree() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(42), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(42), timestamp: 3 });
         assert_eq!(
             s.handle_read(T1, 5, K1, &no_inquiries()),
             s.handle_read(T2, 5, K1, &no_inquiries()),
@@ -1355,7 +1341,7 @@ mod tests {
     #[test]
     fn path_own_write_does_not_affect_other_keys() {
         let mut s = shard();
-        s.versions.get_mut(&K2).unwrap().push(Version { value: v(55), timestamp: 1 });
+        s.versions.entry(K2).or_default().push(Version { value: v(55), timestamp: 1 });
         s.handle_update(T1, 2, K1, v(99));
         assert_eq!(s.handle_read(T1, 2, K2, &no_inquiries()), ReadResult::Value(v(55)));
     }
@@ -1364,7 +1350,7 @@ mod tests {
     #[test]
     fn path_own_write_shadows_committed_version_of_same_key() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 1 });
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
         s.handle_update(T1, 5, K1, v(99));
         // T1's buffered write (99) must shadow the committed v(10).
         assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Value(v(99)));
@@ -1378,7 +1364,7 @@ mod tests {
     #[test]
     fn path_inquire_active_read_sees_pre_prepare_version() {
         let mut s = shard();
-        s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 2 });
+        s.versions.entry(K1).or_default().push(Version { value: v(3), timestamp: 2 });
         // T1 must start after the committed version at ts=2 to avoid CommittedConflict.
         s.handle_update(T1, 3, K1, v(77));
         let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
@@ -1441,9 +1427,9 @@ mod tests {
         s.handle_update(T1, 5, K1, v(77));
         s.prepared.insert(T1, 7); // prep_t=7 >= start_ts=5
         // T2's read at start_ts=5: T1's prep_t=7 >= 5, so T1 cannot have committed before
-        // T2's snapshot → no inquiry needed.
+        // T2's snapshot → no inquiry needed (NotFound since no prior committed version).
         let result = s.handle_read(T2, 5, K1, &no_inquiries());
-        assert!(matches!(result, ReadResult::Value(_)));
+        assert!(!matches!(result, ReadResult::NeedsInquiry(_)));
     }
 
     /// Path: two prepared writers of K1, both with prep_ts < start_ts → NeedsInquiry for both.
@@ -1474,10 +1460,10 @@ mod tests {
         let mut s = shard();
         s.write_buff.entry(T1).or_default().insert(K2, v(50));
         s.prepared.insert(T1, 1);
-        // Reading K1 — T1 only wrote K2, so no inquiry.
-        assert!(matches!(
+        // Reading K1 — T1 only wrote K2, so no inquiry (NotFound since K1 has no versions).
+        assert!(!matches!(
             s.handle_read(T2, 5, K1, &no_inquiries()),
-            ReadResult::Value(_)
+            ReadResult::NeedsInquiry(_)
         ));
     }
 
@@ -1598,37 +1584,29 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Path family 11: Edge cases at timestamp zero / init state
+    // Path family 11: Edge cases at timestamp zero / uninserted keys
     // -------------------------------------------------------------------
 
-    /// Path: read at start_ts=1 sees init value (v0 at t=0, strict < 1).
+    /// Path: read at start_ts=1 on a key that has never been inserted → NotFound.
     #[test]
-    fn path_read_at_ts_one_sees_init() {
+    fn path_read_at_ts_one_returns_not_found() {
         let mut s = shard();
-        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::Value(v(0)));
+        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::NotFound);
     }
 
-    /// Path: update at start_ts=1; committed version at ts=0 (< 1) → no CommittedConflict.
+    /// Path: first write to a key has no committed conflict (no prior versions).
     #[test]
-    fn path_init_version_at_ts_zero_never_causes_committed_conflict() {
+    fn path_first_insert_has_no_committed_conflict() {
         let mut s = shard();
-        // The init version is at ts=0. Any update with start_ts > 0 should not conflict.
         assert_eq!(s.handle_update(T1, 1, K1, v(5)), UpdateResult::Ok);
         assert_eq!(s.handle_update(T2, 1, K2, v(6)), UpdateResult::Ok);
     }
 
-    /// Path: read at start_ts=0 returns nothing visible (init version is at ts=0, not < 0).
+    /// Path: read at start_ts=0 returns NotFound (no version has ts < 0).
     #[test]
-    fn path_read_at_ts_zero_sees_nothing_from_init_version() {
-        // start_ts=0: eligible versions are those with ts < 0 — none exist.
+    fn path_read_at_ts_zero_returns_not_found() {
         let mut s = shard();
-        // The init value is at ts=0. With start_ts=0, it is NOT visible (strict <).
-        // LatestVersionBefore should fall back to InitVal since no eligible version exists.
-        // (Spec: if eligible == {}, return <<InitVal, 0>>.)
-        // The actual returned Value depends on the implementation's fallback behaviour;
-        // we just check it doesn't panic and returns *something*.
-        let r = s.handle_read(T1, 0, K1, &no_inquiries());
-        assert!(matches!(r, ReadResult::Value(_)));
+        assert_eq!(s.handle_read(T1, 0, K1, &no_inquiries()), ReadResult::NotFound);
     }
 
     // -------------------------------------------------------------------
