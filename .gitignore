@@ -1,5 +1,5 @@
 /target/
-tla2tools.jar
-states/
-MC_TTrace_*.tla
-MC_TTrace_*.bin
+spec/tla2tools.jar
+spec/states/
+spec/MC_TTrace_*.tla
+spec/MC_TTrace_*.bin
