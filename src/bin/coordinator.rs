@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         my_port,
         shard_addrs,
         peer_coordinator_addrs,
+        std::time::Duration::from_secs(30),
     )?;
 
     Server::builder()

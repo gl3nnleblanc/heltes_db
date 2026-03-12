@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures::future::join_all;
 use tonic::transport::{Channel, Endpoint};
@@ -36,17 +37,26 @@ pub struct CoordinatorServer {
     /// port → gRPC URI for peer coordinators (for cross-coordinator Inquire forwarding).
     /// Built from `peer_coordinator_addrs` supplied at construction time.
     coordinator_uris: HashMap<u16, String>,
+    /// Maximum time to wait for any individual shard RPC (or the full prepare phase).
+    /// A timeout is treated as an ABORT from the shard: the coordinator aborts the
+    /// transaction and returns Abort to the client. Matches CoordAbortOnReply in TLA+.
+    shard_rpc_timeout: Duration,
 }
 
 impl CoordinatorServer {
     /// Construct a coordinator that will route to `shard_addrs` via consistent
     /// hashing and forward cross-coordinator Inquire RPCs to `peer_coordinator_addrs`.
     /// Connections to shards are lazy (established on first use).
+    ///
+    /// `shard_rpc_timeout` is applied to every shard RPC (individually for reads and
+    /// updates; to the full `join_all` for the PREPARE phase). A timeout is treated as
+    /// an ABORT, matching the `CoordAbortOnReply` path in the TLA+ spec.
     pub fn new(
         state: CoordinatorState,
         my_port: u16,
         shard_addrs: Vec<SocketAddr>,
         peer_coordinator_addrs: Vec<SocketAddr>,
+        shard_rpc_timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let router = ConsistentHashRouter::new(shard_addrs.iter().copied());
         let mut shard_clients = HashMap::new();
@@ -65,6 +75,7 @@ impl CoordinatorServer {
             shard_clients,
             my_port,
             coordinator_uris,
+            shard_rpc_timeout,
         })
     }
 
@@ -121,8 +132,9 @@ impl CoordinatorServer {
         }
     }
 
-    /// Mark `tx_id` aborted in state and fire-and-forget ABORT to every
-    /// participant shard. Matches CoordAbortOnReply in the TLA+ spec.
+    /// Mark `tx_id` aborted in state and best-effort ABORT to every participant shard.
+    /// The abort RPCs are bounded by `shard_rpc_timeout`; hung shards are abandoned.
+    /// Matches CoordAbortOnReply in the TLA+ spec.
     async fn abort_and_notify(&self, tx_id: u64) {
         let participants = self.state.lock().unwrap().abort_tx(tx_id);
         let futs = participants.into_iter().filter_map(|port| {
@@ -133,7 +145,8 @@ impl CoordinatorServer {
                 }
             })
         });
-        join_all(futs).await;
+        // Best-effort: don't block indefinitely if shards are unresponsive.
+        let _ = tokio::time::timeout(self.shard_rpc_timeout, join_all(futs)).await;
     }
 }
 
@@ -181,15 +194,18 @@ impl CoordinatorService for CoordinatorServer {
 
         let mut inquiry_results: Vec<InquiryResult> = vec![];
         loop {
-            let reply = client
-                .read(ReadRequest {
+            let reply = tokio::time::timeout(
+                self.shard_rpc_timeout,
+                client.read(ReadRequest {
                     tx_id,
                     start_ts,
                     key,
                     inquiry_results: inquiry_results.clone(),
-                })
-                .await?
-                .into_inner();
+                }),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("shard read RPC timed out"))??
+            .into_inner();
 
             match reply.result {
                 Some(R::Value(v)) => {
@@ -262,15 +278,18 @@ impl CoordinatorService for CoordinatorServer {
             .add_participant(tx_id, shard_port);
 
         let mut client = self.shard_client(shard_port)?;
-        let reply = client
-            .update(UpdateRequest {
+        let reply = tokio::time::timeout(
+            self.shard_rpc_timeout,
+            client.update(UpdateRequest {
                 tx_id,
                 start_ts,
                 key,
                 value,
-            })
-            .await?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("shard update RPC timed out"))??
+        .into_inner();
 
         use crate::proto::tx_update_reply::Result as TR;
         use crate::proto::update_reply::Result as R;
@@ -310,10 +329,22 @@ impl CoordinatorService for CoordinatorServer {
         match fast_shard {
             BeginFastCommitResult::Ok(shard_port) => {
                 let mut client = self.shard_client(shard_port)?;
-                let reply = client
-                    .fast_commit(ShardFastCommitRequest { tx_id })
-                    .await?
-                    .into_inner();
+                let fast_commit_result = tokio::time::timeout(
+                    self.shard_rpc_timeout,
+                    client.fast_commit(ShardFastCommitRequest { tx_id }),
+                )
+                .await;
+                let reply = match fast_commit_result {
+                    Ok(Ok(r)) => r.into_inner(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_elapsed) => {
+                        // Shard did not respond in time — treat as ABORT.
+                        self.abort_and_notify(tx_id).await;
+                        return Ok(Response::new(TxCommitReply {
+                            result: Some(TR::Abort(Abort {})),
+                        }));
+                    }
+                };
 
                 use crate::proto::fast_commit_reply::Result as R;
                 return match reply.result {
@@ -396,7 +427,18 @@ impl CoordinatorService for CoordinatorServer {
                 Ok((port, ts))
             })
         });
-        let prepare_results = join_all(prepare_futs).await;
+        let prepare_results =
+            match tokio::time::timeout(self.shard_rpc_timeout, join_all(prepare_futs)).await {
+                Ok(results) => results,
+                Err(_elapsed) => {
+                    // At least one shard did not respond in time — treat as ABORT from all
+                    // outstanding shards. Matches CoordAbortOnReply in the TLA+ spec.
+                    self.abort_and_notify(tx_id).await;
+                    return Ok(Response::new(TxCommitReply {
+                        result: Some(TR::Abort(Abort {})),
+                    }));
+                }
+            };
 
         // ── Phase 3: collect replies into state machine ───────────────────────
 
@@ -501,7 +543,31 @@ mod tests {
     use crate::coordinator::CoordinatorState;
 
     fn test_server(my_port: u16, peers: Vec<SocketAddr>) -> CoordinatorServer {
-        CoordinatorServer::new(CoordinatorState::new(), my_port, vec![], peers).unwrap()
+        CoordinatorServer::new(
+            CoordinatorState::new(),
+            my_port,
+            vec![],
+            peers,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// Spawn a TCP listener that accepts connections but never sends any bytes,
+    /// simulating a shard that is reachable at the transport layer but hangs on RPC.
+    async fn spawn_hang_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = vec![];
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => held.push(socket),
+                    Err(_) => break,
+                }
+            }
+        });
+        addr
     }
 
     // Trace: remote IPv4 peer in coordinator_uris → URI uses the configured address.
@@ -596,5 +662,95 @@ mod tests {
             !msg.contains("no address configured"),
             "expected connection attempt, got: {msg}",
         );
+    }
+
+    // Trace: shard_rpc_timeout is stored and retrievable.
+    #[test]
+    fn shard_rpc_timeout_is_stored() {
+        let timeout = Duration::from_secs(7);
+        let server =
+            CoordinatorServer::new(CoordinatorState::new(), 50052, vec![], vec![], timeout)
+                .unwrap();
+        assert_eq!(server.shard_rpc_timeout, timeout);
+    }
+
+    // Trace: CoordBeginCommit → PREPARING → deadline fires before all PREPARE replies
+    // arrive → coordinator aborts (CoordAbortOnReply path in TLA+).
+    //
+    // Two hang shards → 2 participants → 2PC path (not fast-commit).
+    // The coordinator's shard_rpc_timeout is set to 20 ms; the test waits for
+    // the commit future to complete, which happens once the timeout fires.
+    #[tokio::test]
+    async fn prepare_timeout_aborts_transaction() {
+        let hang1 = spawn_hang_server().await;
+        let hang2 = spawn_hang_server().await;
+        let p1 = hang1.port() as u64;
+        let p2 = hang2.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang1, hang2],
+            vec![],
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        // Register a transaction with 2 participants directly, bypassing begin/update RPCs.
+        let tx_id: u64 = (50052u64 << 32) | 1;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, p1);
+            state.add_participant(tx_id, p2);
+        }
+
+        // commit() internally runs join_all(prepare_futs) wrapped in shard_rpc_timeout.
+        // With two hung shards, the timeout fires and the coordinator returns Abort.
+        let reply = server
+            .commit(Request::new(TxCommitRequest { tx_id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use crate::proto::tx_commit_reply::Result as TR;
+        assert_eq!(reply.result, Some(TR::Abort(Abort {})));
+    }
+
+    // Trace: CoordFastCommit → PREPARING → deadline fires before FastCommitReply
+    // arrives → coordinator aborts (same CoordAbortOnReply path in TLA+).
+    //
+    // One hang shard → 1 participant → fast-commit path.
+    #[tokio::test]
+    async fn fast_commit_timeout_aborts_transaction() {
+        let hang = spawn_hang_server().await;
+        let port = hang.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang],
+            vec![],
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 2;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, port);
+        }
+
+        // With 1 participant the fast-commit path is taken. The hang shard never
+        // replies, so shard_rpc_timeout fires and the coordinator returns Abort.
+        let reply = server
+            .commit(Request::new(TxCommitRequest { tx_id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use crate::proto::tx_commit_reply::Result as TR;
+        assert_eq!(reply.result, Some(TR::Abort(Abort {})));
     }
 }

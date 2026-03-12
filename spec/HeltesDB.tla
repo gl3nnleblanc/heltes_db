@@ -287,6 +287,14 @@ CoordHandleFastCommitReply(id) ==
 \* commit_tx(id): send PREPARE to all participant shards (2PC phase 1)
 \* Guard: all UPDATE_KEY messages for this tx have received OK replies,
 \* modelling the coordinator waiting for acknowledgements before committing.
+\*
+\* Implementation note: the PREPARING phase is guarded by a configurable
+\* shard_rpc_timeout applied to the join_all(PREPARE RPCs). If all replies do
+\* not arrive within that deadline, the coordinator treats it identically to
+\* receiving ABORT from the outstanding shards, and falls through to the same
+\* abort path as CoordAbortOnReply. The same deadline guards FastCommit, Read,
+\* and Update shard RPCs — a timeout on any of those propagates as an error to
+\* the client and (for write-path RPCs) aborts the transaction.
 CoordBeginCommit(id) ==
     /\ tx_state[id] = "ACTIVE"
     /\ participants[id] # {}
