@@ -1,0 +1,5 @@
+/target/
+tla2tools.jar
+states/
+MC_TTrace_*.tla
+MC_TTrace_*.bin

@@ -1,0 +1,10 @@
+[package]
+name = "heltes_db"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "heltes_db"
+path = "src/lib.rs"
+
+[dependencies]
