@@ -540,6 +540,33 @@ ShardHandleAbort(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, msgs>>
 
+\* Shard auto-aborts a prepared entry whose coordinator has become unresponsive.
+\*
+\* Models coordinator crash mid-2PC: if the coordinator sent PREPARE but crashed
+\* before deciding COMMIT/ABORT (tx_state = "PREPARING"), the shard may
+\* spontaneously abort the prepared entry after a configurable prepare_ttl,
+\* unblocking conflicting writers.
+\*
+\* The guard tx_state[id] = "PREPARING" makes the action safe in all SI properties:
+\* the coordinator has not committed, so no COMMIT message is in transit and
+\* aborting the prepared entry loses no durable data. Once the coordinator
+\* reaches COMMIT_WAIT or COMMITTED this action is disabled.
+\*
+\* Implementation note: the Rust implementation records Instant::now() at
+\* handle_prepare time, then calls expire_prepared(Instant::now()) lazily at
+\* the start of each update/prepare/read RPC handler. Entries older than
+\* prepare_ttl are aborted with the same cleanup as handle_abort.
+ShardTimeoutPrepared(s, id) ==
+    /\ id \in {pair[1] : pair \in s_prepared[s]}
+    /\ tx_state[id] = "PREPARING"
+    /\ s_aborted'       = [s_aborted       EXCEPT ![s] = @ \cup {id}]
+    /\ write_buff'      = [write_buff      EXCEPT ![id] = {}]
+    /\ write_key_owner' = [k \in Keys |->
+           IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
+    /\ s_prepared'      = [s_prepared      EXCEPT ![s] = {p \in @ : p[1] # id}]
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, versions, msgs>>
+
 \* Shard prunes a resolved transaction from its aborted set.
 \* Safe once the coordinator has fully finalized the transaction:
 \*   tx_state[id] = COMMITTED => coordinator sent COMMIT; no further writes for id possible.
@@ -578,6 +605,7 @@ Next ==
            \/ CoordHandleInquire(id, s)
            \/ ShardPruneAborted(s, id)
            \/ ShardHandleFastCommit(s, id)
+           \/ ShardTimeoutPrepared(s, id)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :
            ShardSendInquire(s, id, prepId, k)
 

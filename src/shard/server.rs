@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 
@@ -50,12 +51,11 @@ impl ShardService for ShardServer {
         let req = request.into_inner();
         let inquiry_results = proto_inquiry_results(req.inquiry_results);
 
-        let result = self.state.lock().unwrap().handle_read(
-            req.tx_id,
-            req.start_ts,
-            req.key,
-            &inquiry_results,
-        );
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.expire_prepared(Instant::now());
+            state.handle_read(req.tx_id, req.start_ts, req.key, &inquiry_results)
+        };
 
         use crate::proto::read_reply::Result as R;
         use crate::shard::ReadResult;
@@ -77,12 +77,16 @@ impl ShardService for ShardServer {
         request: Request<UpdateRequest>,
     ) -> Result<Response<UpdateReply>, Status> {
         let req = request.into_inner();
-        let result = self.state.lock().unwrap().handle_update(
-            req.tx_id,
-            req.start_ts,
-            req.key,
-            crate::shard::Value(req.value),
-        );
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.expire_prepared(Instant::now());
+            state.handle_update(
+                req.tx_id,
+                req.start_ts,
+                req.key,
+                crate::shard::Value(req.value),
+            )
+        };
 
         use crate::proto::update_reply::Result as R;
         use crate::shard::UpdateResult;
@@ -102,7 +106,11 @@ impl ShardService for ShardServer {
         request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareReply>, Status> {
         let req = request.into_inner();
-        let result = self.state.lock().unwrap().handle_prepare(req.tx_id);
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.expire_prepared(Instant::now());
+            state.handle_prepare(req.tx_id)
+        };
 
         use crate::proto::prepare_reply::Result as R;
         use crate::shard::PrepareResult;

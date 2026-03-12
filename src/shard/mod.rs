@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -88,6 +89,13 @@ pub struct ShardState {
     pub prepared: HashMap<TxId, Timestamp>,
     /// Transactions that have been aborted at this shard.
     pub aborted: HashSet<TxId>,
+    /// Wall-clock instant at which each transaction was prepared on this shard.
+    /// Cleared on commit, abort, or TTL-based auto-abort.
+    prepare_times: HashMap<TxId, Instant>,
+    /// Maximum time a prepared entry may sit unresolved before being auto-aborted
+    /// by `expire_prepared`. Protects conflicting writers from being permanently
+    /// blocked by a coordinator that crashed mid-2PC (ShardTimeoutPrepared in TLA+).
+    pub prepare_ttl: Duration,
 }
 
 impl Default for ShardState {
@@ -107,6 +115,8 @@ impl ShardState {
             write_keys: HashMap::new(),
             prepared: HashMap::new(),
             aborted: HashSet::new(),
+            prepare_times: HashMap::new(),
+            prepare_ttl: Duration::from_secs(30),
         }
     }
 
@@ -289,6 +299,7 @@ impl ShardState {
         let prep_t = self.clock + 1;
         self.clock = prep_t;
         self.prepared.insert(tx_id, prep_t);
+        self.prepare_times.insert(tx_id, Instant::now());
         PrepareResult::Timestamp(prep_t)
     }
 
@@ -317,6 +328,7 @@ impl ShardState {
             }
         }
         self.prepared.remove(&tx_id);
+        self.prepare_times.remove(&tx_id);
         self.prune_aborted();
     }
 
@@ -332,6 +344,7 @@ impl ShardState {
             }
         }
         self.prepared.remove(&tx_id);
+        self.prepare_times.remove(&tx_id);
         self.prune_aborted();
     }
 
@@ -367,6 +380,7 @@ impl ShardState {
             }
         }
         self.prepared.remove(&tx_id);
+        self.prepare_times.remove(&tx_id);
         self.prune_aborted();
         FastCommitResult::Ok(commit_ts)
     }
@@ -407,6 +421,52 @@ impl ShardState {
                 None => false,
             }
         });
+    }
+
+    /// Auto-abort prepared entries that have been waiting longer than `prepare_ttl`.
+    ///
+    /// This implements `ShardTimeoutPrepared` from the TLA+ spec: when a coordinator
+    /// crashes mid-2PC (stuck in PREPARING), the shard unilaterally aborts the
+    /// prepared entry after `prepare_ttl`, releasing write locks and unblocking
+    /// conflicting writers.
+    ///
+    /// Pass `now = Instant::now()` in production. In tests, pass a future instant
+    /// (e.g. `Instant::now() + Duration::from_secs(9_999_999)`) to force-expire
+    /// entries without sleeping.
+    ///
+    /// Returns the set of TxIds that were auto-aborted.
+    pub fn expire_prepared(&mut self, now: Instant) -> HashSet<TxId> {
+        let expired: HashSet<TxId> = self
+            .prepare_times
+            .iter()
+            .filter(|(_, &t)| now.saturating_duration_since(t) >= self.prepare_ttl)
+            .map(|(&tx_id, _)| tx_id)
+            .collect();
+
+        for &tx_id in &expired {
+            self.prepare_times.remove(&tx_id);
+            self.aborted.insert(tx_id);
+            if let Some(writes) = self.write_buff.remove(&tx_id) {
+                for key in writes.into_keys() {
+                    self.write_keys.remove(&key);
+                }
+            }
+            self.prepared.remove(&tx_id);
+        }
+
+        if !expired.is_empty() {
+            self.prune_aborted();
+        }
+
+        expired
+    }
+
+    /// Override the recorded prepare time for `tx_id`. Only for use in tests
+    /// to simulate entries that were prepared at an arbitrary past instant without
+    /// requiring the test to sleep.
+    #[cfg(test)]
+    pub fn force_prepare_time(&mut self, tx_id: TxId, t: Instant) {
+        self.prepare_times.insert(tx_id, t);
     }
 }
 

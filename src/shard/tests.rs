@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 
 // -----------------------------------------------------------------------
@@ -2417,4 +2419,169 @@ fn bsearch_fast_commit_inserts_version_in_sorted_order() {
     assert_eq!(ct, 5);
     let ts_list: Vec<u64> = s.versions[&K1].iter().map(|v| v.timestamp).collect();
     assert_eq!(ts_list, vec![1, 5]);
+}
+
+// -----------------------------------------------------------------------
+// expire_prepared — ShardTimeoutPrepared traces
+// -----------------------------------------------------------------------
+
+/// Helper: a ShardState with a specific prepare_ttl.
+fn shard_with_ttl(ttl: Duration) -> ShardState {
+    let mut s = ShardState::new();
+    s.prepare_ttl = ttl;
+    s
+}
+
+/// A far-future Instant to force-expire all prepared entries without sleeping.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(9_999_999)
+}
+
+// Trace: no prepared entries → expire_prepared is a no-op.
+#[test]
+fn expire_prepared_noop_on_empty_prepared_set() {
+    let mut s = shard();
+    let expired = s.expire_prepared(far_future());
+    assert!(expired.is_empty());
+}
+
+// Trace: prepared entry within TTL → not expired.
+#[test]
+fn expire_prepared_does_not_expire_within_ttl() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+    // Call with Instant::now() immediately; 0 time elapsed < 30 s TTL.
+    let expired = s.expire_prepared(Instant::now());
+    assert!(expired.is_empty());
+    assert!(s.prepared.contains_key(&T1));
+}
+
+// Trace: prepared entry past TTL → write lock and prepare entry cleaned up.
+// (ShardTimeoutPrepared action in TLA+)
+//
+// Note: after expiry, prune_aborted may immediately remove the tx from the
+// aborted set when no other active transactions from the same coordinator
+// port are in flight (watermark logic). We assert the functional outcomes
+// (write lock released, prepare cleared) rather than aborted-set membership.
+#[test]
+fn expire_prepared_aborts_entry_past_ttl() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+
+    let expired = s.expire_prepared(far_future());
+
+    assert_eq!(expired, HashSet::from([T1]));
+    assert!(!s.prepared.contains_key(&T1)); // removed from prepared
+    assert!(!s.write_buff.contains_key(&T1)); // write buffer cleared
+    assert!(!s.write_keys.contains_key(&K1)); // write lock released
+}
+
+// Trace: expired prepared entry releases write lock → fresh transaction can now write.
+#[test]
+fn expire_prepared_unblocks_conflicting_writer() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    // T1 writes K1 and prepares (takes write lock on K1).
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+
+    // T1's TTL expires.
+    s.expire_prepared(far_future());
+
+    // T2 (fresh, never aborted) can now write K1 with no conflict.
+    assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
+}
+
+// Trace: multiple prepared entries, only the one past TTL is expired.
+#[test]
+fn expire_prepared_only_expires_entries_past_ttl() {
+    let mut s = shard_with_ttl(Duration::from_secs(10));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+    s.handle_update(T2, 2, K2, v(20));
+    s.handle_prepare(T2);
+
+    let now = Instant::now();
+    // Simulate T1 being prepared 20 s ago (> 10 s TTL), T2 just now.
+    s.force_prepare_time(T1, now - Duration::from_secs(20));
+    s.force_prepare_time(T2, now);
+
+    let expired = s.expire_prepared(now);
+
+    // Only T1 is in the expired set; T2 is untouched.
+    assert_eq!(expired, HashSet::from([T1]));
+    assert!(!expired.contains(&T2));
+    assert!(s.prepared.contains_key(&T2)); // T2 still prepared
+    assert!(!s.write_keys.contains_key(&K1)); // T1's lock released
+    assert!(s.write_keys.contains_key(&K2)); // T2's lock still held
+}
+
+// Trace: committed entry is removed from prepare_times at commit time →
+// expire_prepared cannot touch it, versions stay intact.
+#[test]
+fn expire_prepared_ignores_committed_entries() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+    s.handle_commit(T1, 2); // removes from prepare_times
+
+    let expired = s.expire_prepared(far_future());
+
+    assert!(expired.is_empty());
+    assert!(s.versions.contains_key(&K1)); // version still installed
+}
+
+// Trace: aborted entry is removed from prepare_times at abort time →
+// expire_prepared is a no-op on it.
+#[test]
+fn expire_prepared_ignores_already_aborted_entries() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+    s.handle_abort(T1); // removes from prepare_times
+
+    let expired = s.expire_prepared(far_future());
+
+    assert!(expired.is_empty());
+}
+
+// Trace: expire_prepared calls prune_aborted internally; entries whose
+// coordinator has moved on are pruned from the aborted set.
+#[test]
+fn expire_prepared_prunes_safe_aborted_entries_via_watermark() {
+    // tx1: port 7000, seq 1 (old, will be expired)
+    let tx1: TxId = (7000u64 << 32) | 1;
+    // tx2: port 7000, seq 100 (newer, currently active in write_buff)
+    let tx2: TxId = (7000u64 << 32) | 100;
+
+    let mut s = shard_with_ttl(Duration::from_secs(10));
+    s.handle_update(tx1, 1, K1, v(10));
+    s.handle_prepare(tx1);
+    // tx2 is active (has a write buffer entry but no prepare).
+    s.handle_update(tx2, 2, K2, v(20));
+
+    // Expire tx1 (force its prepare time to be old).
+    let now = Instant::now();
+    s.force_prepare_time(tx1, now - Duration::from_secs(20));
+    let expired = s.expire_prepared(now);
+
+    assert!(expired.contains(&tx1));
+    // prune_aborted fires after expiry: min_active_seq[7000] = 100 (from tx2
+    // in write_buff), and tx1.seq = 1 < 100, so tx1 is pruned from aborted.
+    assert!(!s.aborted.contains(&tx1));
+}
+
+// Trace: expire on a tx with no prepare entry (only in write_buff, never
+// prepared) does nothing to that tx.
+#[test]
+fn expire_prepared_ignores_unprepared_tx() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    // T1 has a buffered write but was never prepared.
+    s.handle_update(T1, 1, K1, v(10));
+
+    let expired = s.expire_prepared(far_future());
+
+    assert!(expired.is_empty());
+    assert!(s.write_buff.contains_key(&T1)); // write buffer untouched
 }
