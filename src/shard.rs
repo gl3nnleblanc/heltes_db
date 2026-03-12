@@ -120,7 +120,77 @@ impl ShardState {
         key: Key,
         inquiry_results: &HashMap<TxId, InquiryStatus>,
     ) -> ReadResult {
-        unimplemented!()
+        if self.aborted.contains(&tx_id) {
+            return ReadResult::Abort;
+        }
+
+        // Own buffered write — return it directly (read-your-writes).
+        if let Some(writes) = self.write_buff.get(&tx_id) {
+            if let Some(val) = writes.get(&key) {
+                self.clock = self.clock.max(start_ts);
+                return ReadResult::Value(val.clone());
+            }
+        }
+
+        // Find prepared writers of this key whose prep_t < start_ts.
+        // These are potentially visible and need coordinator inquiry.
+        let mut needs_inquiry: Vec<TxId> = Vec::new();
+        for (&writer, &prep_t) in &self.prepared {
+            if writer == tx_id {
+                continue;
+            }
+            let wrote_key = self
+                .write_buff
+                .get(&writer)
+                .map(|wb| wb.contains_key(&key))
+                .unwrap_or(false);
+            if wrote_key && prep_t < start_ts {
+                // Check if inquiry result is already provided.
+                match inquiry_results.get(&writer) {
+                    Some(InquiryStatus::Committed(ct)) => {
+                        // Committed before our snapshot — version must be installed.
+                        if *ct < start_ts {
+                            let installed = self
+                                .versions
+                                .get(&key)
+                                .map(|vs| vs.iter().any(|v| v.timestamp == *ct))
+                                .unwrap_or(false);
+                            if !installed {
+                                needs_inquiry.push(writer);
+                            }
+                        }
+                        // If ct >= start_ts it committed after our snapshot; not visible — skip.
+                    }
+                    Some(InquiryStatus::Active) => {
+                        // Still in-flight; not visible to our snapshot — skip.
+                    }
+                    None => {
+                        needs_inquiry.push(writer);
+                    }
+                }
+            }
+        }
+
+        if !needs_inquiry.is_empty() {
+            needs_inquiry.sort();
+            return ReadResult::NeedsInquiry(needs_inquiry);
+        }
+
+        // Return the latest version with timestamp < start_ts.
+        let versions = self.versions.get(&key).expect("key not found in shard");
+        let best = versions
+            .iter()
+            .filter(|v| v.timestamp < start_ts)
+            .max_by_key(|v| v.timestamp);
+
+        // If nothing strictly before start_ts, fall back to the init version (ts=0).
+        let result = best
+            .or_else(|| versions.first())
+            .cloned()
+            .expect("every key has at least the init version");
+
+        self.clock = self.clock.max(start_ts);
+        ReadResult::Value(result.value)
     }
 
     /// Handle UPDATE_KEY(id, start_ts, key, value).
@@ -136,7 +206,54 @@ impl ShardState {
         key: Key,
         value: Value,
     ) -> UpdateResult {
-        unimplemented!()
+        if self.aborted.contains(&tx_id) {
+            return UpdateResult::Abort;
+        }
+
+        // CommittedConflict: any installed version with timestamp >= start_ts.
+        let committed_conflict = self
+            .versions
+            .get(&key)
+            .map(|vs| vs.iter().any(|v| v.timestamp >= start_ts))
+            .unwrap_or(false);
+        if committed_conflict {
+            self.aborted.insert(tx_id);
+            return UpdateResult::Abort;
+        }
+
+        // PreparedConflict: any other prepared tx that wrote this key has prep_t >= start_ts.
+        let prepared_conflict = self.prepared.iter().any(|(&other, &prep_t)| {
+            other != tx_id
+                && prep_t >= start_ts
+                && self
+                    .write_buff
+                    .get(&other)
+                    .map(|wb| wb.contains_key(&key))
+                    .unwrap_or(false)
+        });
+        if prepared_conflict {
+            self.aborted.insert(tx_id);
+            return UpdateResult::Abort;
+        }
+
+        // WriteBuffConflict: any other non-aborted tx already buffered a write to this key,
+        // regardless of whether it is prepared. A prepared tx retains its write in write_buff
+        // until commit, so the lock persists.
+        let write_buff_conflict = self.write_buff.iter().any(|(&other, wb)| {
+            other != tx_id && !self.aborted.contains(&other) && wb.contains_key(&key)
+        });
+        if write_buff_conflict {
+            self.aborted.insert(tx_id);
+            return UpdateResult::Abort;
+        }
+
+        // Buffer the write and advance clock.
+        self.write_buff
+            .entry(tx_id)
+            .or_default()
+            .insert(key, value);
+        self.clock = self.clock.max(start_ts);
+        UpdateResult::Ok
     }
 
     /// Handle PREPARE(id).
@@ -144,7 +261,17 @@ impl ShardState {
     /// Assigns a prepare timestamp = clock + 1, advances clock, records
     /// (tx_id, prep_t) in `self.prepared`.
     pub fn handle_prepare(&mut self, tx_id: TxId) -> PrepareResult {
-        unimplemented!()
+        if self.aborted.contains(&tx_id) {
+            return PrepareResult::Abort;
+        }
+        // Idempotent: if already prepared, return existing timestamp.
+        if let Some(&prep_t) = self.prepared.get(&tx_id) {
+            return PrepareResult::Timestamp(prep_t);
+        }
+        let prep_t = self.clock + 1;
+        self.clock = prep_t;
+        self.prepared.insert(tx_id, prep_t);
+        PrepareResult::Timestamp(prep_t)
     }
 
     /// Handle COMMIT(id, commit_ts).
@@ -152,7 +279,17 @@ impl ShardState {
     /// Installs all buffered writes for `tx_id` as new MVCC versions at
     /// `commit_ts`, clears the write buffer, and removes the tx from `prepared`.
     pub fn handle_commit(&mut self, tx_id: TxId, commit_ts: Timestamp) {
-        unimplemented!()
+        if let Some(writes) = self.write_buff.remove(&tx_id) {
+            for (key, value) in writes {
+                let vs = self.versions.entry(key).or_default();
+                // Idempotent: skip if this timestamp is already installed.
+                if !vs.iter().any(|v| v.timestamp == commit_ts) {
+                    vs.push(Version { value, timestamp: commit_ts });
+                    vs.sort_by_key(|v| v.timestamp);
+                }
+            }
+        }
+        self.prepared.remove(&tx_id);
     }
 
     /// Handle ABORT(id).
@@ -160,7 +297,9 @@ impl ShardState {
     /// Marks `tx_id` as aborted, clears its write buffer, and removes it from
     /// `prepared`.
     pub fn handle_abort(&mut self, tx_id: TxId) {
-        unimplemented!()
+        self.aborted.insert(tx_id);
+        self.write_buff.remove(&tx_id);
+        self.prepared.remove(&tx_id);
     }
 }
 
@@ -501,10 +640,11 @@ mod tests {
 
     #[test]
     fn update_no_conflict_when_prepared_writer_prep_ts_strictly_before_start_ts() {
-        // prep_t=4 < start_ts=5 → no prepared conflict (committed conflict checked separately).
+        // prep_t=4 < start_ts=5 → no prepared conflict.
+        // T2 prepared for K2 (not K1), so no WriteBuffConflict on K1 either.
         let mut s = shard();
         s.prepared.insert(T2, 4);
-        s.write_buff.entry(T2).or_default().insert(K1, v(50));
+        s.write_buff.entry(T2).or_default().insert(K2, v(50));
 
         assert_eq!(s.handle_update(T1, 5, K1, v(99)), UpdateResult::Ok);
     }
@@ -740,7 +880,7 @@ mod tests {
     }
 
     /// SI4: Two concurrent writers to the same key — the second must be aborted.
-    /// T1: start_ts=1, writes K1, prepares (prep_t=2), commits (ct=3).
+    /// T1: start_ts=1, writes K1, prepares, commits (ct=3).
     /// T2: start_ts=1, writes K1 → conflict because committed version ct=3 >= start_ts=1.
     #[test]
     fn si4_concurrent_writers_to_same_key_second_is_aborted() {
@@ -748,7 +888,7 @@ mod tests {
 
         // T1 succeeds.
         assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
-        assert_eq!(s.handle_prepare(T1), PrepareResult::Timestamp(1));
+        assert!(matches!(s.handle_prepare(T1), PrepareResult::Timestamp(_)));
         s.handle_commit(T1, 3);
 
         // T2 is concurrent (start_ts=1) and tries to write the same key.
@@ -1239,7 +1379,8 @@ mod tests {
     fn path_inquire_active_read_sees_pre_prepare_version() {
         let mut s = shard();
         s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 2 });
-        s.handle_update(T1, 1, K1, v(77));
+        // T1 must start after the committed version at ts=2 to avoid CommittedConflict.
+        s.handle_update(T1, 3, K1, v(77));
         let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
         // T2 reads K1 at start_ts > t1_prep.
         let start_ts = t1_prep + 2;
