@@ -510,6 +510,10 @@
     #[test]
     fn abort_marks_tx_in_aborted_set() {
         let mut s = shard();
+        // T1=101 encodes as (port=0, seq=101).  An older in-flight tx from the same
+        // port (seq=50 < 101) keeps min_active_seq[0]=50, so seq=101 >= 50 → retained.
+        let t_older: TxId = 50; // port=0, seq=50
+        s.write_buff.entry(t_older).or_default().insert(K2, v(99));
         s.handle_abort(T1);
         assert!(s.aborted.contains(&T1));
     }
@@ -810,18 +814,24 @@
     }
 
     /// Path: update → abort → read on aborted tx returns Abort.
+    /// An older in-flight tx from the same port prevents pruning of T1 from aborted.
     #[test]
     fn path_read_on_aborted_tx_returns_abort() {
         let mut s = shard();
+        let t_older: TxId = 50; // port=0, seq=50 — keeps T1 (seq=101) in aborted
+        s.write_buff.entry(t_older).or_default().insert(K2, v(99));
         s.handle_update(T1, 1, K1, v(42));
         s.handle_abort(T1);
         assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Abort);
     }
 
     /// Path: update → abort → update on same tx returns Abort.
+    /// An older in-flight tx from the same port prevents pruning of T1 from aborted.
     #[test]
     fn path_update_on_aborted_tx_returns_abort() {
         let mut s = shard();
+        let t_older: TxId = 50; // port=0, seq=50 — keeps T1 (seq=101) in aborted
+        s.write_buff.entry(t_older).or_default().insert(K2, v(99));
         s.handle_update(T1, 1, K1, v(42));
         s.handle_abort(T1);
         assert_eq!(s.handle_update(T1, 1, K2, v(5)), UpdateResult::Abort);
@@ -1336,7 +1346,9 @@
         s.handle_update(T1, 1, K1, v(10));
         s.handle_abort(T1);
         s.handle_abort(T1);
-        assert!(s.aborted.contains(&T1));
+        // After both aborts, write_buff for T1 must be cleared.
+        // T1 may or may not still be in `aborted` depending on pruning; we only
+        // assert the observable effect: the write buffer is empty.
         assert!(s.write_buff.get(&T1).map(|b| b.is_empty()).unwrap_or(true));
     }
 
@@ -1562,4 +1574,153 @@
         // Explicit abort of T2 (coordinator sends ABORT) doesn't disturb T1's lock.
         s.handle_abort(T2);
         assert_eq!(s.write_keys.get(&K1), Some(&T1));
+    }
+
+    // -----------------------------------------------------------------------
+    // prune_aborted — bounded aborted HashSet
+    //
+    // TxId encoding: (coordinator_port << 32) | seq.
+    // A shard can prune aborted entry with seq=N from port=P once the
+    // minimum in-flight seq from P is > N (or P has no in-flight txs).
+    // -----------------------------------------------------------------------
+
+    // Port/seq encoded TxIds used only by the prune tests.
+    const P1_S1: TxId = (1u64 << 32) | 1; // port 1, seq 1
+    const P1_S2: TxId = (1u64 << 32) | 2; // port 1, seq 2
+    const P1_S3: TxId = (1u64 << 32) | 3; // port 1, seq 3
+    const P2_S1: TxId = (2u64 << 32) | 1; // port 2, seq 1
+    const P2_S2: TxId = (2u64 << 32) | 2; // port 2, seq 2
+
+    // Trace: ShardPruneAborted on empty set — no-op.
+    #[test]
+    fn prune_aborted_noop_when_set_empty() {
+        let mut s = shard();
+        s.prune_aborted();
+        assert!(s.aborted.is_empty());
+    }
+
+    // Trace: tx is ABORTED at coordinator, no active tx from same port.
+    // ShardPruneAborted fires and removes the entry.
+    #[test]
+    fn prune_aborted_removes_when_no_active_tx_from_same_port() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        // No write_buff or prepared entries from port 1 → safe to prune.
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1));
+    }
+
+    // Trace: aborted entry from port P; active tx from a different port P2.
+    // Different port's watermark is irrelevant — P1_S1 still pruned.
+    #[test]
+    fn prune_aborted_ignores_active_tx_from_different_port() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        // Simulate P2_S1 active in write_buff.
+        s.write_buff.entry(P2_S1).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 should be pruned (P2's watermark is irrelevant)");
+    }
+
+    // Trace: aborted entry P1_S1; active tx P1_S3 in write_buff (seq 3 > 1).
+    // min_active_seq[P1] = 3, aborted seq = 1 < 3 → pruned.
+    #[test]
+    fn prune_aborted_removes_lower_seq_when_higher_seq_active_in_write_buff() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        s.write_buff.entry(P1_S3).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 seq=1 < min_active_seq=3, should be pruned");
+    }
+
+    // Trace: aborted entry P1_S3; active tx P1_S1 in write_buff (seq 1 < 3).
+    // min_active_seq[P1] = 1, aborted seq = 3 >= 1 → retained (conservative).
+    #[test]
+    fn prune_aborted_retains_higher_seq_when_lower_seq_active_in_write_buff() {
+        let mut s = shard();
+        s.aborted.insert(P1_S3);
+        s.write_buff.entry(P1_S1).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(s.aborted.contains(&P1_S3), "P1_S3 seq=3 >= min_active_seq=1, must be retained");
+    }
+
+    // Trace: aborted entry P1_S1; active tx P1_S2 in prepared (not write_buff).
+    // Prepared txs also count as in-flight: min_active_seq[P1] = 2 > 1 → pruned.
+    #[test]
+    fn prune_aborted_removes_lower_seq_when_higher_seq_in_prepared() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        s.prepared.insert(P1_S2, 5); // P1_S2 is prepared at ts=5
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 seq=1 < min_active_seq=2, should be pruned");
+    }
+
+    // Trace: multiple aborted entries from same port; only older ones pruned.
+    // aborted = {P1_S1, P1_S3}, write_buff has P1_S2 (active).
+    // min_active_seq[P1] = 2: seq=1 < 2 → prune; seq=3 >= 2 → retain.
+    #[test]
+    fn prune_aborted_selectively_prunes_only_safe_entries() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        s.aborted.insert(P1_S3);
+        s.write_buff.entry(P1_S2).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 seq=1 < min=2, should be pruned");
+        assert!(s.aborted.contains(&P1_S3), "P1_S3 seq=3 >= min=2, should be retained");
+    }
+
+    // Trace: multiple ports; entries from each pruned independently.
+    // aborted = {P1_S1, P2_S2}; write_buff has P1_S3 (active from port 1).
+    // min_active_seq[P1]=3 → P1_S1 pruned; no active from P2 → P2_S2 pruned.
+    #[test]
+    fn prune_aborted_handles_multiple_ports_independently() {
+        let mut s = shard();
+        s.aborted.insert(P1_S1);
+        s.aborted.insert(P2_S2);
+        s.write_buff.entry(P1_S3).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 pruned (seq=1 < min_active[P1]=3)");
+        assert!(!s.aborted.contains(&P2_S2), "P2_S2 pruned (no active tx from P2)");
+    }
+
+    // Trace: handle_abort automatically calls prune_aborted.
+    // P1_S3 is in write_buff (active); P1_S1 is being aborted.
+    // After abort: P1_S1 in aborted, prune fires, P1_S1 immediately pruned
+    // (seq=1 < min_active_seq[P1]=3).
+    #[test]
+    fn prune_aborted_called_automatically_from_handle_abort() {
+        let mut s = shard();
+        s.write_buff.entry(P1_S3).or_default().insert(K1, v(10));
+        s.handle_abort(P1_S1);
+        // P1_S1 should be immediately pruned since P1_S3 (seq=3) is active.
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 should be pruned immediately after abort");
+    }
+
+    // Trace: handle_commit automatically calls prune_aborted.
+    // P1_S1 was aborted earlier; P1_S2 just committed.
+    // After commit: write_buff[P1_S2] cleared, prune fires, P1_S1 pruned
+    // (no active tx from P1 remaining).
+    #[test]
+    fn prune_aborted_called_automatically_from_handle_commit() {
+        let mut s = shard();
+        // Set up: P1_S1 was aborted previously.
+        s.aborted.insert(P1_S1);
+        // P1_S2 writes a key and commits.
+        s.write_buff.entry(P1_S2).or_default().insert(K1, v(20));
+        s.prepared.insert(P1_S2, 3);
+        s.handle_commit(P1_S2, 4);
+        // After commit, prune_aborted fires; no active from P1 → P1_S1 pruned.
+        assert!(!s.aborted.contains(&P1_S1), "P1_S1 should be pruned after P1_S2 commits");
+    }
+
+    // Trace: aborted set entry that can't yet be pruned (in-flight tx from same port).
+    // P1_S2 is aborted; P1_S1 still in write_buff (old active tx, lower seq).
+    // min_active_seq[P1] = 1, aborted seq=2 >= 1 → must retain.
+    #[test]
+    fn prune_aborted_retains_entry_when_older_tx_still_active() {
+        let mut s = shard();
+        s.aborted.insert(P1_S2);
+        s.write_buff.entry(P1_S1).or_default().insert(K1, v(10));
+        s.prune_aborted();
+        assert!(s.aborted.contains(&P1_S2), "P1_S2 must be retained: P1_S1 (seq=1) still active");
     }

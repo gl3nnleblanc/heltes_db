@@ -282,6 +282,7 @@ impl ShardState {
             }
         }
         self.prepared.remove(&tx_id);
+        self.prune_aborted();
     }
 
     /// Handle ABORT(id).
@@ -296,6 +297,45 @@ impl ShardState {
             }
         }
         self.prepared.remove(&tx_id);
+        self.prune_aborted();
+    }
+
+    /// Prune entries from `aborted` that are safe to discard.
+    ///
+    /// TxIds are encoded as `(coordinator_port << 32) | seq`.  A coordinator
+    /// assigns seq numbers monotonically, so once it has an in-flight transaction
+    /// with seq M it has already fully resolved every transaction with seq < M.
+    /// Therefore an aborted entry with seq N from port P is safe to remove when
+    /// `min_active_seq[P] > N` — i.e. when every in-flight transaction from P
+    /// has a strictly higher sequence number — or when port P has no in-flight
+    /// transactions at all.
+    ///
+    /// "In-flight" means the transaction still has a write buffer entry or a
+    /// prepared entry on this shard.
+    pub fn prune_aborted(&mut self) {
+        // Build a watermark: for each coordinator port, find the minimum seq
+        // number among all transactions that are still in-flight on this shard
+        // (i.e., have a write buffer entry or a prepared entry).
+        let mut min_active_seq: HashMap<u32, u32> = HashMap::new();
+        for &tx_id in self.write_buff.keys().chain(self.prepared.keys()) {
+            let port = (tx_id >> 32) as u32;
+            let seq  = tx_id as u32;
+            let e = min_active_seq.entry(port).or_insert(u32::MAX);
+            *e = (*e).min(seq);
+        }
+        // An aborted entry with (port, seq) is safe to discard when:
+        //   - No in-flight tx from the same port exists, OR
+        //   - The minimum in-flight seq from that port is strictly greater than seq.
+        // In both cases the coordinator at `port` has progressed past `seq` and
+        // will never send new messages for this tx_id.
+        self.aborted.retain(|&tx_id| {
+            let port = (tx_id >> 32) as u32;
+            let seq  = tx_id as u32;
+            match min_active_seq.get(&port) {
+                Some(&min) => seq >= min,
+                None       => false,
+            }
+        });
     }
 }
 

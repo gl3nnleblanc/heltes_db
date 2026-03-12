@@ -428,6 +428,19 @@ ShardHandleAbort(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, msgs>>
 
+\* Shard prunes a resolved transaction from its aborted set.
+\* Safe once the coordinator has fully finalized the transaction:
+\*   tx_state[id] = COMMITTED => coordinator sent COMMIT; no further writes for id possible.
+\*   tx_state[id] = ABORTED   => coordinator sent ABORT;  no further writes for id possible.
+\* In the implementation this is approximated by a coordinator-port seq-watermark:
+\*   prune seq N from port P when min active seq from P is > N (or P has no active txs).
+ShardPruneAborted(s, id) ==
+    /\ tx_state[id] \in {"COMMITTED", "ABORTED"}
+    /\ id \in s_aborted[s]
+    /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \ {id}]
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, msgs>>
+
 ------------------------------------------------------------------------
 (* Next-state relation *)
 
@@ -448,7 +461,8 @@ Next ==
            \/ CoordUpdate(id, k, v)
            \/ ShardHandleUpdate(ShardOf[k], id, k, v)
     \/ \E id \in TxIds, s \in Shards :
-           CoordHandleInquire(id, s)
+           \/ CoordHandleInquire(id, s)
+           \/ ShardPruneAborted(s, id)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :
            ShardSendInquire(s, id, prepId, k)
 

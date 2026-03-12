@@ -2,7 +2,6 @@
 
 ## Correctness
 
-- **Bound and prune the `aborted` HashSet** — currently grows without limit; entries can be removed once all in-flight transactions with lower tx_ids have resolved _(2 pts)_
 - **Handle coordinator crash mid-2PC** — transactions left in PREPARING or COMMIT_WAIT are permanently stuck on shards; need a recovery protocol or coordinator-side WAL _(13 pts)_
 - **Fix hardcoded `[::1]` in cross-coordinator Inquire** — coordinators can't actually run on separate machines without a way to resolve coordinator address from port _(3 pts)_
 
