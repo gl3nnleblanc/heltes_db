@@ -10,7 +10,6 @@
  *   - All communication is via explicit message passing
  *
  * Assumptions (matching the proof):
- *   - All keys exist initially (no create/delete)
  *   - Each key k is owned by exactly one shard: ShardOf[k]
  *   - Each transaction id has exactly one coordinator: CoordOf[id]
  *   - Processes do not fail
@@ -34,12 +33,10 @@ CONSTANTS
     Shards,         \* Set of shard process identifiers
     CoordOf,        \* CoordOf[id] : TxId -> Coordinator
     ShardOf,        \* ShardOf[k]  : Key  -> Shard
-    InitVal,        \* Initial value held by every key at timestamp 0
     MaxTimestamp,   \* Upper bound on timestamps (for finite model checking)
     ABORT,          \* Sentinel: abort signal (model value, not in Values)
-    NONE            \* Sentinel: absent timestamp (model value, not in Timestamps)
+    NONE            \* Sentinel: absent/not-found (model value, not in Timestamps or Values)
 
-ASSUME InitVal \in Values
 ASSUME ABORT \notin Values
 ASSUME \A id \in TxIds    : CoordOf[id] \in Coordinators
 ASSUME \A k  \in Keys     : ShardOf[k]  \in Shards
@@ -110,11 +107,12 @@ SendAll(S) == msgs' = msgs \cup S
 ------------------------------------------------------------------------
 (* Helpers *)
 
-\* The latest committed (value, timestamp) pair for key k strictly before t
+\* The latest committed (value, timestamp) pair for key k strictly before t.
+\* Returns <<NONE, 0>> if no version exists before t (key does not exist at that snapshot).
 LatestVersionBefore(k, t) ==
     LET eligible == {tv \in versions[k] : tv[2] < t}
     IN IF eligible = {}
-       THEN <<InitVal, 0>>
+       THEN <<NONE, 0>>
        ELSE CHOOSE tv \in eligible : \A tv2 \in eligible : tv2[2] <= tv[2]
 
 \* True if shard s has a prepared transaction that buffered a write to key k
@@ -150,7 +148,7 @@ Init ==
     /\ participants = [id \in TxIds |-> {}]
     /\ tx_state     = [id \in TxIds |-> "IDLE"]
     /\ s_clock      = [s \in Shards |-> 0]
-    /\ versions     = [k \in Keys |-> {<<InitVal, 0>>}]
+    /\ versions     = [k \in Keys |-> {}]
     /\ write_buff   = [id \in TxIds |-> {}]
     /\ s_prepared   = [s \in Shards |-> {}]
     /\ s_aborted    = [s \in Shards |-> {}]
@@ -492,5 +490,4 @@ THEOREM Spec => []HeltesDBInvariant
 \*   Shards       <- {s1}
 \*   CoordOf      <- (t1 :> c1 @@ t2 :> c1)
 \*   ShardOf      <- (k1 :> s1)
-\*   InitVal      <- v1
 \*   MaxTimestamp <- 6
