@@ -1,0 +1,193 @@
+syntax = "proto3";
+package heltes_db;
+
+// ── Shard service ─────────────────────────────────────────────────────────────
+//
+// One ShardService instance runs per shard process. The coordinator calls these
+// RPCs to drive the Heltes SI protocol on behalf of transactions.
+
+service ShardService {
+  rpc Read    (ReadRequest)    returns (ReadReply);
+  rpc Update  (UpdateRequest)  returns (UpdateReply);
+  rpc Prepare (PrepareRequest) returns (PrepareReply);
+  rpc Commit  (CommitRequest)  returns (CommitReply);
+  rpc Abort   (AbortRequest)   returns (AbortReply);
+}
+
+// ── Coordinator service ───────────────────────────────────────────────────────
+//
+// One CoordinatorService instance runs per coordinator process.
+//
+// Client-facing RPCs drive the full transaction lifecycle. The coordinator
+// handles all shard routing, Inquire retry loops, and 2PC internally — clients
+// never see shards.
+//
+// Commit blocks until 2PC completes (all shards have installed the version).
+//
+// Internal RPC: shards call Inquire to resolve prepared-writer visibility.
+
+service CoordinatorService {
+  // Client-facing
+  rpc Begin   (TxBeginRequest)   returns (TxBeginReply);
+  rpc Read    (TxReadRequest)    returns (TxReadReply);
+  rpc Update  (TxUpdateRequest)  returns (TxUpdateReply);
+  rpc Commit  (TxCommitRequest)  returns (TxCommitReply);
+  rpc Abort   (TxAbortRequest)   returns (TxAbortReply);
+
+  // Internal: shard → coordinator
+  rpc Inquire (InquireRequest)   returns (InquireReply);
+}
+
+// ── Shared primitives ─────────────────────────────────────────────────────────
+
+// Reusable unit-variant messages (proto3 bools in oneofs are error-prone).
+message Abort  {}
+message Active {}
+
+// ── Read ──────────────────────────────────────────────────────────────────────
+
+message ReadRequest {
+  uint64                tx_id           = 1;
+  uint64                start_ts        = 2;
+  uint64                key             = 3;
+  // Coordinator-resolved INQUIRE results from a previous NeedsInquiry reply.
+  // Empty on the first attempt; populated on retries.
+  repeated InquiryResult inquiry_results = 4;
+}
+
+// One resolved INQUIRE result supplied by the coordinator.
+message InquiryResult {
+  uint64 tx_id = 1;
+  oneof status {
+    uint64 committed_at = 2;  // Committed(ts)
+    Active active       = 3;  // Active
+  }
+}
+
+message ReadReply {
+  oneof result {
+    uint64          value         = 1;  // Value(v)
+    bool            not_found     = 2;  // NotFound  (true = not found)
+    Abort           abort         = 3;  // Abort
+    NeedsInquirySet needs_inquiry = 4;  // NeedsInquiry(ids)
+  }
+}
+
+message NeedsInquirySet {
+  repeated uint64 tx_ids = 1;
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+
+message UpdateRequest {
+  uint64 tx_id    = 1;
+  uint64 start_ts = 2;
+  uint64 key      = 3;
+  uint64 value    = 4;
+}
+
+message UpdateReply {
+  oneof result {
+    bool  ok    = 1;  // Ok
+    Abort abort = 2;  // Abort
+  }
+}
+
+// ── Prepare ───────────────────────────────────────────────────────────────────
+
+message PrepareRequest {
+  uint64 tx_id = 1;
+}
+
+message PrepareReply {
+  oneof result {
+    uint64 timestamp = 1;  // Timestamp(t)
+    Abort  abort     = 2;  // Abort
+  }
+}
+
+// ── Commit ────────────────────────────────────────────────────────────────────
+
+message CommitRequest {
+  uint64 tx_id     = 1;
+  uint64 commit_ts = 2;
+}
+
+message CommitReply {}
+
+// ── Abort ─────────────────────────────────────────────────────────────────────
+
+message AbortRequest {
+  uint64 tx_id = 1;
+}
+
+message AbortReply {}
+
+// ── Coordinator client-facing messages ───────────────────────────────────────
+//
+// These differ from the shard-level messages: start_ts and commit_ts are
+// managed internally by the coordinator; clients only supply tx_id, key, value.
+
+message TxBeginRequest {}
+
+message TxBeginReply {
+  uint64 tx_id    = 1;
+  uint64 start_ts = 2;
+}
+
+message TxReadRequest {
+  uint64 tx_id = 1;
+  uint64 key   = 2;
+}
+
+message TxReadReply {
+  oneof result {
+    uint64 value     = 1;  // Value(v)
+    bool   not_found = 2;  // NotFound
+    Abort  abort     = 3;  // transaction was aborted
+  }
+}
+
+message TxUpdateRequest {
+  uint64 tx_id  = 1;
+  uint64 key    = 2;
+  uint64 value  = 3;
+}
+
+message TxUpdateReply {
+  oneof result {
+    bool  ok    = 1;
+    Abort abort = 2;
+  }
+}
+
+message TxCommitRequest {
+  uint64 tx_id = 1;
+}
+
+message TxCommitReply {
+  oneof result {
+    uint64 commit_ts = 1;  // committed at this timestamp
+    Abort  abort     = 2;  // 2PC failed (a shard aborted)
+  }
+}
+
+message TxAbortRequest {
+  uint64 tx_id = 1;
+}
+
+message TxAbortReply {}
+
+// ── Inquire ───────────────────────────────────────────────────────────────────
+
+message InquireRequest {
+  uint64 tx_id   = 1;
+  uint64 prep_ts = 2;
+}
+
+message InquireReply {
+  oneof status {
+    uint64 committed_at = 1;  // Committed(ts)
+    Active active       = 2;  // Active
+  }
+}

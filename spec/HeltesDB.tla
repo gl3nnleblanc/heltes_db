@@ -32,6 +32,9 @@ CONSTANTS
     Coordinators,   \* Set of coordinator process identifiers
     Shards,         \* Set of shard process identifiers
     CoordOf,        \* CoordOf[id] : TxId -> Coordinator
+                    \*   In the implementation, CoordOf is derived from the tx_id
+                    \*   encoding itself (high bits = coordinator port), so no
+                    \*   external lookup or coordination between coordinators is needed.
     ShardOf,        \* ShardOf[k]  : Key  -> Shard
     MaxTimestamp,   \* Upper bound on timestamps (for finite model checking)
     ABORT,          \* Sentinel: abort signal (model value, not in Values)

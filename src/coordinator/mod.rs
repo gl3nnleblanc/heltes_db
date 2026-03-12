@@ -1,0 +1,259 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::shard::{InquiryStatus, Timestamp, TxId};
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+pub type ShardId = u64;
+
+/// Maps directly to tx_state in TLA+: ACTIVE / PREPARING / COMMIT_WAIT / COMMITTED / ABORTED.
+/// IDLE is not represented here; a TxEntry is only created on start_tx.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxPhase {
+    Active,
+    Preparing,
+    CommitWait,
+    Committed,
+    Aborted,
+}
+
+// ---------------------------------------------------------------------------
+// Result types (one per coordinator action)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BeginCommitResult {
+    /// Send PREPARE to these shards (tx_state → PREPARING).
+    Prepare(HashSet<ShardId>),
+    /// Transaction was already aborted.
+    Aborted,
+    /// No participant shards were registered — nothing to commit.
+    NoParticipants,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CollectPrepareResult {
+    /// Waiting for more PREPARE_REPLYs.
+    NeedMore,
+    /// All shards replied OK; send COMMIT to participants.
+    Done { commit_ts: Timestamp, participants: HashSet<ShardId> },
+    /// At least one shard replied ABORT.
+    Aborted,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendCommitResult {
+    /// tx_state → COMMITTED; send CommitMsg(tx_id, commit_ts) to these shards.
+    Ok { commit_ts: Timestamp, participants: HashSet<ShardId> },
+    /// Transaction is not in CommitWait phase.
+    NotReady,
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator state
+// ---------------------------------------------------------------------------
+
+struct TxEntry {
+    start_ts: Timestamp,
+    commit_ts: Option<Timestamp>,
+    is_committed: bool,
+    participants: HashSet<ShardId>,
+    phase: TxPhase,
+    /// PREPARE_REPLYs collected so far: shard → prep_t.
+    prepare_replies: HashMap<ShardId, Timestamp>,
+}
+
+pub struct CoordinatorState {
+    /// Logical clock (c_clock in TLA+).
+    pub clock: Timestamp,
+    transactions: HashMap<TxId, TxEntry>,
+}
+
+impl CoordinatorState {
+    pub fn new() -> Self {
+        CoordinatorState { clock: 0, transactions: HashMap::new() }
+    }
+
+    // -- Accessors -----------------------------------------------------------
+
+    pub fn tx_phase(&self, tx_id: TxId) -> Option<TxPhase> {
+        self.transactions.get(&tx_id).map(|t| t.phase.clone())
+    }
+
+    pub fn start_ts(&self, tx_id: TxId) -> Option<Timestamp> {
+        self.transactions.get(&tx_id).map(|t| t.start_ts)
+    }
+
+    // -- Actions -------------------------------------------------------------
+
+    /// CoordStartTx: assign start_ts = clock + 1, advance clock.
+    /// Returns start_ts.
+    pub fn start_tx(&mut self, tx_id: TxId) -> Timestamp {
+        let start_ts = self.clock + 1;
+        self.clock = start_ts;
+        self.transactions.insert(tx_id, TxEntry {
+            start_ts,
+            commit_ts: None,
+            is_committed: false,
+            participants: HashSet::new(),
+            phase: TxPhase::Active,
+            prepare_replies: HashMap::new(),
+        });
+        start_ts
+    }
+
+    /// CoordUpdate (participant tracking half): record shard_id as a participant
+    /// of tx_id. Called when the coordinator routes an update to a shard.
+    pub fn add_participant(&mut self, tx_id: TxId, shard_id: ShardId) {
+        if let Some(tx) = self.transactions.get_mut(&tx_id) {
+            if tx.phase == TxPhase::Active {
+                tx.participants.insert(shard_id);
+            }
+        }
+    }
+
+    /// CoordBeginCommit: transition ACTIVE → PREPARING.
+    /// Returns the participant set so the caller can dispatch PREPARE RPCs.
+    pub fn begin_commit(&mut self, tx_id: TxId) -> BeginCommitResult {
+        let tx = match self.transactions.get_mut(&tx_id) {
+            Some(t) => t,
+            None => return BeginCommitResult::Aborted,
+        };
+        match tx.phase {
+            TxPhase::Active => {}
+            TxPhase::Aborted => return BeginCommitResult::Aborted,
+            _ => return BeginCommitResult::Aborted,
+        }
+        if tx.participants.is_empty() {
+            return BeginCommitResult::NoParticipants;
+        }
+        tx.phase = TxPhase::Preparing;
+        BeginCommitResult::Prepare(tx.participants.clone())
+    }
+
+    /// CoordFinalizePrepare (incremental): record one shard's PREPARE_REPLY.
+    ///
+    /// `ts` is `Some(prep_t)` for a successful prepare, `None` for abort.
+    ///
+    /// Returns `Done` once all participant shards have replied with timestamps,
+    /// at which point commit_ts = max(all prep_ts, clock) and the coordinator
+    /// clock advances to commit_ts + 1 (ensuring SI2).
+    pub fn collect_prepare_reply(
+        &mut self,
+        tx_id: TxId,
+        shard_id: ShardId,
+        ts: Option<Timestamp>,
+    ) -> CollectPrepareResult {
+        let tx = match self.transactions.get_mut(&tx_id) {
+            Some(t) => t,
+            None => return CollectPrepareResult::Aborted,
+        };
+        if tx.phase == TxPhase::Aborted {
+            return CollectPrepareResult::Aborted;
+        }
+        if ts.is_none() {
+            tx.phase = TxPhase::Aborted;
+            return CollectPrepareResult::Aborted;
+        }
+        tx.prepare_replies.insert(shard_id, ts.unwrap());
+        if tx.prepare_replies.len() < tx.participants.len() {
+            return CollectPrepareResult::NeedMore;
+        }
+
+        // All replied — compute commit_ts = max(all prep_ts, c_clock).
+        let max_prep = tx.prepare_replies.values().copied().max().unwrap_or(0);
+        let commit_ts = max_prep.max(self.clock);
+        tx.commit_ts = Some(commit_ts);
+        tx.phase = TxPhase::CommitWait;
+        // Advance clock past commit_ts so the next tx's commit_ts is strictly greater (SI2).
+        self.clock = commit_ts + 1;
+
+        CollectPrepareResult::Done {
+            commit_ts,
+            participants: tx.participants.clone(),
+        }
+    }
+
+    /// CoordSendCommit: transition COMMIT_WAIT → COMMITTED.
+    /// Returns commit_ts and participants so the caller can dispatch COMMIT RPCs.
+    pub fn send_commit(&mut self, tx_id: TxId) -> SendCommitResult {
+        let tx = match self.transactions.get_mut(&tx_id) {
+            Some(t) => t,
+            None => return SendCommitResult::NotReady,
+        };
+        if tx.phase != TxPhase::CommitWait {
+            return SendCommitResult::NotReady;
+        }
+        let commit_ts = tx.commit_ts.unwrap();
+        tx.phase = TxPhase::Committed;
+        tx.is_committed = true;
+        SendCommitResult::Ok { commit_ts, participants: tx.participants.clone() }
+    }
+
+    /// CoordAbortOnReply / manual abort: mark ABORTED.
+    /// Returns participants so the caller can dispatch ABORT RPCs.
+    pub fn abort_tx(&mut self, tx_id: TxId) -> HashSet<ShardId> {
+        match self.transactions.get_mut(&tx_id) {
+            Some(tx) => {
+                tx.phase = TxPhase::Aborted;
+                tx.participants.clone()
+            }
+            None => HashSet::new(),
+        }
+    }
+
+    /// CoordHandleInquire: answer a shard's question about tx_id's commit status.
+    ///
+    /// Advances the coordinator clock by the reader's start_ts (Lamport clock
+    /// synchronisation — matches `c_clock' = max(c_clock, m.ts)` in TLA+).
+    pub fn handle_inquire(&mut self, tx_id: TxId, reader_start_ts: Timestamp) -> InquiryStatus {
+        self.clock = self.clock.max(reader_start_ts);
+        match self.transactions.get(&tx_id) {
+            Some(tx) if tx.is_committed => InquiryStatus::Committed(tx.commit_ts.unwrap()),
+            _ => InquiryStatus::Active,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tx-ID encoding
+// ---------------------------------------------------------------------------
+
+/// Generates transaction IDs that encode the issuing coordinator's port.
+///
+/// Format (64 bits):
+///   [63..32]  coordinator port (u16 in low 16 bits of the high word)
+///   [31.. 0]  sequence number
+///
+/// Any process holding a tx_id can recover the coordinator port with
+/// `coord_port_from_tx_id` and reconstruct its address without a lookup
+/// service — satisfying the TLA+ `CoordOf` relation purely from the id.
+pub struct TxIdGen {
+    coordinator_port: u16,
+    next_seq: u32,
+}
+
+impl TxIdGen {
+    pub fn new(coordinator_port: u16) -> Self {
+        TxIdGen { coordinator_port, next_seq: 0 }
+    }
+
+    pub fn next(&mut self) -> TxId {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        ((self.coordinator_port as u64) << 32) | seq as u64
+    }
+}
+
+/// Decode the coordinator's listening port from a tx_id.
+pub fn coord_port_from_tx_id(tx_id: TxId) -> u16 {
+    (tx_id >> 32) as u16
+}
+
+#[cfg(test)]
+mod tests;
+
+pub mod routing;
+pub mod server;

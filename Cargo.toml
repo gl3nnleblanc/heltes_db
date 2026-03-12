@@ -7,4 +7,18 @@ edition = "2021"
 name = "heltes_db"
 path = "src/lib.rs"
 
+[[bin]]
+name = "shard"
+path = "src/bin/shard.rs"
+
+[[bin]]
+name = "coordinator"
+path = "src/bin/coordinator.rs"
+
 [dependencies]
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"
