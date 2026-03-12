@@ -497,7 +497,7 @@ fn txidgen_new_at_port_correct_with_nonzero_start() {
 fn txidgen_non_overlapping_starts_produce_distinct_ids() {
     let port = 50052;
     let mut old_epoch = TxIdGen::new_at(port, 0);
-    let mut new_epoch = TxIdGen::new_at(port, 100_000);
+    let new_epoch = TxIdGen::new_at(port, 100_000);
     let old_ids: std::collections::HashSet<u64> = old_epoch.by_ref().take(1000).collect();
     for id in new_epoch.take(1000) {
         assert!(
