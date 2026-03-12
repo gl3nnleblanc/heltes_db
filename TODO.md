@@ -3,7 +3,6 @@
 ## Correctness
 
 - **Handle coordinator crash mid-2PC** — transactions left in PREPARING or COMMIT_WAIT are permanently stuck on shards; need a recovery protocol or coordinator-side WAL _(13 pts)_
-- **Fix hardcoded `[::1]` in cross-coordinator Inquire** — coordinators can't actually run on separate machines without a way to resolve coordinator address from port _(3 pts)_
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
 - **Shard-side prepared-entry timeout** — a shard holding a PREPARED entry for a crashed coordinator is blocked until the coordinator recovers; shards should auto-abort prepared entries after a configurable TTL, unblocking conflicting writers _(5 pts)_
 - **gRPC deadline propagation to shard RPCs** — `join_all(prepare_futs)` in the coordinator commit path has no deadline; a single hung shard blocks the coordinator indefinitely, stalling all transactions touching that shard _(3 pts)_

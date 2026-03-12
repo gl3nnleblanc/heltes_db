@@ -34,15 +34,20 @@ pub struct CoordinatorServer {
     /// port → connected shard client (lazy connection)
     shard_clients: HashMap<u64, ShardServiceClient<Channel>>,
     my_port: u16,
+    /// port → gRPC URI for peer coordinators (for cross-coordinator Inquire forwarding).
+    /// Built from `peer_coordinator_addrs` supplied at construction time.
+    coordinator_uris: HashMap<u16, String>,
 }
 
 impl CoordinatorServer {
     /// Construct a coordinator that will route to `shard_addrs` via consistent
-    /// hashing. Connections to shards are lazy (established on first use).
+    /// hashing and forward cross-coordinator Inquire RPCs to `peer_coordinator_addrs`.
+    /// Connections to shards are lazy (established on first use).
     pub fn new(
         state: CoordinatorState,
         my_port: u16,
         shard_addrs: Vec<SocketAddr>,
+        peer_coordinator_addrs: Vec<SocketAddr>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let router = ConsistentHashRouter::new(shard_addrs.iter().copied());
         let mut shard_clients = HashMap::new();
@@ -50,13 +55,24 @@ impl CoordinatorServer {
             let channel = Endpoint::from_shared(format!("http://{addr}"))?.connect_lazy();
             shard_clients.insert(addr.port() as u64, ShardServiceClient::new(channel));
         }
+        let coordinator_uris = peer_coordinator_addrs
+            .iter()
+            .map(|addr| (addr.port(), format!("http://{addr}")))
+            .collect();
         Ok(CoordinatorServer {
             state: Mutex::new(state),
             tx_id_gen: Mutex::new(TxIdGen::new(my_port)),
             router,
             shard_clients,
             my_port,
+            coordinator_uris,
         })
+    }
+
+    /// Return the gRPC URI for a peer coordinator by its port, or `None` if
+    /// no address was configured for that port.
+    pub(crate) fn coordinator_uri_for_port(&self, port: u16) -> Option<&str> {
+        self.coordinator_uris.get(&port).map(String::as_str)
     }
 
     fn shard_client(&self, port: u64) -> Result<ShardServiceClient<Channel>, Status> {
@@ -77,7 +93,12 @@ impl CoordinatorServer {
         if port == self.my_port {
             return Ok(self.state.lock().unwrap().handle_inquire(tx_id, reader_start_ts));
         }
-        let uri = format!("http://[::1]:{port}");
+        let uri = self
+            .coordinator_uri_for_port(port)
+            .ok_or_else(|| Status::unavailable(format!(
+                "no address configured for coordinator port {port}"
+            )))?
+            .to_owned();
         let mut client = CoordinatorServiceClient::connect(uri)
             .await
             .map_err(|e| Status::unavailable(format!("coordinator :{port} unreachable: {e}")))?;
@@ -403,5 +424,108 @@ impl CoordinatorService for CoordinatorServer {
             InquiryStatus::Active => S::Active(Active {}),
         };
         Ok(Response::new(InquireReply { status: Some(proto_status) }))
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::CoordinatorState;
+
+    fn test_server(my_port: u16, peers: Vec<SocketAddr>) -> CoordinatorServer {
+        CoordinatorServer::new(CoordinatorState::new(), my_port, vec![], peers).unwrap()
+    }
+
+    // Trace: remote IPv4 peer in coordinator_uris → URI uses the configured address.
+    #[test]
+    fn coordinator_uri_for_known_ipv4_peer() {
+        let server = test_server(50052, vec!["192.0.2.1:50053".parse().unwrap()]);
+        assert_eq!(
+            server.coordinator_uri_for_port(50053),
+            Some("http://192.0.2.1:50053"),
+        );
+    }
+
+    // Trace: remote IPv6 peer → URI wraps host in brackets (std::net formatting).
+    #[test]
+    fn coordinator_uri_for_known_ipv6_peer() {
+        let server = test_server(50052, vec!["[::2]:50053".parse().unwrap()]);
+        assert_eq!(
+            server.coordinator_uri_for_port(50053),
+            Some("http://[::2]:50053"),
+        );
+    }
+
+    // Trace: port not present in coordinator_uris → None.
+    #[test]
+    fn coordinator_uri_for_unknown_peer_returns_none() {
+        let server = test_server(50052, vec![]);
+        assert_eq!(server.coordinator_uri_for_port(50099), None);
+    }
+
+    // Trace: multiple peers → each independently addressable by port.
+    #[test]
+    fn coordinator_uri_for_multiple_peers() {
+        let server = test_server(50052, vec![
+            "192.0.2.1:50053".parse().unwrap(),
+            "192.0.2.2:50054".parse().unwrap(),
+        ]);
+        assert_eq!(
+            server.coordinator_uri_for_port(50053),
+            Some("http://192.0.2.1:50053"),
+        );
+        assert_eq!(
+            server.coordinator_uri_for_port(50054),
+            Some("http://192.0.2.2:50054"),
+        );
+    }
+
+    // Trace: resolve_inquiry for own tx_id is handled in-process (no URI lookup).
+    // We can verify this by using a tx_id whose port encodes my_port.
+    #[tokio::test]
+    async fn resolve_inquiry_for_own_tx_id_answers_in_process() {
+        let server = test_server(50052, vec![]);
+        // Encode my_port=50052 into tx_id high 32 bits.
+        let tx_id: u64 = (50052u64 << 32) | 1;
+        // The tx is not in state (unknown), so handle_inquire returns Active.
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), InquiryStatus::Active);
+    }
+
+    // Trace: resolve_inquiry for a tx whose port is not in coordinator_uris →
+    // returns Status::unavailable immediately (does not attempt [::1]).
+    #[tokio::test]
+    async fn resolve_inquiry_for_unknown_remote_port_returns_unavailable() {
+        let server = test_server(50052, vec![]);
+        // Port 50099 is not my_port and not in coordinator_uris.
+        let tx_id: u64 = (50099u64 << 32) | 1;
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    // Trace: resolve_inquiry for a configured remote port attempts the right URI
+    // (not [::1]). Use 127.0.0.1 at an unused port so the OS immediately
+    // refuses the connection (ECONNREFUSED), keeping the test fast.
+    // The error must NOT say "no address configured" — it must be a
+    // connection-level error, proving the code looked up the configured URI.
+    #[tokio::test]
+    async fn resolve_inquiry_for_configured_peer_uses_correct_address() {
+        // Port 59999 on loopback — almost certainly not in use; OS refuses instantly.
+        let peer_addr: SocketAddr = "127.0.0.1:59999".parse().unwrap();
+        let server = test_server(50052, vec![peer_addr]);
+        let tx_id: u64 = (59999u64 << 32) | 1;
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        let err = result.unwrap_err();
+        // Must NOT be the "no address configured" error (which would mean the
+        // code fell back to hardcoded [::1] or skipped the lookup).
+        let msg = err.message();
+        assert!(
+            !msg.contains("no address configured"),
+            "expected connection attempt, got: {msg}",
+        );
     }
 }

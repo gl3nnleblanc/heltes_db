@@ -328,7 +328,17 @@ CoordSendCommit(id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, participants,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
-\* Coordinator handles INQUIRE(id, t) from shard s
+\* Coordinator handles INQUIRE(id, t) from shard s.
+\*
+\* When the INQUIRE is for a transaction owned by a different coordinator, the
+\* implementation forwards the request over gRPC to that coordinator. The spec
+\* abstracts this with CoordOf[id]: any coordinator that owns id can answer.
+\*
+\* Implementation note: CoordOf is encoded in the high 32 bits of tx_id (the
+\* coordinator's listening port). The server resolves the remote coordinator's
+\* full address from a config-supplied table (coordinator_uris: port → URI),
+\* NOT from a hardcoded host such as [::1]. This enables multi-machine deployments.
+\* If the port is absent from coordinator_uris the RPC returns UNAVAILABLE.
 CoordHandleInquire(id, s) ==
     LET coord == CoordOf[id]
         m     == CHOOSE msg \in msgs :
