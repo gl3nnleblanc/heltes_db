@@ -27,3 +27,8 @@
 
 - **Read-only transactions** — currently unmodelled and unimplemented; read-only txns don't need 2PC and can be significantly cheaper _(5 pts)_
 - **Multi-key atomic reads** — the current Read RPC is per-key; a snapshot read of multiple keys requires multiple round trips with no atomicity guarantee across them _(8 pts)_
+
+## Other
+
+- **CI** - add some github actions for ensuring main is stable
+- **Frontend** - add a CLI frontend for running some limited SQL-like statements
