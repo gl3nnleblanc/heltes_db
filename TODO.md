@@ -12,7 +12,6 @@
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
-- **Binary-search MVCC version lookup** — `handle_read` does a linear scan over sorted `Vec<Version>` to find the latest visible version; a binary search on the timestamp field would reduce this to O(log N) _(2 pts)_
 
 ## Durability
 

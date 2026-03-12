@@ -1858,3 +1858,181 @@
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Binary-search MVCC version lookup
+    //
+    // Traces derived from TLC enumeration of LatestVersionBefore(k, t):
+    //   - versions[] is a sorted Vec<Version> (ascending by timestamp)
+    //   - handle_read: partition_point to find latest version with ts < start_ts
+    //   - handle_update: CommittedConflict via binary search (any ts >= start_ts)
+    //   - handle_commit / handle_fast_commit: idempotency + sorted insertion
+    // -----------------------------------------------------------------------
+
+    // Trace: eligible = {} because versions[k] is empty.
+    #[test]
+    fn bsearch_read_empty_versions_returns_not_found() {
+        let mut s = shard();
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::NotFound);
+    }
+
+    // Trace: single version above start_ts — eligible set empty → NotFound.
+    #[test]
+    fn bsearch_read_single_version_above_start_ts() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 10 });
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::NotFound);
+    }
+
+    // Trace: single version exactly at start_ts — strict inequality (ts < t) → NotFound.
+    #[test]
+    fn bsearch_read_single_version_at_start_ts_is_not_visible() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(99), timestamp: 5 });
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::NotFound);
+    }
+
+    // Trace: single version strictly below start_ts → Value.
+    #[test]
+    fn bsearch_read_single_version_below_start_ts() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(42), timestamp: 4 });
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Value(v(42)));
+    }
+
+    // Trace: two versions, start_ts between them — only the lower one is eligible.
+    #[test]
+    fn bsearch_read_picks_lower_version_when_upper_is_not_eligible() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(2), timestamp: 7 });
+        // start_ts=5: only ts=3 is eligible (ts=7 >= 5)
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Value(v(1)));
+    }
+
+    // Trace: two versions, start_ts above both — pick the latest (ts=7).
+    #[test]
+    fn bsearch_read_picks_latest_when_both_versions_eligible() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(2), timestamp: 7 });
+        // start_ts=8: both eligible, pick max ts=7
+        assert_eq!(s.handle_read(T1, 8, K1, &no_inquiries()), ReadResult::Value(v(2)));
+    }
+
+    // Trace: many versions (10 entries), start_ts in the middle.
+    #[test]
+    fn bsearch_read_many_versions_start_ts_in_middle() {
+        let mut s = shard();
+        for ts in 1u64..=10 {
+            s.versions.entry(K1).or_default().push(Version { value: v(ts * 10), timestamp: ts });
+        }
+        // start_ts=6: latest eligible is ts=5 → value=50
+        assert_eq!(s.handle_read(T1, 6, K1, &no_inquiries()), ReadResult::Value(v(50)));
+    }
+
+    // Trace: many versions, start_ts=1 → nothing strictly before 1 → NotFound.
+    #[test]
+    fn bsearch_read_many_versions_start_ts_before_all() {
+        let mut s = shard();
+        for ts in 1u64..=10 {
+            s.versions.entry(K1).or_default().push(Version { value: v(ts), timestamp: ts });
+        }
+        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::NotFound);
+    }
+
+    // Trace: many versions, start_ts above all → return the last version.
+    #[test]
+    fn bsearch_read_many_versions_start_ts_above_all() {
+        let mut s = shard();
+        for ts in 1u64..=10 {
+            s.versions.entry(K1).or_default().push(Version { value: v(ts * 100), timestamp: ts });
+        }
+        // start_ts=11: all eligible, latest is ts=10 → value=1000
+        assert_eq!(s.handle_read(T1, 11, K1, &no_inquiries()), ReadResult::Value(v(1000)));
+    }
+
+    // Trace: start_ts exactly at a version boundary — the version at that ts is NOT visible.
+    // Versions at ts=[3,5,7], start_ts=5 → only ts=3 eligible.
+    #[test]
+    fn bsearch_read_boundary_version_at_start_ts_excluded() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(2), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(3), timestamp: 7 });
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Value(v(1)));
+    }
+
+    // Trace: CommittedConflict — version at ts=5, start_ts=5 → conflict (5 >= 5).
+    #[test]
+    fn bsearch_committed_conflict_at_exact_start_ts() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 5 });
+        assert_eq!(s.handle_update(T1, 5, K1, v(2)), UpdateResult::Abort);
+    }
+
+    // Trace: CommittedConflict — versions [1,3,5], start_ts=4 → version at ts=5 >= 4 → conflict.
+    #[test]
+    fn bsearch_committed_conflict_with_version_above_start_ts() {
+        let mut s = shard();
+        for ts in [1u64, 3, 5] {
+            s.versions.entry(K1).or_default().push(Version { value: v(ts), timestamp: ts });
+        }
+        assert_eq!(s.handle_update(T1, 4, K1, v(99)), UpdateResult::Abort);
+    }
+
+    // Trace: no CommittedConflict — versions [1,3,5], start_ts=6 → all < 6 → no conflict.
+    #[test]
+    fn bsearch_no_committed_conflict_when_all_versions_below_start_ts() {
+        let mut s = shard();
+        for ts in [1u64, 3, 5] {
+            s.versions.entry(K1).or_default().push(Version { value: v(ts), timestamp: ts });
+        }
+        s.clock = 10; // ensure no clock-based abort
+        assert_eq!(s.handle_update(T1, 6, K1, v(99)), UpdateResult::Ok);
+    }
+
+    // Trace: handle_commit with out-of-order commit_ts maintains sorted order.
+    // Pre-existing versions at ts=[1,3,7]; commit at ts=5 → sorted result [1,3,5,7].
+    #[test]
+    fn bsearch_commit_inserts_version_in_sorted_order() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 1 });
+        s.versions.entry(K1).or_default().push(Version { value: v(3), timestamp: 3 });
+        s.versions.entry(K1).or_default().push(Version { value: v(7), timestamp: 7 });
+        // Simulate T1 with a buffered write
+        s.write_buff.entry(T1).or_default().insert(K1, v(5));
+        s.write_keys.insert(K1, T1);
+        s.handle_commit(T1, 5);
+        let ts_list: Vec<u64> = s.versions[&K1].iter().map(|v| v.timestamp).collect();
+        assert_eq!(ts_list, vec![1, 3, 5, 7]);
+    }
+
+    // Trace: handle_commit is idempotent — re-committing same tx/ts installs no duplicate.
+    #[test]
+    fn bsearch_commit_idempotent_no_duplicate_version() {
+        let mut s = shard();
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 1 });
+        s.versions.entry(K1).or_default().push(Version { value: v(5), timestamp: 5 });
+        s.versions.entry(K1).or_default().push(Version { value: v(7), timestamp: 7 });
+        // Simulate a second commit message for a tx that already installed ts=5.
+        s.write_buff.entry(T1).or_default().insert(K1, v(5));
+        s.write_keys.insert(K1, T1);
+        s.handle_commit(T1, 5);
+        // Still exactly 3 versions.
+        assert_eq!(s.versions[&K1].len(), 3);
+    }
+
+    // Trace: handle_fast_commit also inserts in sorted order.
+    #[test]
+    fn bsearch_fast_commit_inserts_version_in_sorted_order() {
+        let mut s = shard();
+        // Pre-install a version at ts=1.
+        s.versions.entry(K1).or_default().push(Version { value: v(1), timestamp: 1 });
+        s.clock = 4; // next fast-commit will get ts=5
+        s.handle_update(T1, 2, K1, v(99));
+        let FastCommitResult::Ok(ct) = s.handle_fast_commit(T1) else { panic!() };
+        assert_eq!(ct, 5);
+        let ts_list: Vec<u64> = s.versions[&K1].iter().map(|v| v.timestamp).collect();
+        assert_eq!(ts_list, vec![1, 5]);
+    }
+

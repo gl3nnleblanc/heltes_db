@@ -179,11 +179,16 @@ impl ShardState {
         }
 
         // Return the latest version with timestamp strictly before start_ts.
-        // If none exists the key has not been inserted at this snapshot.
+        // versions[key] is sorted ascending by timestamp, so partition_point
+        // gives the first index with timestamp >= start_ts in O(log N).
+        // The entry just before that index (if any) is the answer.
         let best = self
             .versions
             .get(&key)
-            .and_then(|vs| vs.iter().filter(|v| v.timestamp < start_ts).max_by_key(|v| v.timestamp))
+            .and_then(|vs| {
+                let pos = vs.partition_point(|v| v.timestamp < start_ts);
+                if pos > 0 { Some(&vs[pos - 1]) } else { None }
+            })
             .cloned();
 
         self.clock = self.clock.max(start_ts);
@@ -211,10 +216,12 @@ impl ShardState {
         }
 
         // CommittedConflict: any installed version with timestamp >= start_ts.
+        // versions[key] is sorted ascending; the first entry at or after the
+        // partition point has timestamp >= start_ts — O(log N) check.
         let committed_conflict = self
             .versions
             .get(&key)
-            .map(|vs| vs.iter().any(|v| v.timestamp >= start_ts))
+            .map(|vs| vs.partition_point(|v| v.timestamp < start_ts) < vs.len())
             .unwrap_or(false);
         if committed_conflict {
             self.aborted.insert(tx_id);
@@ -282,10 +289,11 @@ impl ShardState {
                 // Release write lock.
                 self.write_keys.remove(&key);
                 let vs = self.versions.entry(key).or_default();
-                // Idempotent: skip if this timestamp is already installed.
-                if !vs.iter().any(|v| v.timestamp == commit_ts) {
-                    vs.push(Version { value, timestamp: commit_ts });
-                    vs.sort_by_key(|v| v.timestamp);
+                // Idempotent + sorted insertion: binary search for commit_ts.
+                // Ok(i) → already installed at index i, skip.
+                // Err(i) → not present; insert at index i to maintain ascending order.
+                if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
+                    vs.insert(pos, Version { value, timestamp: commit_ts });
                 }
             }
         }
@@ -327,9 +335,9 @@ impl ShardState {
             for (key, value) in writes {
                 self.write_keys.remove(&key);
                 let vs = self.versions.entry(key).or_default();
-                if !vs.iter().any(|v| v.timestamp == commit_ts) {
-                    vs.push(Version { value, timestamp: commit_ts });
-                    vs.sort_by_key(|v| v.timestamp);
+                // Idempotent + sorted insertion via binary search (same as handle_commit).
+                if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
+                    vs.insert(pos, Version { value, timestamp: commit_ts });
                 }
             }
         }

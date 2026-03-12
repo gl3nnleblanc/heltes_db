@@ -121,6 +121,14 @@ SendAll(S) == msgs' = msgs \cup S
 
 \* The latest committed (value, timestamp) pair for key k strictly before t.
 \* Returns <<NONE, 0>> if no version exists before t (key does not exist at that snapshot).
+\*
+\* Implementation note: the Rust implementation maintains versions[k] as a Vec<Version>
+\* sorted ascending by timestamp. This operator is therefore implemented as a binary
+\* search (partition_point) in O(log N) rather than a linear scan. All three linear
+\* scans on the sorted vec — handle_read (find latest visible version),
+\* handle_update (CommittedConflict: any version with ts >= start_ts?), and
+\* handle_commit/handle_fast_commit (idempotency: ts == commit_ts already installed?) —
+\* are replaced with O(log N) binary-search equivalents.
 LatestVersionBefore(k, t) ==
     LET eligible == {tv \in versions[k] : tv[2] < t}
     IN IF eligible = {}
