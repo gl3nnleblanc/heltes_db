@@ -2,7 +2,10 @@ use std::net::SocketAddr;
 
 use tonic::transport::Server;
 
-use heltes_db::shard::{server::{ShardServer, ShardServiceServer}, ShardState};
+use heltes_db::shard::{
+    server::{ShardServer, ShardServiceServer},
+    ShardState,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

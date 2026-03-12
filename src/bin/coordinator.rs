@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sep = rest.iter().position(|a| a == "--");
     let (shard_part, peer_part) = match sep {
         Some(i) => (&rest[..i], &rest[i + 1..]),
-        None    => (rest.as_slice(), [].as_slice()),
+        None => (rest.as_slice(), [].as_slice()),
     };
 
     let shard_addrs: Vec<SocketAddr> = shard_part

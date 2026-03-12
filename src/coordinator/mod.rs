@@ -321,11 +321,41 @@ pub struct TxIdGen {
 }
 
 impl TxIdGen {
+    /// Create a generator whose first sequence number is chosen by a
+    /// time-mixed pseudo-random seed.  Different restarts of the same
+    /// coordinator port will (with overwhelming probability) start from
+    /// different positions, preventing new-epoch tx_ids from colliding with
+    /// old-epoch entries still held in shards' aborted sets.
     pub fn new(coordinator_port: u16) -> Self {
+        Self::new_at(coordinator_port, Self::time_mixed_seed(coordinator_port))
+    }
+
+    /// Create a generator whose first sequence number is exactly `start_seq`.
+    /// Use this in tests where deterministic ID values are required.
+    pub fn new_at(coordinator_port: u16, start_seq: u32) -> Self {
         TxIdGen {
             coordinator_port,
-            next_seq: 0,
+            next_seq: start_seq,
         }
+    }
+
+    /// Derive a pseudo-random starting sequence from the current wall-clock
+    /// time mixed with the coordinator port.
+    ///
+    /// The LCG step (Knuth multiplicative hash) spreads the nanosecond
+    /// timestamp across all 32 bits.  XORing in the port ensures two
+    /// coordinators starting at the same nanosecond get different seeds.
+    fn time_mixed_seed(coordinator_port: u16) -> u32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let mixed = nanos
+            .wrapping_mul(6364136223846793005u64)
+            .wrapping_add(1442695040888963407u64)
+            ^ (coordinator_port as u64).wrapping_mul(2246822519u64);
+        (mixed >> 32) as u32
     }
 }
 
@@ -342,6 +372,11 @@ impl Iterator for TxIdGen {
 /// Decode the coordinator's listening port from a tx_id.
 pub fn coord_port_from_tx_id(tx_id: TxId) -> u16 {
     (tx_id >> 32) as u16
+}
+
+/// Decode the sequence number from a tx_id.
+pub fn coord_seq_from_tx_id(tx_id: TxId) -> u32 {
+    tx_id as u32
 }
 
 #[cfg(test)]

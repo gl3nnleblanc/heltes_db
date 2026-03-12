@@ -5,10 +5,9 @@ use tonic::{Request, Response, Status};
 
 use crate::proto::shard_service_server::ShardService;
 use crate::proto::{
-    Abort, Active, CommitReply, CommitRequest, AbortReply, AbortRequest,
-    FastCommitReply, FastCommitRequest,
-    InquiryResult, NeedsInquirySet, PrepareReply, PrepareRequest,
-    ReadReply, ReadRequest, UpdateReply, UpdateRequest,
+    Abort, AbortReply, AbortRequest, Active, CommitReply, CommitRequest, FastCommitReply,
+    FastCommitRequest, InquiryResult, NeedsInquirySet, PrepareReply, PrepareRequest, ReadReply,
+    ReadRequest, UpdateReply, UpdateRequest,
 };
 use crate::shard::{InquiryStatus, ShardState};
 
@@ -20,15 +19,15 @@ pub struct ShardServer {
 
 impl ShardServer {
     pub fn new(state: ShardState) -> Self {
-        Self { state: Mutex::new(state) }
+        Self {
+            state: Mutex::new(state),
+        }
     }
 }
 
 // ── Type conversion helpers ───────────────────────────────────────────────────
 
-fn proto_inquiry_results(
-    results: Vec<InquiryResult>,
-) -> HashMap<u64, InquiryStatus> {
+fn proto_inquiry_results(results: Vec<InquiryResult>) -> HashMap<u64, InquiryStatus> {
     results
         .into_iter()
         .filter_map(|r| {
@@ -36,9 +35,7 @@ fn proto_inquiry_results(
                 crate::proto::inquiry_result::Status::CommittedAt(ts) => {
                     InquiryStatus::Committed(ts)
                 }
-                crate::proto::inquiry_result::Status::Active(_) => {
-                    InquiryStatus::Active
-                }
+                crate::proto::inquiry_result::Status::Active(_) => InquiryStatus::Active,
             };
             Some((r.tx_id, status))
         })
@@ -49,32 +46,30 @@ fn proto_inquiry_results(
 
 #[tonic::async_trait]
 impl ShardService for ShardServer {
-    async fn read(
-        &self,
-        request: Request<ReadRequest>,
-    ) -> Result<Response<ReadReply>, Status> {
+    async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
         let req = request.into_inner();
         let inquiry_results = proto_inquiry_results(req.inquiry_results);
 
-        let result = self
-            .state
-            .lock()
-            .unwrap()
-            .handle_read(req.tx_id, req.start_ts, req.key, &inquiry_results);
+        let result = self.state.lock().unwrap().handle_read(
+            req.tx_id,
+            req.start_ts,
+            req.key,
+            &inquiry_results,
+        );
 
-        use crate::shard::ReadResult;
         use crate::proto::read_reply::Result as R;
+        use crate::shard::ReadResult;
 
         let proto_result = match result {
             ReadResult::Value(v) => R::Value(v.0),
             ReadResult::NotFound => R::NotFound(true),
             ReadResult::Abort => R::Abort(Abort {}),
-            ReadResult::NeedsInquiry(ids) => {
-                R::NeedsInquiry(NeedsInquirySet { tx_ids: ids })
-            }
+            ReadResult::NeedsInquiry(ids) => R::NeedsInquiry(NeedsInquirySet { tx_ids: ids }),
         };
 
-        Ok(Response::new(ReadReply { result: Some(proto_result) }))
+        Ok(Response::new(ReadReply {
+            result: Some(proto_result),
+        }))
     }
 
     async fn update(
@@ -89,15 +84,17 @@ impl ShardService for ShardServer {
             crate::shard::Value(req.value),
         );
 
-        use crate::shard::UpdateResult;
         use crate::proto::update_reply::Result as R;
+        use crate::shard::UpdateResult;
 
         let proto_result = match result {
             UpdateResult::Ok => R::Ok(true),
             UpdateResult::Abort => R::Abort(Abort {}),
         };
 
-        Ok(Response::new(UpdateReply { result: Some(proto_result) }))
+        Ok(Response::new(UpdateReply {
+            result: Some(proto_result),
+        }))
     }
 
     async fn prepare(
@@ -107,15 +104,17 @@ impl ShardService for ShardServer {
         let req = request.into_inner();
         let result = self.state.lock().unwrap().handle_prepare(req.tx_id);
 
-        use crate::shard::PrepareResult;
         use crate::proto::prepare_reply::Result as R;
+        use crate::shard::PrepareResult;
 
         let proto_result = match result {
             PrepareResult::Timestamp(ts) => R::Timestamp(ts),
             PrepareResult::Abort => R::Abort(Abort {}),
         };
 
-        Ok(Response::new(PrepareReply { result: Some(proto_result) }))
+        Ok(Response::new(PrepareReply {
+            result: Some(proto_result),
+        }))
     }
 
     async fn commit(
@@ -123,14 +122,14 @@ impl ShardService for ShardServer {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitReply>, Status> {
         let req = request.into_inner();
-        self.state.lock().unwrap().handle_commit(req.tx_id, req.commit_ts);
+        self.state
+            .lock()
+            .unwrap()
+            .handle_commit(req.tx_id, req.commit_ts);
         Ok(Response::new(CommitReply {}))
     }
 
-    async fn abort(
-        &self,
-        request: Request<AbortRequest>,
-    ) -> Result<Response<AbortReply>, Status> {
+    async fn abort(&self, request: Request<AbortRequest>) -> Result<Response<AbortReply>, Status> {
         let req = request.into_inner();
         self.state.lock().unwrap().handle_abort(req.tx_id);
         Ok(Response::new(AbortReply {}))
@@ -143,17 +142,21 @@ impl ShardService for ShardServer {
         let req = request.into_inner();
         let result = self.state.lock().unwrap().handle_fast_commit(req.tx_id);
 
-        use crate::shard::FastCommitResult;
         use crate::proto::fast_commit_reply::Result as R;
+        use crate::shard::FastCommitResult;
 
         let proto_result = match result {
             FastCommitResult::Ok(commit_ts) => R::CommitTs(commit_ts),
             FastCommitResult::Abort => R::Abort(Abort {}),
         };
 
-        Ok(Response::new(FastCommitReply { result: Some(proto_result) }))
+        Ok(Response::new(FastCommitReply {
+            result: Some(proto_result),
+        }))
     }
 }
 
 // Suppress unused import warning for Active (used in proto_inquiry_results via generated code)
-const _: () = { let _ = Active {}; };
+const _: () = {
+    let _ = Active {};
+};

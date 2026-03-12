@@ -21,10 +21,7 @@ impl ConsistentHashRouter {
         Self::with_vnodes(shards, DEFAULT_VNODES)
     }
 
-    pub fn with_vnodes(
-        shards: impl IntoIterator<Item = SocketAddr>,
-        vnodes: usize,
-    ) -> Self {
+    pub fn with_vnodes(shards: impl IntoIterator<Item = SocketAddr>, vnodes: usize) -> Self {
         let mut ring = BTreeMap::new();
         for addr in shards {
             for i in 0..vnodes {
@@ -63,7 +60,9 @@ impl ConsistentHashRouter {
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 14695981039346656037;
     const PRIME: u64 = 1099511628211;
-    bytes.iter().fold(OFFSET, |h, &b| (h ^ b as u64).wrapping_mul(PRIME))
+    bytes
+        .iter()
+        .fold(OFFSET, |h, &b| (h ^ b as u64).wrapping_mul(PRIME))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -97,8 +96,14 @@ mod tests {
     fn two_shards_both_receive_keys() {
         let r = ConsistentHashRouter::new([addr(50051), addr(50052)]);
         let keys: Vec<u64> = (0u64..1000).collect();
-        let hits_51 = keys.iter().filter(|&&k| r.shard_for_key(k) == Some(addr(50051))).count();
-        let hits_52 = keys.iter().filter(|&&k| r.shard_for_key(k) == Some(addr(50052))).count();
+        let hits_51 = keys
+            .iter()
+            .filter(|&&k| r.shard_for_key(k) == Some(addr(50051)))
+            .count();
+        let hits_52 = keys
+            .iter()
+            .filter(|&&k| r.shard_for_key(k) == Some(addr(50052)))
+            .count();
         assert!(hits_51 > 0, "shard 50051 should own at least one key");
         assert!(hits_52 > 0, "shard 50052 should own at least one key");
         assert_eq!(hits_51 + hits_52, 1000);

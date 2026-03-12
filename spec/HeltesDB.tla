@@ -35,6 +35,14 @@ CONSTANTS
                     \*   In the implementation, CoordOf is derived from the tx_id
                     \*   encoding itself (high bits = coordinator port), so no
                     \*   external lookup or coordination between coordinators is needed.
+                    \*
+                    \*   The spec assumes TxIds are globally unique — including across
+                    \*   coordinator restarts.  The implementation enforces this by
+                    \*   seeding TxIdGen with a time-mixed starting sequence on each
+                    \*   construction, so a restarted coordinator's new seq numbers are
+                    \*   pseudo-randomly offset from the previous epoch's, making
+                    \*   collisions with surviving shard-side aborted entries negligibly
+                    \*   unlikely (probability ≈ aborted_set_size / 2^32 per transaction).
     ShardOf,        \* ShardOf[k]  : Key  -> Shard
     MaxTimestamp,   \* Upper bound on timestamps (for finite model checking)
     ABORT,          \* Sentinel: abort signal (model value, not in Values)

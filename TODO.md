@@ -6,7 +6,6 @@
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
 - **Shard-side prepared-entry timeout** — a shard holding a PREPARED entry for a crashed coordinator is blocked until the coordinator recovers; shards should auto-abort prepared entries after a configurable TTL, unblocking conflicting writers _(5 pts)_
 - **gRPC deadline propagation to shard RPCs** — `join_all(prepare_futs)` in the coordinator commit path has no deadline; a single hung shard blocks the coordinator indefinitely, stalling all transactions touching that shard _(3 pts)_
-- **TxIdGen sequence continuity across coordinator restarts** — `TxIdGen` resets its sequence to 0 on every restart; if new transactions from seq=0 arrive at a shard that still has in-flight or aborted entries from a prior epoch, the `prune_aborted` watermark can incorrectly discard or retain entries, risking stale-abort suppression; fix by time-seeding or persisting the high-water sequence _(3 pts)_
 
 ## Performance
 
