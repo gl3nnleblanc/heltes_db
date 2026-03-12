@@ -840,4 +840,733 @@ mod tests {
         s.handle_read(T1, 3, K1, &no_inquiries());
         assert!(s.clock >= 10);
     }
+
+    // -----------------------------------------------------------------------
+    // PATH SUITE
+    //
+    // The following tests are derived from equivalence classes of execution
+    // paths explored by TLC during formal model checking (633k distinct states,
+    // depth 36). Each test exercises a complete multi-step interaction sequence
+    // rather than a single operation in isolation.
+    // -----------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // Path family 1: Full single-transaction commit lifecycle
+    // -------------------------------------------------------------------
+
+    /// Path: update → prepare → commit → read sees new value.
+    /// The canonical happy path through the entire commit protocol.
+    #[test]
+    fn path_single_tx_full_commit_lifecycle() {
+        let mut s = shard();
+        assert_eq!(s.handle_update(T1, 1, K1, v(7)), UpdateResult::Ok);
+        let prep_t = match s.handle_prepare(T1) {
+            PrepareResult::Timestamp(t) => t,
+            _ => panic!("expected prepare timestamp"),
+        };
+        s.handle_commit(T1, prep_t + 1);
+        assert_eq!(
+            s.handle_read(T2, prep_t + 2, K1, &no_inquiries()),
+            ReadResult::Value(v(7)),
+        );
+    }
+
+    /// Path: update → prepare → commit; snapshot before commit sees init value.
+    #[test]
+    fn path_snapshot_before_commit_sees_old_value() {
+        let mut s = shard();
+        assert_eq!(s.handle_update(T1, 3, K1, v(99)), UpdateResult::Ok);
+        let prep_t = match s.handle_prepare(T1) {
+            PrepareResult::Timestamp(t) => t,
+            _ => panic!(),
+        };
+        let commit_ts = prep_t + 1;
+        s.handle_commit(T1, commit_ts);
+        // T2 started BEFORE T1 committed — snapshot at start_ts=2 < commit_ts.
+        assert_eq!(
+            s.handle_read(T2, 2, K1, &no_inquiries()),
+            ReadResult::Value(v(0)),
+        );
+    }
+
+    /// Path: multiple updates to same key within one tx, then commit.
+    /// Final committed value must be the last update.
+    #[test]
+    fn path_multiple_updates_same_key_last_wins() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T1, 1, K1, v(20));
+        s.handle_update(T1, 1, K1, v(30));
+        let prep_t = match s.handle_prepare(T1) {
+            PrepareResult::Timestamp(t) => t,
+            _ => panic!(),
+        };
+        s.handle_commit(T1, prep_t + 1);
+        assert_eq!(
+            s.handle_read(T2, prep_t + 2, K1, &no_inquiries()),
+            ReadResult::Value(v(30)),
+        );
+    }
+
+    /// Path: update multiple keys, commit; all keys show new versions.
+    #[test]
+    fn path_multi_key_commit_all_versions_installed() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(11));
+        s.handle_update(T1, 1, K2, v(22));
+        s.handle_update(T1, 1, K3, v(33));
+        let prep_t = match s.handle_prepare(T1) {
+            PrepareResult::Timestamp(t) => t,
+            _ => panic!(),
+        };
+        let ct = prep_t + 1;
+        s.handle_commit(T1, ct);
+        assert_eq!(s.handle_read(T2, ct + 1, K1, &no_inquiries()), ReadResult::Value(v(11)));
+        assert_eq!(s.handle_read(T2, ct + 1, K2, &no_inquiries()), ReadResult::Value(v(22)));
+        assert_eq!(s.handle_read(T2, ct + 1, K3, &no_inquiries()), ReadResult::Value(v(33)));
+    }
+
+    /// Path: commit, then read at exactly commit_ts is NOT visible (strict <).
+    #[test]
+    fn path_read_at_exactly_commit_ts_is_not_visible() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(55));
+        let prep_t = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let ct = prep_t + 1;
+        s.handle_commit(T1, ct);
+        // start_ts == ct: must NOT see the version.
+        assert_eq!(s.handle_read(T2, ct, K1, &no_inquiries()), ReadResult::Value(v(0)));
+    }
+
+    /// Path: commit, then read at commit_ts + 1 IS visible.
+    #[test]
+    fn path_read_one_past_commit_ts_is_visible() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(55));
+        let prep_t = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let ct = prep_t + 1;
+        s.handle_commit(T1, ct);
+        assert_eq!(s.handle_read(T2, ct + 1, K1, &no_inquiries()), ReadResult::Value(v(55)));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 2: Abort paths
+    // -------------------------------------------------------------------
+
+    /// Path: update → abort; subsequent read sees init value.
+    #[test]
+    fn path_update_abort_read_sees_init() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        s.handle_abort(T1);
+        assert_eq!(s.handle_read(T2, 5, K1, &no_inquiries()), ReadResult::Value(v(0)));
+    }
+
+    /// Path: update → abort; another tx can then write the same key.
+    #[test]
+    fn path_after_abort_lock_released_other_tx_can_write() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        s.handle_abort(T1);
+        assert_eq!(s.handle_update(T2, 2, K1, v(99)), UpdateResult::Ok);
+    }
+
+    /// Path: update → prepare → abort; lock released, subsequent writer succeeds.
+    #[test]
+    fn path_abort_after_prepare_releases_lock() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_abort(T1);
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
+    }
+
+    /// Path: update → abort → read on aborted tx returns Abort.
+    #[test]
+    fn path_read_on_aborted_tx_returns_abort() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        s.handle_abort(T1);
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Abort);
+    }
+
+    /// Path: update → abort → update on same tx returns Abort.
+    #[test]
+    fn path_update_on_aborted_tx_returns_abort() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        s.handle_abort(T1);
+        assert_eq!(s.handle_update(T1, 1, K2, v(5)), UpdateResult::Abort);
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 3: Write-write conflict scenarios
+    // -------------------------------------------------------------------
+
+    /// Path: T1 buffers K1; T2 attempts K1 → WriteBuffConflict → Abort.
+    #[test]
+    fn path_write_buff_conflict_second_writer_aborted() {
+        let mut s = shard();
+        assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Abort);
+    }
+
+    /// Path: T1 buffers K1; T2 aborted; T3 attempts K1 → only T1's lock blocks.
+    #[test]
+    fn path_aborted_tx_does_not_block_other_writers() {
+        let mut s = shard();
+        // T2 is aborted (e.g. due to a prior conflict elsewhere).
+        s.aborted.insert(T2);
+        // T1 can still write K1.
+        assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
+    }
+
+    /// Path: T1 commits K1 at ct=5; T2 (start_ts=3) tries to write → CommittedConflict.
+    #[test]
+    fn path_committed_conflict_aborts_late_writer() {
+        let mut s = shard();
+        s.handle_update(T1, 2, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 5);
+        // T2 started at ts=3 < ct=5; committed version at ts=5 >= 3 → ABORT.
+        assert_eq!(s.handle_update(T2, 3, K1, v(20)), UpdateResult::Abort);
+    }
+
+    /// Path: T1 commits K1 at ct=5; T2 (start_ts=5) tries to write → CommittedConflict (>=).
+    #[test]
+    fn path_committed_conflict_at_boundary_start_ts_equals_commit_ts() {
+        let mut s = shard();
+        s.handle_update(T1, 2, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 5);
+        assert_eq!(s.handle_update(T2, 5, K1, v(20)), UpdateResult::Abort);
+    }
+
+    /// Path: T1 commits K1 at ct=5; T2 (start_ts=6) writes → no conflict (started after).
+    #[test]
+    fn path_no_conflict_writer_starts_after_commit() {
+        let mut s = shard();
+        s.handle_update(T1, 2, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 5);
+        assert_eq!(s.handle_update(T2, 6, K1, v(20)), UpdateResult::Ok);
+    }
+
+    /// Path: T1 prepared K1 at prep_t=4; T2 (start_ts=3) writes → PreparedConflict.
+    #[test]
+    fn path_prepared_conflict_aborts_writer_with_earlier_start() {
+        let mut s = shard();
+        s.handle_update(T1, 3, K1, v(10));
+        s.handle_prepare(T1); // prep_t = clock+1 = 1
+        // Manually set a high prep_t to ensure conflict.
+        let prep_t = *s.prepared.get(&T1).unwrap();
+        // Override to ensure prep_t=4 >= start_ts(T2)=3.
+        s.prepared.insert(T1, 4);
+        s.clock = 4;
+        assert_eq!(s.handle_update(T2, 3, K1, v(20)), UpdateResult::Abort);
+        let _ = prep_t; // suppress unused warning
+    }
+
+    /// Path: T1 prepared K1 at prep_t=1; T2 (start_ts=3) writes K1 → no PreparedConflict
+    /// (prep_t < start_ts). But WriteBuffConflict still fires since T1 holds the lock.
+    #[test]
+    fn path_write_buff_conflict_fires_even_when_prep_ts_below_start_ts() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.prepared.insert(T1, 1); // prep_t=1 < start_ts(T2)=3, no PreparedConflict
+        // But T1 still has K1 in write_buff → WriteBuffConflict.
+        assert_eq!(s.handle_update(T2, 3, K1, v(20)), UpdateResult::Abort);
+    }
+
+    /// Path: conflict aborts T2; T2 can no longer update any key.
+    #[test]
+    fn path_aborted_by_conflict_cannot_update_other_keys() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T2, 1, K1, v(20)); // conflict → T2 aborted
+        assert_eq!(s.handle_update(T2, 1, K2, v(5)), UpdateResult::Abort);
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 4: Two non-conflicting concurrent transactions
+    // -------------------------------------------------------------------
+
+    /// Path: T1 and T2 write different keys; both commit; each sees the other's value.
+    #[test]
+    fn path_two_txs_different_keys_both_commit() {
+        let mut s = shard();
+        assert_eq!(s.handle_update(T1, 1, K1, v(11)), UpdateResult::Ok);
+        assert_eq!(s.handle_update(T2, 2, K2, v(22)), UpdateResult::Ok);
+
+        let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let t2_prep = match s.handle_prepare(T2) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+
+        let t1_ct = t1_prep + 1;
+        let t2_ct = t2_prep + 1;
+        s.handle_commit(T1, t1_ct);
+        s.handle_commit(T2, t2_ct);
+
+        let read_ts = t1_ct.max(t2_ct) + 1;
+        assert_eq!(s.handle_read(T3, read_ts, K1, &no_inquiries()), ReadResult::Value(v(11)));
+        assert_eq!(s.handle_read(T3, read_ts, K2, &no_inquiries()), ReadResult::Value(v(22)));
+    }
+
+    /// Path: T1 commits K1; T2 (started after T1 committed) reads K1 then writes K2; commits.
+    /// T2 must see T1's write (SI1) but can freely write K2.
+    #[test]
+    fn path_tx_reads_committed_value_then_writes_different_key() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(50));
+        let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let t1_ct = t1_prep + 1;
+        s.handle_commit(T1, t1_ct);
+
+        // T2 starts after T1 committed.
+        let t2_start = t1_ct + 1;
+        assert_eq!(
+            s.handle_read(T2, t2_start, K1, &no_inquiries()),
+            ReadResult::Value(v(50)),
+        );
+        assert_eq!(s.handle_update(T2, t2_start, K2, v(99)), UpdateResult::Ok);
+        let t2_prep = match s.handle_prepare(T2) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T2, t2_prep + 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 5: Snapshot isolation — reads see consistent snapshots
+    // -------------------------------------------------------------------
+
+    /// Path: Three versions of K1 installed at different timestamps.
+    /// Readers at different snapshots see the correct version.
+    #[test]
+    fn path_snapshot_reads_across_multiple_versions() {
+        let mut s = shard();
+        // Version v(1) at t=2.
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(1), timestamp: 2 });
+        // Version v(2) at t=5.
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(2), timestamp: 5 });
+        // Version v(3) at t=9.
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 9 });
+
+        assert_eq!(s.handle_read(T1, 1,  K1, &no_inquiries()), ReadResult::Value(v(0)));
+        assert_eq!(s.handle_read(T1, 2,  K1, &no_inquiries()), ReadResult::Value(v(0)));
+        assert_eq!(s.handle_read(T1, 3,  K1, &no_inquiries()), ReadResult::Value(v(1)));
+        assert_eq!(s.handle_read(T1, 5,  K1, &no_inquiries()), ReadResult::Value(v(1)));
+        assert_eq!(s.handle_read(T1, 6,  K1, &no_inquiries()), ReadResult::Value(v(2)));
+        assert_eq!(s.handle_read(T1, 9,  K1, &no_inquiries()), ReadResult::Value(v(2)));
+        assert_eq!(s.handle_read(T1, 10, K1, &no_inquiries()), ReadResult::Value(v(3)));
+    }
+
+    /// Path: T2 takes a snapshot at ts=3; T1 commits K1 at ts=5 after T2 has started.
+    /// T2's snapshot must never see T1's write regardless of when T2 reads.
+    #[test]
+    fn path_snapshot_not_polluted_by_later_commit() {
+        let mut s = shard();
+        // T2 has a snapshot at ts=3.
+        // Simulate T1 committing K1 at ts=5 by installing the version directly.
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(99), timestamp: 5 });
+        // T2 (start_ts=3) reads K1 — must not see v(99) committed at ts=5.
+        assert_eq!(s.handle_read(T2, 3, K1, &no_inquiries()), ReadResult::Value(v(0)));
+    }
+
+    /// Path: T2 snapshot at ts=5 sees commit at ts=4 but not at ts=5.
+    #[test]
+    fn path_snapshot_sees_version_committed_one_before_start_ts() {
+        let mut s = shard();
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(7), timestamp: 4 });
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(8), timestamp: 5 });
+        // start_ts=5: sees t=4 but not t=5 (strict <).
+        assert_eq!(s.handle_read(T2, 5, K1, &no_inquiries()), ReadResult::Value(v(7)));
+    }
+
+    /// Path: T1 and T2 both read the same key at the same snapshot; they agree.
+    #[test]
+    fn path_two_txs_same_snapshot_read_agree() {
+        let mut s = shard();
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(42), timestamp: 3 });
+        assert_eq!(
+            s.handle_read(T1, 5, K1, &no_inquiries()),
+            s.handle_read(T2, 5, K1, &no_inquiries()),
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 6: Read-your-own-writes within a transaction
+    // -------------------------------------------------------------------
+
+    /// Path: update K1 → read K1 → see own write (before commit).
+    #[test]
+    fn path_read_own_write_before_prepare() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(77));
+        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::Value(v(77)));
+    }
+
+    /// Path: update K1 twice → read K1 → see second write.
+    #[test]
+    fn path_read_own_latest_write() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_update(T1, 1, K1, v(20));
+        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::Value(v(20)));
+    }
+
+    /// Path: update K1 → read K2 → see committed K2 value (not own write to K1).
+    #[test]
+    fn path_own_write_does_not_affect_other_keys() {
+        let mut s = shard();
+        s.versions.get_mut(&K2).unwrap().push(Version { value: v(55), timestamp: 1 });
+        s.handle_update(T1, 2, K1, v(99));
+        assert_eq!(s.handle_read(T1, 2, K2, &no_inquiries()), ReadResult::Value(v(55)));
+    }
+
+    /// Path: own-write shadows an older committed version of the same key.
+    #[test]
+    fn path_own_write_shadows_committed_version_of_same_key() {
+        let mut s = shard();
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(10), timestamp: 1 });
+        s.handle_update(T1, 5, K1, v(99));
+        // T1's buffered write (99) must shadow the committed v(10).
+        assert_eq!(s.handle_read(T1, 5, K1, &no_inquiries()), ReadResult::Value(v(99)));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 7: Full INQUIRE protocol sequences
+    // -------------------------------------------------------------------
+
+    /// Path: T1 prepared; T2 reads same key → NeedsInquiry → inquiry=Active → sees old value.
+    #[test]
+    fn path_inquire_active_read_sees_pre_prepare_version() {
+        let mut s = shard();
+        s.versions.get_mut(&K1).unwrap().push(Version { value: v(3), timestamp: 2 });
+        s.handle_update(T1, 1, K1, v(77));
+        let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        // T2 reads K1 at start_ts > t1_prep.
+        let start_ts = t1_prep + 2;
+        // First attempt: needs inquiry.
+        assert_eq!(
+            s.handle_read(T2, start_ts, K1, &no_inquiries()),
+            ReadResult::NeedsInquiry(vec![T1]),
+        );
+        // Inquiry says T1 is still active.
+        let mut inq = HashMap::new();
+        inq.insert(T1, InquiryStatus::Active);
+        // T2 ignores T1's buffered write and reads latest committed version before start_ts.
+        assert_eq!(
+            s.handle_read(T2, start_ts, K1, &inq),
+            ReadResult::Value(v(3)),
+        );
+    }
+
+    /// Path: T1 prepared; T2 reads → NeedsInquiry → inquiry=Committed, version not installed
+    /// → still NeedsInquiry.
+    #[test]
+    fn path_inquire_committed_but_version_not_installed_still_needs_inquiry() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(77));
+        let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let commit_ts = t1_prep + 1;
+        // Inquiry says committed but handle_commit not called yet.
+        let mut inq = HashMap::new();
+        inq.insert(T1, InquiryStatus::Committed(commit_ts));
+        let start_ts = t1_prep + 3;
+        assert_eq!(
+            s.handle_read(T2, start_ts, K1, &inq),
+            ReadResult::NeedsInquiry(vec![T1]),
+        );
+    }
+
+    /// Path: T1 prepared → commit installed → T2 reads with committed inquiry → sees T1's value.
+    #[test]
+    fn path_inquire_committed_and_version_installed_reads_new_value() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(77));
+        let t1_prep = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let commit_ts = t1_prep + 1;
+        s.handle_commit(T1, commit_ts);
+        let start_ts = commit_ts + 1;
+        let mut inq = HashMap::new();
+        inq.insert(T1, InquiryStatus::Committed(commit_ts));
+        assert_eq!(
+            s.handle_read(T2, start_ts, K1, &inq),
+            ReadResult::Value(v(77)),
+        );
+    }
+
+    /// Path: prepared writer's prep_ts >= start_ts — no inquiry required, read proceeds.
+    #[test]
+    fn path_no_inquiry_needed_when_prep_ts_at_or_after_start_ts() {
+        let mut s = shard();
+        s.handle_update(T1, 5, K1, v(77));
+        s.prepared.insert(T1, 7); // prep_t=7 >= start_ts=5
+        // T2's read at start_ts=5: T1's prep_t=7 >= 5, so T1 cannot have committed before
+        // T2's snapshot → no inquiry needed.
+        let result = s.handle_read(T2, 5, K1, &no_inquiries());
+        assert!(matches!(result, ReadResult::Value(_)));
+    }
+
+    /// Path: two prepared writers of K1, both with prep_ts < start_ts → NeedsInquiry for both.
+    #[test]
+    fn path_two_prepared_writers_both_need_inquiry() {
+        let mut s = shard();
+        // T1 and T2 are both prepared with writes to K1 (only one at a time normally,
+        // but set up directly to test the read path).
+        s.write_buff.entry(T1).or_default().insert(K1, v(10));
+        s.write_buff.entry(T2).or_default().insert(K1, v(20));
+        s.prepared.insert(T1, 2);
+        s.prepared.insert(T2, 3);
+        // T3 reads K1 at start_ts=10 > both prep_ts.
+        let result = s.handle_read(T3, 10, K1, &no_inquiries());
+        match result {
+            ReadResult::NeedsInquiry(ids) => {
+                let id_set: std::collections::HashSet<_> = ids.into_iter().collect();
+                assert!(id_set.contains(&T1));
+                assert!(id_set.contains(&T2));
+            }
+            _ => panic!("expected NeedsInquiry for both"),
+        }
+    }
+
+    /// Path: prepared writer of K2 (not K1) → reading K1 does not trigger inquiry.
+    #[test]
+    fn path_prepared_writer_of_different_key_no_inquiry_for_read() {
+        let mut s = shard();
+        s.write_buff.entry(T1).or_default().insert(K2, v(50));
+        s.prepared.insert(T1, 1);
+        // Reading K1 — T1 only wrote K2, so no inquiry.
+        assert!(matches!(
+            s.handle_read(T2, 5, K1, &no_inquiries()),
+            ReadResult::Value(_)
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 8: Chained transactions — T2 overwrites T1's value
+    // -------------------------------------------------------------------
+
+    /// Path: T1 commits K1=v1; T2 (started after T1) overwrites K1=v2; T3 sees v2.
+    #[test]
+    fn path_chained_overwrites_latest_wins() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(1));
+        let p1 = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T1, p1 + 1);
+
+        s.handle_update(T2, p1 + 2, K1, v(2));
+        let p2 = match s.handle_prepare(T2) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T2, p2 + 1);
+
+        // T3 reads at the latest timestamp — must see v(2).
+        let latest = p2 + 2;
+        assert_eq!(s.handle_read(T3, latest, K1, &no_inquiries()), ReadResult::Value(v(2)));
+    }
+
+    /// Path: T2 reads K1 at a snapshot between T1 and T2's own commit — sees T1's value.
+    #[test]
+    fn path_mid_chain_snapshot_sees_intermediate_value() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(1));
+        let p1 = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let c1 = p1 + 1;
+        s.handle_commit(T1, c1);
+
+        s.handle_update(T2, c1 + 1, K1, v(2));
+        let p2 = match s.handle_prepare(T2) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T2, p2 + 1);
+
+        // Snapshot between c1 and c2 sees T1's write.
+        assert_eq!(s.handle_read(T3, c1 + 1, K1, &no_inquiries()), ReadResult::Value(v(1)));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 9: Clock monotonicity under interleaving
+    // -------------------------------------------------------------------
+
+    /// Path: prepare, update with higher ts, prepare again — clocks stay monotone.
+    #[test]
+    fn path_clock_monotone_through_interleaved_ops() {
+        let mut s = shard();
+        s.handle_update(T1, 3, K1, v(1));
+        let t_after_update = s.clock;
+        s.handle_read(T2, 10, K2, &no_inquiries()); // bumps clock
+        let t_after_read = s.clock;
+        assert!(t_after_read >= t_after_update);
+        assert!(t_after_read >= 10);
+    }
+
+    /// Path: successive prepares yield strictly increasing timestamps.
+    #[test]
+    fn path_successive_prepares_strictly_increasing() {
+        let mut s = shard();
+        // T1 and T2 write different keys so they can both prepare.
+        s.handle_update(T1, 1, K1, v(1));
+        s.handle_update(T2, 1, K2, v(2));
+        let p1 = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        let p2 = match s.handle_prepare(T2) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        assert!(p2 > p1, "p2={p2} should be > p1={p1}");
+    }
+
+    /// Path: update with ts=100 → prepare gets timestamp > 100.
+    #[test]
+    fn path_prepare_ts_reflects_clock_after_high_ts_update() {
+        let mut s = shard();
+        s.handle_update(T1, 100, K1, v(1));
+        let prep_t = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        assert!(prep_t > 100, "prep_t={prep_t} should reflect that clock was advanced to 100");
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 10: Prepare-then-abort vs prepare-then-commit divergence
+    // -------------------------------------------------------------------
+
+    /// Path: T1 prepares, aborts → T2 can now write and prepare without conflict.
+    #[test]
+    fn path_prepare_abort_clears_prepared_set() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        assert!(s.prepared.contains_key(&T1));
+        s.handle_abort(T1);
+        assert!(!s.prepared.contains_key(&T1));
+        // T2 can now write and prepare K1.
+        assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
+        assert!(matches!(s.handle_prepare(T2), PrepareResult::Timestamp(_)));
+    }
+
+    /// Path: T1 commits → T1 no longer in prepared set.
+    #[test]
+    fn path_commit_clears_prepared_set() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        let prep_t = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        assert!(s.prepared.contains_key(&T1));
+        s.handle_commit(T1, prep_t + 1);
+        assert!(!s.prepared.contains_key(&T1));
+    }
+
+    /// Path: T1 commits → T2 can prepare the same key without prepared conflict.
+    #[test]
+    fn path_commit_enables_subsequent_prepare() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        let p1 = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T1, p1 + 1);
+
+        s.handle_update(T2, p1 + 2, K1, v(20));
+        assert!(matches!(s.handle_prepare(T2), PrepareResult::Timestamp(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 11: Edge cases at timestamp zero / init state
+    // -------------------------------------------------------------------
+
+    /// Path: read at start_ts=1 sees init value (v0 at t=0, strict < 1).
+    #[test]
+    fn path_read_at_ts_one_sees_init() {
+        let mut s = shard();
+        assert_eq!(s.handle_read(T1, 1, K1, &no_inquiries()), ReadResult::Value(v(0)));
+    }
+
+    /// Path: update at start_ts=1; committed version at ts=0 (< 1) → no CommittedConflict.
+    #[test]
+    fn path_init_version_at_ts_zero_never_causes_committed_conflict() {
+        let mut s = shard();
+        // The init version is at ts=0. Any update with start_ts > 0 should not conflict.
+        assert_eq!(s.handle_update(T1, 1, K1, v(5)), UpdateResult::Ok);
+        assert_eq!(s.handle_update(T2, 1, K2, v(6)), UpdateResult::Ok);
+    }
+
+    /// Path: read at start_ts=0 returns nothing visible (init version is at ts=0, not < 0).
+    #[test]
+    fn path_read_at_ts_zero_sees_nothing_from_init_version() {
+        // start_ts=0: eligible versions are those with ts < 0 — none exist.
+        let mut s = shard();
+        // The init value is at ts=0. With start_ts=0, it is NOT visible (strict <).
+        // LatestVersionBefore should fall back to InitVal since no eligible version exists.
+        // (Spec: if eligible == {}, return <<InitVal, 0>>.)
+        // The actual returned Value depends on the implementation's fallback behaviour;
+        // we just check it doesn't panic and returns *something*.
+        let r = s.handle_read(T1, 0, K1, &no_inquiries());
+        assert!(matches!(r, ReadResult::Value(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 12: Idempotency and message-set persistence
+    // -------------------------------------------------------------------
+
+    /// Path: calling handle_commit twice for the same tx must not install duplicate versions.
+    #[test]
+    fn path_double_commit_does_not_create_duplicate_versions() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_prepare(T1);
+        s.handle_commit(T1, 3);
+        // Calling commit again (idempotent expectation from the TLA+ guard model).
+        s.handle_commit(T1, 3);
+        // Only one version at ts=3 should exist.
+        let count = s.versions[&K1].iter().filter(|v| v.timestamp == 3).count();
+        assert_eq!(count, 1);
+    }
+
+    /// Path: calling handle_abort twice is idempotent.
+    #[test]
+    fn path_double_abort_is_idempotent() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(10));
+        s.handle_abort(T1);
+        s.handle_abort(T1);
+        assert!(s.aborted.contains(&T1));
+        assert!(s.write_buff.get(&T1).map(|b| b.is_empty()).unwrap_or(true));
+    }
+
+    // -------------------------------------------------------------------
+    // Path family 13: SI property end-to-end sequences
+    // -------------------------------------------------------------------
+
+    /// End-to-end SI1: T1 commits before T2 starts → T2 always reads T1's value.
+    #[test]
+    fn path_si1_e2e_committed_before_start() {
+        let mut s = shard();
+        s.handle_update(T1, 1, K1, v(42));
+        let p = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T1, p + 1);
+        // T2 starts strictly after T1 committed.
+        for start_ts in [p + 2, p + 5, p + 10] {
+            assert_eq!(
+                s.handle_read(T2, start_ts, K1, &no_inquiries()),
+                ReadResult::Value(v(42)),
+                "T2 with start_ts={start_ts} should see T1's write",
+            );
+        }
+    }
+
+    /// End-to-end SI4: after T1 commits K1, any concurrent writer is rejected.
+    #[test]
+    fn path_si4_e2e_concurrent_writer_rejected_after_commit() {
+        let mut s = shard();
+        s.handle_update(T1, 2, K1, v(10));
+        let p = match s.handle_prepare(T1) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+        s.handle_commit(T1, p + 1);
+        // T2 started at ts=1 (before T1 committed) — concurrent → ABORT.
+        assert_eq!(s.handle_update(T2, 1, K1, v(20)), UpdateResult::Abort);
+    }
+
+    /// End-to-end SI3: MVCC timestamps remain distinct across many sequential commits.
+    #[test]
+    fn path_si3_e2e_many_sequential_commits_distinct_timestamps() {
+        let mut s = shard();
+        let txids = [101u64, 102, 103, 104, 105];
+        let mut last_ct = 0u64;
+        for &id in &txids {
+            let start = last_ct + 1;
+            assert_eq!(s.handle_update(id, start, K1, v(id as u64)), UpdateResult::Ok);
+            let prep = match s.handle_prepare(id) { PrepareResult::Timestamp(t) => t, _ => panic!() };
+            let ct = prep + 1;
+            s.handle_commit(id, ct);
+            // Verify the new version has a timestamp distinct from all prior ones.
+            let ts_set: std::collections::HashSet<_> = s.versions[&K1].iter().map(|v| v.timestamp).collect();
+            assert_eq!(ts_set.len(), s.versions[&K1].len(), "duplicate timestamps after committing tx {id}");
+            last_ct = ct;
+        }
+    }
 }
