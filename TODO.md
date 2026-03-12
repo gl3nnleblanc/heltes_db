@@ -30,5 +30,4 @@
 
 ## Other
 
-- **CI** - add some github actions for ensuring main is stable
 - **Frontend** - add a CLI frontend for running some limited SQL-like statements

@@ -7,19 +7,18 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::coordinator::{
-    coord_port_from_tx_id, routing::ConsistentHashRouter, BeginCommitResult,
-    BeginFastCommitResult, CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult,
-    SendCommitResult, TxIdGen,
+    coord_port_from_tx_id, routing::ConsistentHashRouter, BeginCommitResult, BeginFastCommitResult,
+    CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, SendCommitResult, TxIdGen,
 };
 use crate::proto::coordinator_service_client::CoordinatorServiceClient;
 use crate::proto::coordinator_service_server::CoordinatorService;
 use crate::proto::shard_service_client::ShardServiceClient;
 use crate::proto::{
     Abort, AbortRequest as ShardAbortRequest, Active, CommitRequest as ShardCommitRequest,
-    FastCommitRequest as ShardFastCommitRequest,
-    InquireReply, InquireRequest, InquiryResult, NeedsInquirySet, PrepareRequest, ReadRequest,
-    TxAbortReply, TxAbortRequest, TxBeginReply, TxBeginRequest, TxCommitReply, TxCommitRequest,
-    TxReadReply, TxReadRequest, TxUpdateReply, TxUpdateRequest, UpdateRequest,
+    FastCommitRequest as ShardFastCommitRequest, InquireReply, InquireRequest, InquiryResult,
+    NeedsInquirySet, PrepareRequest, ReadRequest, TxAbortReply, TxAbortRequest, TxBeginReply,
+    TxBeginRequest, TxCommitReply, TxCommitRequest, TxReadReply, TxReadRequest, TxUpdateReply,
+    TxUpdateRequest, UpdateRequest,
 };
 use crate::shard::InquiryStatus;
 
@@ -75,6 +74,7 @@ impl CoordinatorServer {
         self.coordinator_uris.get(&port).map(String::as_str)
     }
 
+    #[allow(clippy::result_large_err)] // Status is the tonic-mandated error type; boxing it would complicate callers
     fn shard_client(&self, port: u64) -> Result<ShardServiceClient<Channel>, Status> {
         self.shard_clients
             .get(&port)
@@ -91,19 +91,26 @@ impl CoordinatorServer {
     ) -> Result<InquiryStatus, Status> {
         let port = coord_port_from_tx_id(tx_id);
         if port == self.my_port {
-            return Ok(self.state.lock().unwrap().handle_inquire(tx_id, reader_start_ts));
+            return Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .handle_inquire(tx_id, reader_start_ts));
         }
         let uri = self
             .coordinator_uri_for_port(port)
-            .ok_or_else(|| Status::unavailable(format!(
-                "no address configured for coordinator port {port}"
-            )))?
+            .ok_or_else(|| {
+                Status::unavailable(format!("no address configured for coordinator port {port}"))
+            })?
             .to_owned();
         let mut client = CoordinatorServiceClient::connect(uri)
             .await
             .map_err(|e| Status::unavailable(format!("coordinator :{port} unreachable: {e}")))?;
         let reply = client
-            .inquire(InquireRequest { tx_id, prep_ts: reader_start_ts })
+            .inquire(InquireRequest {
+                tx_id,
+                prep_ts: reader_start_ts,
+            })
             .await?
             .into_inner();
         use crate::proto::inquire_reply::Status as S;
@@ -121,7 +128,9 @@ impl CoordinatorServer {
         let futs = participants.into_iter().filter_map(|port| {
             self.shard_clients.get(&port).map(|c| {
                 let mut client = c.clone();
-                async move { let _ = client.abort(ShardAbortRequest { tx_id }).await; }
+                async move {
+                    let _ = client.abort(ShardAbortRequest { tx_id }).await;
+                }
             })
         });
         join_all(futs).await;
@@ -137,16 +146,18 @@ impl CoordinatorService for CoordinatorServer {
         &self,
         _request: Request<TxBeginRequest>,
     ) -> Result<Response<TxBeginReply>, Status> {
-        let tx_id = self.tx_id_gen.lock().unwrap().next();
+        let tx_id = self
+            .tx_id_gen
+            .lock()
+            .unwrap()
+            .next()
+            .expect("TxIdGen never exhausts");
         let start_ts = self.state.lock().unwrap().start_tx(tx_id);
         Ok(Response::new(TxBeginReply { tx_id, start_ts }))
     }
 
     /// CoordRead: route to the owning shard, resolve any NeedsInquiry loops.
-    async fn read(
-        &self,
-        request: Request<TxReadRequest>,
-    ) -> Result<Response<TxReadReply>, Status> {
+    async fn read(&self, request: Request<TxReadRequest>) -> Result<Response<TxReadReply>, Status> {
         let req = request.into_inner();
         let tx_id = req.tx_id;
         let key = req.key;
@@ -171,20 +182,31 @@ impl CoordinatorService for CoordinatorServer {
         let mut inquiry_results: Vec<InquiryResult> = vec![];
         loop {
             let reply = client
-                .read(ReadRequest { tx_id, start_ts, key, inquiry_results: inquiry_results.clone() })
+                .read(ReadRequest {
+                    tx_id,
+                    start_ts,
+                    key,
+                    inquiry_results: inquiry_results.clone(),
+                })
                 .await?
                 .into_inner();
 
             match reply.result {
                 Some(R::Value(v)) => {
-                    return Ok(Response::new(TxReadReply { result: Some(TR::Value(v)) }));
+                    return Ok(Response::new(TxReadReply {
+                        result: Some(TR::Value(v)),
+                    }));
                 }
                 Some(R::NotFound(_)) => {
-                    return Ok(Response::new(TxReadReply { result: Some(TR::NotFound(true)) }));
+                    return Ok(Response::new(TxReadReply {
+                        result: Some(TR::NotFound(true)),
+                    }));
                 }
                 Some(R::Abort(_)) => {
                     self.abort_and_notify(tx_id).await;
-                    return Ok(Response::new(TxReadReply { result: Some(TR::Abort(Abort {})) }));
+                    return Ok(Response::new(TxReadReply {
+                        result: Some(TR::Abort(Abort {})),
+                    }));
                 }
                 Some(R::NeedsInquiry(NeedsInquirySet { tx_ids })) => {
                     for id in tx_ids {
@@ -199,8 +221,10 @@ impl CoordinatorService for CoordinatorServer {
                         };
                         match inquiry_results.iter_mut().find(|r| r.tx_id == id) {
                             Some(r) => r.status = Some(proto_status),
-                            None => inquiry_results
-                                .push(InquiryResult { tx_id: id, status: Some(proto_status) }),
+                            None => inquiry_results.push(InquiryResult {
+                                tx_id: id,
+                                status: Some(proto_status),
+                            }),
                         }
                     }
                 }
@@ -232,11 +256,19 @@ impl CoordinatorService for CoordinatorServer {
             .ok_or_else(|| Status::unavailable("no shards registered"))?
             .port() as u64;
 
-        self.state.lock().unwrap().add_participant(tx_id, shard_port);
+        self.state
+            .lock()
+            .unwrap()
+            .add_participant(tx_id, shard_port);
 
         let mut client = self.shard_client(shard_port)?;
         let reply = client
-            .update(UpdateRequest { tx_id, start_ts, key, value })
+            .update(UpdateRequest {
+                tx_id,
+                start_ts,
+                key,
+                value,
+            })
             .await?
             .into_inner();
 
@@ -251,7 +283,9 @@ impl CoordinatorService for CoordinatorServer {
             }
             None => return Err(Status::internal("shard returned empty update result")),
         };
-        Ok(Response::new(TxUpdateReply { result: Some(result) }))
+        Ok(Response::new(TxUpdateReply {
+            result: Some(result),
+        }))
     }
 
     /// Commit a transaction.
@@ -284,23 +318,34 @@ impl CoordinatorService for CoordinatorServer {
                 use crate::proto::fast_commit_reply::Result as R;
                 return match reply.result {
                     Some(R::CommitTs(commit_ts)) => {
-                        match self.state.lock().unwrap().finalize_fast_commit(tx_id, commit_ts) {
+                        match self
+                            .state
+                            .lock()
+                            .unwrap()
+                            .finalize_fast_commit(tx_id, commit_ts)
+                        {
                             FinalizeFastCommitResult::Ok => {}
                             FinalizeFastCommitResult::NotReady => {
                                 return Err(Status::internal("unexpected state after fast commit"));
                             }
                         }
-                        Ok(Response::new(TxCommitReply { result: Some(TR::CommitTs(commit_ts)) }))
+                        Ok(Response::new(TxCommitReply {
+                            result: Some(TR::CommitTs(commit_ts)),
+                        }))
                     }
                     Some(R::Abort(_)) => {
                         self.abort_and_notify(tx_id).await;
-                        Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }))
+                        Ok(Response::new(TxCommitReply {
+                            result: Some(TR::Abort(Abort {})),
+                        }))
                     }
                     None => Err(Status::internal("shard returned empty fast commit reply")),
                 };
             }
             BeginFastCommitResult::Aborted => {
-                return Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }));
+                return Ok(Response::new(TxCommitReply {
+                    result: Some(TR::Abort(Abort {})),
+                }));
             }
             BeginFastCommitResult::NotSingleShard => {
                 // Fall through to standard 2PC below.
@@ -315,10 +360,14 @@ impl CoordinatorService for CoordinatorServer {
             match state.begin_commit(tx_id) {
                 BeginCommitResult::Prepare(p) => p.into_iter().collect(),
                 BeginCommitResult::Aborted => {
-                    return Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }));
+                    return Ok(Response::new(TxCommitReply {
+                        result: Some(TR::Abort(Abort {})),
+                    }));
                 }
                 BeginCommitResult::NoParticipants => {
-                    return Err(Status::failed_precondition("commit with no participant shards"));
+                    return Err(Status::failed_precondition(
+                        "commit with no participant shards",
+                    ));
                 }
             }
         };
@@ -355,7 +404,12 @@ impl CoordinatorService for CoordinatorServer {
         let mut prepare_aborted = false;
         for result in prepare_results {
             let (port, ts) = result?;
-            match self.state.lock().unwrap().collect_prepare_reply(tx_id, port, ts) {
+            match self
+                .state
+                .lock()
+                .unwrap()
+                .collect_prepare_reply(tx_id, port, ts)
+            {
                 CollectPrepareResult::Done { commit_ts: ct, .. } => commit_ts = Some(ct),
                 CollectPrepareResult::Aborted => {
                     prepare_aborted = true;
@@ -369,11 +423,15 @@ impl CoordinatorService for CoordinatorServer {
             let futs = participants.iter().filter_map(|&port| {
                 self.shard_clients.get(&port).map(|c| {
                     let mut client = c.clone();
-                    async move { let _ = client.abort(ShardAbortRequest { tx_id }).await; }
+                    async move {
+                        let _ = client.abort(ShardAbortRequest { tx_id }).await;
+                    }
                 })
             });
             join_all(futs).await;
-            return Ok(Response::new(TxCommitReply { result: Some(TR::Abort(Abort {})) }));
+            return Ok(Response::new(TxCommitReply {
+                result: Some(TR::Abort(Abort {})),
+            }));
         }
 
         let commit_ts = commit_ts.unwrap();
@@ -399,7 +457,9 @@ impl CoordinatorService for CoordinatorServer {
         });
         join_all(commit_futs).await;
 
-        Ok(Response::new(TxCommitReply { result: Some(TR::CommitTs(commit_ts)) }))
+        Ok(Response::new(TxCommitReply {
+            result: Some(TR::CommitTs(commit_ts)),
+        }))
     }
 
     /// CoordAbortOnReply (manual): abort state and notify all participant shards.
@@ -417,13 +477,19 @@ impl CoordinatorService for CoordinatorServer {
         request: Request<InquireRequest>,
     ) -> Result<Response<InquireReply>, Status> {
         let req = request.into_inner();
-        let status = self.state.lock().unwrap().handle_inquire(req.tx_id, req.prep_ts);
+        let status = self
+            .state
+            .lock()
+            .unwrap()
+            .handle_inquire(req.tx_id, req.prep_ts);
         use crate::proto::inquire_reply::Status as S;
         let proto_status = match status {
             InquiryStatus::Committed(ts) => S::CommittedAt(ts),
             InquiryStatus::Active => S::Active(Active {}),
         };
-        Ok(Response::new(InquireReply { status: Some(proto_status) }))
+        Ok(Response::new(InquireReply {
+            status: Some(proto_status),
+        }))
     }
 }
 
@@ -468,10 +534,13 @@ mod tests {
     // Trace: multiple peers → each independently addressable by port.
     #[test]
     fn coordinator_uri_for_multiple_peers() {
-        let server = test_server(50052, vec![
-            "192.0.2.1:50053".parse().unwrap(),
-            "192.0.2.2:50054".parse().unwrap(),
-        ]);
+        let server = test_server(
+            50052,
+            vec![
+                "192.0.2.1:50053".parse().unwrap(),
+                "192.0.2.2:50054".parse().unwrap(),
+            ],
+        );
         assert_eq!(
             server.coordinator_uri_for_port(50053),
             Some("http://192.0.2.1:50053"),

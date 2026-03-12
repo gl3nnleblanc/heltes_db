@@ -90,6 +90,12 @@ pub struct ShardState {
     pub aborted: HashSet<TxId>,
 }
 
+impl Default for ShardState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShardState {
     /// Create a new shard with no committed versions.
     /// Keys come into existence on first commit (matching TLA+ `versions = [k \in Keys |-> {}]`).
@@ -187,7 +193,11 @@ impl ShardState {
             .get(&key)
             .and_then(|vs| {
                 let pos = vs.partition_point(|v| v.timestamp < start_ts);
-                if pos > 0 { Some(&vs[pos - 1]) } else { None }
+                if pos > 0 {
+                    Some(&vs[pos - 1])
+                } else {
+                    None
+                }
             })
             .cloned();
 
@@ -201,8 +211,10 @@ impl ShardState {
     /// Handle UPDATE_KEY(id, start_ts, key, value).
     ///
     /// Detects write-write conflicts:
+    ///
     ///   - Abort if any committed version of `key` has timestamp >= start_ts.
     ///   - Abort if any prepared transaction that wrote `key` has prep_t >= start_ts.
+    ///
     /// Otherwise, buffer the write (overwriting any prior write to `key` by this tx).
     pub fn handle_update(
         &mut self,
@@ -244,17 +256,18 @@ impl ShardState {
         }
 
         // WriteBuffConflict: O(1) index lookup — any other tx holds the write lock for key.
-        let write_buff_conflict = self.write_keys.get(&key).map(|&owner| owner != tx_id).unwrap_or(false);
+        let write_buff_conflict = self
+            .write_keys
+            .get(&key)
+            .map(|&owner| owner != tx_id)
+            .unwrap_or(false);
         if write_buff_conflict {
             self.aborted.insert(tx_id);
             return UpdateResult::Abort;
         }
 
         // Buffer the write and advance clock.
-        self.write_buff
-            .entry(tx_id)
-            .or_default()
-            .insert(key, value);
+        self.write_buff.entry(tx_id).or_default().insert(key, value);
         // Acquire the write lock for this key in the O(1) index.
         self.write_keys.insert(key, tx_id);
         self.clock = self.clock.max(start_ts);
@@ -293,7 +306,13 @@ impl ShardState {
                 // Ok(i) → already installed at index i, skip.
                 // Err(i) → not present; insert at index i to maintain ascending order.
                 if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
-                    vs.insert(pos, Version { value, timestamp: commit_ts });
+                    vs.insert(
+                        pos,
+                        Version {
+                            value,
+                            timestamp: commit_ts,
+                        },
+                    );
                 }
             }
         }
@@ -337,7 +356,13 @@ impl ShardState {
                 let vs = self.versions.entry(key).or_default();
                 // Idempotent + sorted insertion via binary search (same as handle_commit).
                 if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
-                    vs.insert(pos, Version { value, timestamp: commit_ts });
+                    vs.insert(
+                        pos,
+                        Version {
+                            value,
+                            timestamp: commit_ts,
+                        },
+                    );
                 }
             }
         }
@@ -365,7 +390,7 @@ impl ShardState {
         let mut min_active_seq: HashMap<u32, u32> = HashMap::new();
         for &tx_id in self.write_buff.keys().chain(self.prepared.keys()) {
             let port = (tx_id >> 32) as u32;
-            let seq  = tx_id as u32;
+            let seq = tx_id as u32;
             let e = min_active_seq.entry(port).or_insert(u32::MAX);
             *e = (*e).min(seq);
         }
@@ -376,15 +401,14 @@ impl ShardState {
         // will never send new messages for this tx_id.
         self.aborted.retain(|&tx_id| {
             let port = (tx_id >> 32) as u32;
-            let seq  = tx_id as u32;
+            let seq = tx_id as u32;
             match min_active_seq.get(&port) {
                 Some(&min) => seq >= min,
-                None       => false,
+                None => false,
             }
         });
     }
 }
-
 
 #[cfg(test)]
 mod tests;

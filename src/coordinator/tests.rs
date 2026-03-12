@@ -65,7 +65,10 @@ fn begin_commit_returns_participant_shards() {
     c.start_tx(1);
     c.add_participant(1, 10);
     c.add_participant(1, 20);
-    assert_eq!(c.begin_commit(1), BeginCommitResult::Prepare(shards(&[10, 20])));
+    assert_eq!(
+        c.begin_commit(1),
+        BeginCommitResult::Prepare(shards(&[10, 20]))
+    );
     assert_eq!(c.tx_phase(1), Some(TxPhase::Preparing));
 }
 
@@ -115,7 +118,10 @@ fn collect_prepare_single_shard_returns_done() {
     let r = c.collect_prepare_reply(1, 10, Some(3));
     assert_eq!(
         r,
-        CollectPrepareResult::Done { commit_ts: 3, participants: shards(&[10]) }
+        CollectPrepareResult::Done {
+            commit_ts: 3,
+            participants: shards(&[10])
+        }
     );
     assert_eq!(c.tx_phase(1), Some(TxPhase::CommitWait));
 }
@@ -135,7 +141,10 @@ fn collect_prepare_two_shards_need_more_then_done() {
     let r2 = c.collect_prepare_reply(1, 20, Some(5));
     assert_eq!(
         r2,
-        CollectPrepareResult::Done { commit_ts: 5, participants: shards(&[10, 20]) }
+        CollectPrepareResult::Done {
+            commit_ts: 5,
+            participants: shards(&[10, 20])
+        }
     );
 }
 
@@ -151,7 +160,10 @@ fn collect_prepare_commit_ts_is_max_of_prep_timestamps() {
     // commit_ts = max(3, 7, clock=1) = 7
     assert_eq!(
         r,
-        CollectPrepareResult::Done { commit_ts: 7, participants: shards(&[10, 20]) }
+        CollectPrepareResult::Done {
+            commit_ts: 7,
+            participants: shards(&[10, 20])
+        }
     );
 }
 
@@ -167,7 +179,10 @@ fn collect_prepare_commit_ts_is_clock_when_clock_greater() {
     // commit_ts = max(1, clock=2) = 2
     assert_eq!(
         r,
-        CollectPrepareResult::Done { commit_ts: 2, participants: shards(&[10]) }
+        CollectPrepareResult::Done {
+            commit_ts: 2,
+            participants: shards(&[10])
+        }
     );
 }
 
@@ -218,7 +233,10 @@ fn send_commit_transitions_to_committed_and_sets_is_committed() {
     let r = c.send_commit(1);
     assert_eq!(
         r,
-        SendCommitResult::Ok { commit_ts: 3, participants: shards(&[10]) }
+        SendCommitResult::Ok {
+            commit_ts: 3,
+            participants: shards(&[10])
+        }
     );
     assert_eq!(c.tx_phase(1), Some(TxPhase::Committed));
 }
@@ -343,7 +361,11 @@ fn path_single_shard_happy_commit() {
 
     // ShardHandlePrepare(S1, T1): shard responds with prep_t=2
     let r = c.collect_prepare_reply(1, 100, Some(2));
-    let CollectPrepareResult::Done { commit_ts, participants } = r else {
+    let CollectPrepareResult::Done {
+        commit_ts,
+        participants,
+    } = r
+    else {
         panic!("expected Done");
     };
     assert_eq!(participants, shards(&[100]));
@@ -430,16 +452,16 @@ fn path_inquire_after_commit() {
 #[test]
 fn txidgen_encodes_port_in_high_bits() {
     let mut gen = TxIdGen::new(50052);
-    let id = gen.next();
+    let id = gen.next().unwrap();
     assert_eq!(coord_port_from_tx_id(id), 50052);
 }
 
 #[test]
 fn txidgen_sequence_increments() {
     let mut gen = TxIdGen::new(50052);
-    let id0 = gen.next();
-    let id1 = gen.next();
-    let id2 = gen.next();
+    let id0 = gen.next().unwrap();
+    let id1 = gen.next().unwrap();
+    let id2 = gen.next().unwrap();
     assert_eq!(id0 & 0xFFFF_FFFF, 0);
     assert_eq!(id1 & 0xFFFF_FFFF, 1);
     assert_eq!(id2 & 0xFFFF_FFFF, 2);
@@ -450,14 +472,14 @@ fn txidgen_different_ports_produce_distinct_ids() {
     let mut gen_a = TxIdGen::new(50052);
     let mut gen_b = TxIdGen::new(50053);
     // Same sequence slot, different ports — ids must not collide.
-    assert_ne!(gen_a.next(), gen_b.next());
+    assert_ne!(gen_a.next().unwrap(), gen_b.next().unwrap());
 }
 
 #[test]
 fn coord_port_roundtrips() {
     for port in [50051u16, 50052, 60000, 1, u16::MAX] {
         let mut gen = TxIdGen::new(port);
-        let id = gen.next();
+        let id = gen.next().unwrap();
         assert_eq!(coord_port_from_tx_id(id), port);
     }
 }
@@ -471,17 +493,24 @@ fn si2_committed_txs_have_distinct_commit_timestamps() {
     c.add_participant(1, 100);
     c.begin_commit(1);
     let r1 = c.collect_prepare_reply(1, 100, Some(2));
-    let CollectPrepareResult::Done { commit_ts: ct1, .. } = r1 else { panic!() };
+    let CollectPrepareResult::Done { commit_ts: ct1, .. } = r1 else {
+        panic!()
+    };
     c.send_commit(1);
 
     c.start_tx(2);
     c.add_participant(2, 100);
     c.begin_commit(2);
     let r2 = c.collect_prepare_reply(2, 100, Some(2)); // shard reused prep_ts value
-    let CollectPrepareResult::Done { commit_ts: ct2, .. } = r2 else { panic!() };
+    let CollectPrepareResult::Done { commit_ts: ct2, .. } = r2 else {
+        panic!()
+    };
     c.send_commit(2);
 
-    assert_ne!(ct1, ct2, "SI2 violated: two committed txs share a commit timestamp");
+    assert_ne!(
+        ct1, ct2,
+        "SI2 violated: two committed txs share a commit timestamp"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +531,10 @@ fn begin_fast_commit_returns_shard_for_single_participant() {
 fn begin_fast_commit_no_participants_returns_not_single_shard() {
     let mut c = coord();
     c.start_tx(1);
-    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::NotSingleShard);
+    assert_eq!(
+        c.begin_fast_commit(1),
+        BeginFastCommitResult::NotSingleShard
+    );
 }
 
 /// Trace: CoordFastCommit guard — two participants → NotSingleShard (use regular 2PC).
@@ -512,7 +544,10 @@ fn begin_fast_commit_multiple_participants_returns_not_single_shard() {
     c.start_tx(1);
     c.add_participant(1, 100);
     c.add_participant(1, 200);
-    assert_eq!(c.begin_fast_commit(1), BeginFastCommitResult::NotSingleShard);
+    assert_eq!(
+        c.begin_fast_commit(1),
+        BeginFastCommitResult::NotSingleShard
+    );
 }
 
 /// Trace: CoordFastCommit guard — aborted transaction → Aborted.
@@ -572,7 +607,10 @@ fn finalize_fast_commit_does_not_regress_clock() {
     c.add_participant(1, 100);
     // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance to 2).
     c.finalize_fast_commit(1, 1);
-    assert!(c.clock >= 2, "clock must not regress below pre-existing value");
+    assert!(
+        c.clock >= 2,
+        "clock must not regress below pre-existing value"
+    );
 }
 
 /// Trace: CoordHandleFastCommitReply on wrong phase → NotReady.
@@ -582,7 +620,10 @@ fn finalize_fast_commit_on_wrong_phase_returns_not_ready() {
     c.start_tx(1);
     c.add_participant(1, 100);
     c.abort_tx(1);
-    assert_eq!(c.finalize_fast_commit(1, 5), FinalizeFastCommitResult::NotReady);
+    assert_eq!(
+        c.finalize_fast_commit(1, 5),
+        FinalizeFastCommitResult::NotReady
+    );
 }
 
 /// TLA+ fast path: CoordFastCommit → ShardHandleFastCommit → CoordHandleFastCommitReply.

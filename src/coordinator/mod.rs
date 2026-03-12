@@ -38,7 +38,10 @@ pub enum CollectPrepareResult {
     /// Waiting for more PREPARE_REPLYs.
     NeedMore,
     /// All shards replied OK; send COMMIT to participants.
-    Done { commit_ts: Timestamp, participants: HashSet<ShardId> },
+    Done {
+        commit_ts: Timestamp,
+        participants: HashSet<ShardId>,
+    },
     /// At least one shard replied ABORT.
     Aborted,
 }
@@ -46,7 +49,10 @@ pub enum CollectPrepareResult {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendCommitResult {
     /// tx_state → COMMITTED; send CommitMsg(tx_id, commit_ts) to these shards.
-    Ok { commit_ts: Timestamp, participants: HashSet<ShardId> },
+    Ok {
+        commit_ts: Timestamp,
+        participants: HashSet<ShardId>,
+    },
     /// Transaction is not in CommitWait phase.
     NotReady,
 }
@@ -91,9 +97,18 @@ pub struct CoordinatorState {
     transactions: HashMap<TxId, TxEntry>,
 }
 
+impl Default for CoordinatorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CoordinatorState {
     pub fn new() -> Self {
-        CoordinatorState { clock: 0, transactions: HashMap::new() }
+        CoordinatorState {
+            clock: 0,
+            transactions: HashMap::new(),
+        }
     }
 
     // -- Accessors -----------------------------------------------------------
@@ -113,14 +128,17 @@ impl CoordinatorState {
     pub fn start_tx(&mut self, tx_id: TxId) -> Timestamp {
         let start_ts = self.clock + 1;
         self.clock = start_ts;
-        self.transactions.insert(tx_id, TxEntry {
-            start_ts,
-            commit_ts: None,
-            is_committed: false,
-            participants: HashSet::new(),
-            phase: TxPhase::Active,
-            prepare_replies: HashMap::new(),
-        });
+        self.transactions.insert(
+            tx_id,
+            TxEntry {
+                start_ts,
+                commit_ts: None,
+                is_committed: false,
+                participants: HashSet::new(),
+                phase: TxPhase::Active,
+                prepare_replies: HashMap::new(),
+            },
+        );
         start_ts
     }
 
@@ -209,7 +227,10 @@ impl CoordinatorState {
         let commit_ts = tx.commit_ts.unwrap();
         tx.phase = TxPhase::Committed;
         tx.is_committed = true;
-        SendCommitResult::Ok { commit_ts, participants: tx.participants.clone() }
+        SendCommitResult::Ok {
+            commit_ts,
+            participants: tx.participants.clone(),
+        }
     }
 
     /// CoordFastCommit (phase 1): validate that this is a single-shard transaction
@@ -301,13 +322,20 @@ pub struct TxIdGen {
 
 impl TxIdGen {
     pub fn new(coordinator_port: u16) -> Self {
-        TxIdGen { coordinator_port, next_seq: 0 }
+        TxIdGen {
+            coordinator_port,
+            next_seq: 0,
+        }
     }
+}
 
-    pub fn next(&mut self) -> TxId {
+impl Iterator for TxIdGen {
+    type Item = TxId;
+
+    fn next(&mut self) -> Option<TxId> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        ((self.coordinator_port as u64) << 32) | seq as u64
+        Some(((self.coordinator_port as u64) << 32) | seq as u64)
     }
 }
 
