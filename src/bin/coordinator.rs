@@ -4,28 +4,43 @@ use tonic::transport::Server;
 
 use heltes_db::coordinator::{
     server::{CoordinatorServer, CoordinatorServiceServer},
-    CoordinatorState, TxIdGen,
+    CoordinatorState,
 };
 
+/// Usage: coordinator [BIND_ADDR] [SHARD_ADDR...]
+///
+///   coordinator [::1]:50052 [::1]:50051 [::1]:50053
+///
+/// BIND_ADDR defaults to [::1]:50052.
+/// At least one SHARD_ADDR is required to serve real traffic.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+
+    let bind: SocketAddr = args
+        .next()
         .unwrap_or_else(|| "[::1]:50052".to_string())
         .parse()?;
 
-    let port = addr.port();
-    eprintln!("coordinator listening on {addr} (coordinator_port={port})");
+    let shard_addrs: Vec<SocketAddr> = args
+        .map(|s| s.parse::<SocketAddr>())
+        .collect::<Result<_, _>>()?;
 
-    // TxIdGen encodes this coordinator's port into every tx_id it issues,
-    // letting shards route Inquire RPCs back here without a lookup service.
-    let _gen = TxIdGen::new(port);
+    let my_port = bind.port();
+
+    eprintln!(
+        "coordinator listening on {bind} (port={my_port}, shards={shard_addrs:?})"
+    );
+
+    if shard_addrs.is_empty() {
+        eprintln!("warning: no shard addresses provided — all RPCs will return Unavailable");
+    }
+
+    let server = CoordinatorServer::new(CoordinatorState::new(), my_port, shard_addrs)?;
 
     Server::builder()
-        .add_service(CoordinatorServiceServer::new(CoordinatorServer::new(
-            CoordinatorState::new(),
-        )))
-        .serve(addr)
+        .add_service(CoordinatorServiceServer::new(server))
+        .serve(bind)
         .await?;
 
     Ok(())
