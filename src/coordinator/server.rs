@@ -45,6 +45,7 @@ pub struct CoordinatorServer {
     my_port: u16,
     /// port → gRPC URI for peer coordinators (for cross-coordinator Inquire forwarding).
     /// Built from `peer_coordinator_addrs` supplied at construction time.
+    #[allow(dead_code)] // used in tests only
     coordinator_uris: HashMap<u16, String>,
     /// port → cached gRPC client for peer coordinators.
     /// Pre-built with lazy connections so cross-coordinator Inquire RPCs reuse the
@@ -113,6 +114,7 @@ impl CoordinatorServer {
 
     /// Return the gRPC URI for a peer coordinator by its port, or `None` if
     /// no address was configured for that port.
+    #[allow(dead_code)] // used in tests only
     pub(crate) fn coordinator_uri_for_port(&self, port: u16) -> Option<&str> {
         self.coordinator_uris.get(&port).map(String::as_str)
     }
