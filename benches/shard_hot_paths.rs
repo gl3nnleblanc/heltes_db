@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use heltes_db::shard::{InquiryStatus, ShardState, Value};
 
 // ── Setup helpers (mirror tests/shard_bench_traces.rs) ───────────────────────
@@ -116,33 +116,29 @@ fn bench_compact_versions(c: &mut Criterion) {
     let mut group = c.benchmark_group("compact_versions");
 
     for n_keys in [10u64, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("keys", n_keys),
-            &n_keys,
-            |b, &n_keys| {
-                b.iter_batched(
-                    || {
-                        let mut state = ShardState::new();
-                        for v in 1u64..=5 {
-                            for key in 0..n_keys {
-                                let tx_id = (v - 1) * n_keys + key + 1;
-                                let start_ts = v * 1_000 - 500;
-                                let commit_ts = v * 1_000 + key;
-                                state.handle_update(tx_id, start_ts, key, Value(v * 1_000 + key));
-                                state.handle_prepare(tx_id);
-                                state.handle_commit(tx_id, commit_ts);
-                            }
+        group.bench_with_input(BenchmarkId::new("keys", n_keys), &n_keys, |b, &n_keys| {
+            b.iter_batched(
+                || {
+                    let mut state = ShardState::new();
+                    for v in 1u64..=5 {
+                        for key in 0..n_keys {
+                            let tx_id = (v - 1) * n_keys + key + 1;
+                            let start_ts = v * 1_000 - 500;
+                            let commit_ts = v * 1_000 + key;
+                            state.handle_update(tx_id, start_ts, key, Value(v * 1_000 + key));
+                            state.handle_prepare(tx_id);
+                            state.handle_commit(tx_id, commit_ts);
                         }
-                        // Sentinel active tx establishes a non-trivial watermark.
-                        let sentinel_seq = 5 * n_keys + 1;
-                        state.handle_update(sentinel_seq, 10_000, 99_999, Value(0));
-                        state
-                    },
-                    |mut state| state.compact_versions(),
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+                    }
+                    // Sentinel active tx establishes a non-trivial watermark.
+                    let sentinel_seq = 5 * n_keys + 1;
+                    state.handle_update(sentinel_seq, 10_000, 99_999, Value(0));
+                    state
+                },
+                |mut state| state.compact_versions(),
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }

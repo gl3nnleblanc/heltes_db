@@ -145,7 +145,11 @@ fn handle_commit_installs_all_buffered_writes() {
 
         for key in 0..n_writes as u64 {
             let versions = state.versions.get(&key).expect("key must have versions");
-            assert_eq!(versions.len(), 1, "n_writes={n_writes} key={key}: expected 1 version");
+            assert_eq!(
+                versions.len(),
+                1,
+                "n_writes={n_writes} key={key}: expected 1 version"
+            );
             assert_eq!(versions[0].timestamp, commit_ts);
             assert_eq!(versions[0].value, Value(key * 7));
         }
@@ -179,7 +183,10 @@ fn compact_versions_prunes_old_versions_leaving_latest() {
         // Confirm 5 versions per key before compaction.
         for key in 0..n_keys {
             let len = state.versions.get(&key).map_or(0, |v| v.len());
-            assert_eq!(len, 5, "before compact: key={key} expected 5 versions, got {len}");
+            assert_eq!(
+                len, 5,
+                "before compact: key={key} expected 5 versions, got {len}"
+            );
         }
 
         // Record the max (latest) timestamp per key — this is what should survive.
@@ -198,7 +205,10 @@ fn compact_versions_prunes_old_versions_leaving_latest() {
         let sentinel_seq = 5 * n_keys + 1;
         state.handle_update(sentinel_seq, 10_000, 99_999, Value(0));
 
-        assert!(!state.dirty_keys.is_empty(), "dirty_keys must be non-empty before compaction");
+        assert!(
+            !state.dirty_keys.is_empty(),
+            "dirty_keys must be non-empty before compaction"
+        );
 
         state.compact_versions();
 
@@ -212,8 +222,7 @@ fn compact_versions_prunes_old_versions_leaving_latest() {
                 versions.len()
             );
             assert_eq!(
-                versions[0].timestamp,
-                max_ts[key as usize],
+                versions[0].timestamp, max_ts[key as usize],
                 "surviving version should be the latest"
             );
         }
@@ -229,5 +238,8 @@ fn compact_versions_no_op_without_active_transactions() {
     let count_before = state.versions.get(&0).map_or(0, |v| v.len());
     state.compact_versions();
     let count_after = state.versions.get(&0).map_or(0, |v| v.len());
-    assert_eq!(count_before, count_after, "no-op: version count should not change");
+    assert_eq!(
+        count_before, count_after,
+        "no-op: version count should not change"
+    );
 }
