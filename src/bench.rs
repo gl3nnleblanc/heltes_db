@@ -353,6 +353,7 @@ async fn run_worker(
     stats
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_transaction(
     client: &mut CoordinatorServiceClient<Channel>,
     rng: &mut Xorshift64,
