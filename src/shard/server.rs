@@ -130,7 +130,11 @@ impl ShardService for ShardServer {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitReply>, Status> {
         let req = request.into_inner();
-        let result = self.state.lock().unwrap().handle_commit(req.tx_id, req.commit_ts);
+        let result = self
+            .state
+            .lock()
+            .unwrap()
+            .handle_commit(req.tx_id, req.commit_ts);
 
         use crate::proto::commit_reply::Result as R;
         let proto_result = match result {

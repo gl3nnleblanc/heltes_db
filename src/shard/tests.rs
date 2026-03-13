@@ -2600,7 +2600,12 @@ fn handle_commit_on_prepared_tx_returns_ok_and_installs_versions() {
     let result = s.handle_commit(T1, 2);
     assert_eq!(result, CommitResult::Ok);
     // Version must be installed.
-    assert!(s.versions.get(&K1).unwrap().iter().any(|v| v.timestamp == 2));
+    assert!(s
+        .versions
+        .get(&K1)
+        .unwrap()
+        .iter()
+        .any(|v| v.timestamp == 2));
 }
 
 // Trace 2 (TTL expiry then COMMIT): prepare → expire_prepared fires →
