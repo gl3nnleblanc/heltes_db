@@ -7,8 +7,8 @@ use tonic::{Request, Response, Status};
 use crate::proto::shard_service_server::ShardService;
 use crate::proto::{
     Abort, AbortReply, AbortRequest, Active, CommitReply, CommitRequest, FastCommitReply,
-    FastCommitRequest, InquiryResult, NeedsInquirySet, PrepareReply, PrepareRequest, ReadReply,
-    ReadRequest, UpdateReply, UpdateRequest,
+    FastCommitRequest, GetClockReply, GetClockRequest, InquiryResult, NeedsInquirySet,
+    PrepareReply, PrepareRequest, ReadReply, ReadRequest, UpdateReply, UpdateRequest,
 };
 use crate::shard::{CommitResult, InquiryStatus, ShardState};
 
@@ -150,6 +150,16 @@ impl ShardService for ShardServer {
         let req = request.into_inner();
         self.state.lock().unwrap().handle_abort(req.tx_id);
         Ok(Response::new(AbortReply {}))
+    }
+
+    /// CoordSyncClock (shard side): return the current shard logical clock so
+    /// a newly-started coordinator can advance its c_clock before serving requests.
+    async fn get_clock(
+        &self,
+        _request: Request<GetClockRequest>,
+    ) -> Result<Response<GetClockReply>, Status> {
+        let clock = self.state.lock().unwrap().clock;
+        Ok(Response::new(GetClockReply { clock }))
     }
 
     async fn fast_commit(

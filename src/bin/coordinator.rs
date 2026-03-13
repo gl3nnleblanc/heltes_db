@@ -62,6 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(30),
     )?;
 
+    // Sync coordinator clock from all shards before serving requests.
+    // This prevents CommittedConflict aborts when joining a cluster that already
+    // has committed transactions (CoordSyncClock in TLA+).
+    server.sync_clock_from_shards().await;
+
     Server::builder()
         .add_service(CoordinatorServiceServer::new(server))
         .serve(bind)

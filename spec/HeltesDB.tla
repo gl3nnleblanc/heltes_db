@@ -613,6 +613,25 @@ ShardPruneAborted(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, msgs>>
 
+\* Coordinator reads s_clock[s] from a shard and advances its own clock.
+\*
+\* This models the clock-sync step the implementation executes at coordinator
+\* startup (via the GetClock shard RPC) before serving any client requests.
+\* Without this sync, a fresh coordinator starts with c_clock=0 and assigns
+\* start_ts values near 0; shards that have already committed versions at
+\* higher timestamps then reject every write with CommittedConflict.
+\*
+\* The action is monotone: it can only increase c_clock, and it never touches
+\* any transaction state, so SI1–SI4 remain satisfied in all executions that
+\* include it.
+CoordSyncClock(coord, s) ==
+    /\ c_clock' = [c_clock EXCEPT ![coord] =
+                      IF s_clock[s] > c_clock[coord]
+                      THEN s_clock[s]
+                      ELSE c_clock[coord]]
+    /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+
 ------------------------------------------------------------------------
 (* Next-state relation *)
 
@@ -626,6 +645,8 @@ Next ==
            \/ CoordSendCommit(id)
            \/ CoordAbortOnReply(id)
            \/ CoordAbortReadDeadline(id)
+    \/ \E coord \in Coordinators, s \in Shards :
+           CoordSyncClock(coord, s)
     \/ \E id \in TxIds, k \in Keys :
            \/ CoordRead(id, k)
            \/ ShardHandlePrepare(ShardOf[k], id)

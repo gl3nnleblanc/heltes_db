@@ -1,15 +1,3 @@
-# ⚠️ WARNING: SYSTEM IS BROKEN — DO NOT TRUST BENCHMARK RESULTS ⚠️
-
-**Critical bug: multi-coordinator clock divergence causes 100% abort rate.**
-
-Each `CoordinatorState` starts with `c_clock = 0`. Shard clocks advance with every committed transaction. When a second coordinator joins a cluster that has already processed transactions, it assigns `start_ts` values near 0 while shards have committed versions at timestamps in the thousands. Every `handle_update` from the new coordinator triggers `CommittedConflict` — 100% abort rate confirmed in benchmarks (coordinator :50053 = 0 commits/s vs :50052 = 9,509 tx/s).
-
-**The system does not function correctly in multi-coordinator deployments.**
-
-A passing end-to-end integration test (`tests/integration_test.rs`) must exist and be green before any other work proceeds.
-
----
-
 # TODO
 
 ## Correctness

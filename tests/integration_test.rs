@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tonic::transport::{Channel, Server};
+use tonic::transport::{Channel, Endpoint, Server};
 
 use heltes_db::coordinator::{
     routing::ConsistentHashRouter,
@@ -14,8 +14,8 @@ use heltes_db::coordinator::{
     CoordinatorState,
 };
 use heltes_db::proto::{
-    coordinator_service_client::CoordinatorServiceClient, Abort, TxBeginRequest, TxCommitRequest,
-    TxReadRequest, TxUpdateRequest,
+    coordinator_service_client::CoordinatorServiceClient, shard_service_client::ShardServiceClient,
+    Abort, GetClockRequest, TxBeginRequest, TxCommitRequest, TxReadRequest, TxUpdateRequest,
 };
 use heltes_db::shard::{
     server::{ShardServer, ShardServiceServer},
@@ -42,6 +42,10 @@ async fn spawn_shard() -> SocketAddr {
 
 /// Bind to a random port, spin up a `CoordinatorServer` pointing at `shard_addrs`,
 /// wait briefly for it to start, and return a connected client.
+///
+/// The coordinator's clock is synced from the shards before it begins serving,
+/// so this function is safe to call even after other coordinators have already
+/// committed transactions on the same shards.
 async fn spawn_coordinator(shard_addrs: Vec<SocketAddr>) -> CoordinatorServiceClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -59,6 +63,7 @@ async fn spawn_coordinator(shard_addrs: Vec<SocketAddr>) -> CoordinatorServiceCl
         Duration::from_secs(5),
     )
     .unwrap();
+    server.sync_clock_from_shards().await;
     tokio::spawn(
         Server::builder()
             .add_service(CoordinatorServiceServer::new(server))
@@ -344,5 +349,117 @@ async fn snapshot_isolation_stale_reader() {
         Some(RR::Value(777)),
         "fresh reader should see committed write, got {:?}",
         r_b.result
+    );
+}
+
+/// Multi-coordinator clock divergence regression: a second coordinator joining a
+/// cluster where shards already have committed versions must not abort every write
+/// due to CommittedConflict from a stale start_ts.
+///
+/// Without clock sync: coordinator 2 starts with c_clock=0, assigns start_ts=1,
+/// shards have committed versions at ts≫1 → 100% abort rate.
+/// With clock sync (GetClock RPC): coordinator 2 advances c_clock to max(s_clock)
+/// before serving requests, so its start_ts values are strictly greater than all
+/// committed timestamps.
+#[tokio::test]
+async fn second_coordinator_clock_sync_prevents_abort() {
+    let shard = spawn_shard().await;
+
+    // Coordinator 1: commit 50 transactions to drive the shard clock well above 0.
+    let mut client1 = spawn_coordinator(vec![shard]).await;
+    for key in 0u64..50 {
+        let begin = client1.begin(TxBeginRequest {}).await.unwrap().into_inner();
+        let tx_id = begin.tx_id;
+        client1
+            .update(TxUpdateRequest {
+                tx_id,
+                key,
+                value: key * 10,
+            })
+            .await
+            .unwrap();
+        let commit = client1
+            .commit(TxCommitRequest { tx_id })
+            .await
+            .unwrap()
+            .into_inner();
+        use heltes_db::proto::tx_commit_reply::Result as CR;
+        assert!(
+            matches!(commit.result, Some(CR::CommitTs(_))),
+            "coordinator 1 commit failed at key {key}: {:?}",
+            commit.result
+        );
+    }
+
+    // Verify the shard clock is now meaningfully above 0.
+    let shard_clock = {
+        let channel = Endpoint::from_shared(format!("http://{shard}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut sc = ShardServiceClient::new(channel);
+        sc.get_clock(GetClockRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .clock
+    };
+    assert!(
+        shard_clock > 10,
+        "shard clock should be well above 0 after 50 commits, got {shard_clock}"
+    );
+
+    // Coordinator 2: same shards, fresh state.  spawn_coordinator calls
+    // sync_clock_from_shards() before serving — this is the fix under test.
+    let mut client2 = spawn_coordinator(vec![shard]).await;
+
+    // Coordinator 2 must be able to commit a transaction without CommittedConflict.
+    let begin = client2.begin(TxBeginRequest {}).await.unwrap().into_inner();
+    let tx_id = begin.tx_id;
+
+    let update = client2
+        .update(TxUpdateRequest {
+            tx_id,
+            key: 9999,
+            value: 42,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    use heltes_db::proto::tx_update_reply::Result as UR;
+    assert_eq!(
+        update.result,
+        Some(UR::Ok(true)),
+        "coordinator 2 update must not abort due to clock divergence"
+    );
+
+    let commit = client2
+        .commit(TxCommitRequest { tx_id })
+        .await
+        .unwrap()
+        .into_inner();
+    use heltes_db::proto::tx_commit_reply::Result as CR;
+    assert!(
+        matches!(commit.result, Some(CR::CommitTs(_))),
+        "coordinator 2 commit must succeed after clock sync, got {:?}",
+        commit.result
+    );
+
+    // Coordinator 2's committed value must be readable by a subsequent transaction.
+    let read_begin = client2.begin(TxBeginRequest {}).await.unwrap().into_inner();
+    let read = client2
+        .read(TxReadRequest {
+            tx_id: read_begin.tx_id,
+            key: 9999,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    use heltes_db::proto::tx_read_reply::Result as RR;
+    assert_eq!(
+        read.result,
+        Some(RR::Value(42)),
+        "coordinator 2 committed value must be readable"
     );
 }

@@ -16,10 +16,10 @@ use crate::proto::coordinator_service_server::CoordinatorService;
 use crate::proto::shard_service_client::ShardServiceClient;
 use crate::proto::{
     Abort, AbortRequest as ShardAbortRequest, Active, CommitRequest as ShardCommitRequest,
-    FastCommitRequest as ShardFastCommitRequest, InquireReply, InquireRequest, InquiryResult,
-    NeedsInquirySet, PrepareRequest, ReadRequest, TxAbortReply, TxAbortRequest, TxBeginReply,
-    TxBeginRequest, TxCommitReply, TxCommitRequest, TxReadReply, TxReadRequest, TxUpdateReply,
-    TxUpdateRequest, UpdateRequest,
+    FastCommitRequest as ShardFastCommitRequest, GetClockRequest, InquireReply, InquireRequest,
+    InquiryResult, NeedsInquirySet, PrepareRequest, ReadRequest, TxAbortReply, TxAbortRequest,
+    TxBeginReply, TxBeginRequest, TxCommitReply, TxCommitRequest, TxReadReply, TxReadRequest,
+    TxUpdateReply, TxUpdateRequest, UpdateRequest,
 };
 use crate::shard::InquiryStatus;
 
@@ -136,6 +136,29 @@ impl CoordinatorServer {
             Some(S::CommittedAt(ts)) => Ok(InquiryStatus::Committed(ts)),
             Some(S::Active(_)) => Ok(InquiryStatus::Active),
             None => Err(Status::internal("empty inquire reply")),
+        }
+    }
+
+    /// CoordSyncClock: query every registered shard for its current clock and advance
+    /// the coordinator's own clock to `max(all s_clock values)`.
+    ///
+    /// Call this once at coordinator startup — before serving any client requests —
+    /// to prevent CommittedConflict aborts when joining a cluster that has already
+    /// processed transactions.  Without this, a fresh coordinator starts with
+    /// `c_clock = 0`, assigns `start_ts ≈ 1`, and shards whose committed versions
+    /// are at timestamps >> 1 reject every write with CommittedConflict.
+    ///
+    /// Matches the `CoordSyncClock` action added to the TLA+ spec.
+    pub async fn sync_clock_from_shards(&self) {
+        for client in self.shard_clients.values() {
+            let mut c = client.clone();
+            if let Ok(reply) = c.get_clock(GetClockRequest {}).await {
+                let shard_clock = reply.into_inner().clock;
+                let mut state = self.state.lock().unwrap();
+                if shard_clock > state.clock {
+                    state.clock = shard_clock;
+                }
+            }
         }
     }
 

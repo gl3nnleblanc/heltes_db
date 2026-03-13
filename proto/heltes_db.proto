@@ -14,6 +14,10 @@ service ShardService {
   rpc Abort       (AbortRequest)       returns (AbortReply);
   // Single-shard fast path: atomically prepare + commit in one round trip.
   rpc FastCommit  (FastCommitRequest)  returns (FastCommitReply);
+  // Returns the shard's current logical clock.  Used by coordinators at startup
+  // to sync c_clock to max(s_clock) across all shards before serving requests,
+  // preventing CommittedConflict aborts from clock divergence (CoordSyncClock in TLA+).
+  rpc GetClock    (GetClockRequest)    returns (GetClockReply);
 }
 
 // ── Coordinator service ───────────────────────────────────────────────────────
@@ -144,6 +148,14 @@ message AbortRequest {
 }
 
 message AbortReply {}
+
+// ── GetClock ──────────────────────────────────────────────────────────────────
+
+message GetClockRequest {}
+
+message GetClockReply {
+  uint64 clock = 1;
+}
 
 // ── Coordinator client-facing messages ───────────────────────────────────────
 //
