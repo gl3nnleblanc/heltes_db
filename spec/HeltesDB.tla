@@ -79,6 +79,26 @@ Timestamps == 0..MaxTimestamp
  * Profile "read-heavy":
  *   ClientBegin → ShardRead (loop) → CoordHandleInquiry (if needed) → Abort.
  *   Exercises the NeedsInquiry / resolve_inquiry path under high concurrency.
+ *
+ * Criterion micro-benchmark hot paths (benches/shard_hot_paths.rs):
+ *
+ *   handle_read / ShardRead — binary-search cost over N MVCC versions.
+ *     Trace: commit N versions for key k; read with start_ts > all of them.
+ *     Measures O(log N) partition_point over versions[k].
+ *
+ *   handle_update / ShardUpdate — O(P) PreparedConflict scan.
+ *     Trace: prepare P transactions on distinct keys; update key 0 (no conflict).
+ *     Measures the full prepared.iter().any(…) loop that the inverted-index
+ *     Performance TODO would replace with an O(1) lookup.
+ *
+ *   handle_commit / ShardCommit — install W writes + update write_keys index.
+ *     Trace: buffer W writes; prepare; commit at ts T.
+ *     Measures binary-search insertion into versions[key] × W.
+ *
+ *   compact_versions / ShardCompactVersions — watermark-gated MVCC pruning.
+ *     Trace: commit N keys × 5 versions; hold sentinel tx at high start_ts;
+ *     compact_versions prunes versions 1–4 for every dirty key.
+ *     Measures drain(..cutoff-1) across |dirty_keys|.
  *)
 ------------------------------------------------------------------------
 (* State variables *)

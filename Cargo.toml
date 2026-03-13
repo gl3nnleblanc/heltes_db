@@ -29,5 +29,12 @@ prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
 tonic = "0.12"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "shard_hot_paths"
+harness = false
+
 [build-dependencies]
 tonic-build = "0.12"

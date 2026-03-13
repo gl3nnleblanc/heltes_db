@@ -11,7 +11,6 @@
 
 ## Benchmarking & Validation ← CURRENT SPRINT — work only from this section until fully drained
 
-- **Criterion.rs micro-benchmarks for shard hot paths** — hot-path operations (`handle_read`, `handle_update`, `handle_commit`, `compact_versions`) have no isolated timing; add criterion.rs benchmarks so algorithmic changes can be validated independently of network noise _(3 pts)_
 - **CI throughput regression gate** — run a fixed workload in CI on every PR and fail if throughput drops >10% or p99 latency increases >20% relative to the committed baseline; this prevents accidentally shipping regressions under the banner of "improvements" _(5 pts)_
 
 ## Performance
