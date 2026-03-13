@@ -692,6 +692,48 @@ ShardPruneAborted(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, msgs>>
 
+\* Shard prunes ALL aborted entries from coordinator coord when coord has no
+\* in-flight transactions (write_buff or prepared) on this shard.
+\*
+\* This models the shard background task that periodically evicts aborted entries
+\* from dead or permanently-quiescent coordinator ports. Without this action,
+\* aborted entries from a coordinator that crashes and never restarts accumulate
+\* indefinitely: ShardPruneAborted only fires when new RPCs arrive from the same
+\* coordinator, but a dead coordinator never sends new RPCs.
+\*
+\* Safety: if coord has no write_buff or prepared entries on s, it has no
+\* in-flight writes that could race with a COMMIT.  Any future transaction from
+\* coord will use a new tx_id (implementation: randomly seeded seq), so old
+\* aborted entries are irrelevant.
+\*
+\* Implementation note: the background compaction task (compact_interval = 100 ms)
+\* calls prune_aborted() on each tick in addition to compact_versions(). The Rust
+\* prune_aborted() uses a per-port seq-watermark: if a coordinator port has no
+\* in-flight tx (no write_buff or prepared entry), all its aborted entries are
+\* pruned (the None => false arm). Running it from the background task means dead
+\* coordinator entries are collected within one compaction interval even if no new
+\* RPC from that port ever arrives.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   T1: coord dead (no in-flight txs) → all its aborted entries pruned in one pass
+\*   T2: mixed: dead coord entries pruned; active coord entries retained by seq watermark
+\*   T3: coord transiently idle (no active txs) → entries pruned (safe: new txs have fresh ids)
+\*   T4: coord still has prepared entry → entries NOT pruned
+ShardPruneOrphanedPort(s, coord) ==
+    LET coordTxIds == {id \in TxIds : CoordOf[id] = coord}
+        noInFlight ==
+            \A id \in coordTxIds :
+                /\ write_buff[id] = {}
+                /\ \A pair \in s_prepared[s] : pair[1] # id
+        hasOrphans == \E id \in coordTxIds : id \in s_aborted[s]
+    IN
+    /\ noInFlight
+    /\ hasOrphans
+    /\ s_aborted' = [s_aborted EXCEPT ![s] =
+           {id \in @ : CoordOf[id] # coord}]
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, msgs>>
+
 \* Coordinator reads s_clock[s] from a shard and advances its own clock.
 \*
 \* This models the clock-sync step the implementation executes at coordinator
@@ -725,7 +767,8 @@ Next ==
            \/ CoordAbortOnReply(id)
            \/ CoordAbortReadDeadline(id)
     \/ \E coord \in Coordinators, s \in Shards :
-           CoordSyncClock(coord, s)
+           \/ CoordSyncClock(coord, s)
+           \/ ShardPruneOrphanedPort(s, coord)
     \/ \E id \in TxIds, k \in Keys :
            \/ CoordRead(id, k)
            \/ ShardHandlePrepare(ShardOf[k], id)

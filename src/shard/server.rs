@@ -41,7 +41,16 @@ impl ShardServer {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                bg_state.lock().unwrap().compact_versions();
+                let mut state = bg_state.lock().unwrap();
+                state.compact_versions();
+                // Prune aborted entries from dead coordinator ports.
+                // prune_aborted() already runs on every commit/abort RPC, but if a
+                // coordinator crashes and never restarts, no new RPCs arrive from that
+                // port and its aborted entries accumulate indefinitely.
+                // Running it here ensures eviction within one compact_interval even
+                // when a coordinator port goes permanently quiescent.
+                // (ShardPruneOrphanedPort in TLA+)
+                state.prune_aborted();
             }
         });
         Self { state }
@@ -209,3 +218,88 @@ impl ShardService for ShardServer {
 const _: () = {
     let _ = Active {};
 };
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::{Key, Value};
+
+    // Port-encoded TxIds matching the convention in shard/tests.rs.
+    const P1_S1: u64 = (1u64 << 32) | 1;
+    const P1_S2: u64 = (1u64 << 32) | 2;
+    const P2_S1: u64 = (2u64 << 32) | 1;
+
+    /// Trace T1: ShardPruneOrphanedPort — background compact task calls
+    /// prune_aborted() so dead coordinator entries are evicted even when
+    /// no new RPC from that coordinator ever arrives.
+    ///
+    /// Without the fix, compact_versions_only fires and aborted entries
+    /// from dead ports accumulate indefinitely. With the fix, the background
+    /// tick also calls prune_aborted(), clearing quiescent-port entries within
+    /// one compact_interval.
+    #[tokio::test]
+    async fn background_task_prunes_orphaned_aborted_entries() {
+        let mut state = ShardState::new();
+
+        // Simulate two transactions from port P1 that were aborted.
+        // No write_buff or prepared entries remain from P1 (coordinator is dead).
+        state.aborted.insert(P1_S1);
+        state.aborted.insert(P1_S2);
+
+        // Use a very short compact interval so the background task fires quickly.
+        let server = ShardServer::with_compact_interval(state, Duration::from_millis(5));
+
+        // Wait for at least two ticks to be confident the background task ran.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let state = server.state.lock().unwrap();
+        assert!(
+            !state.aborted.contains(&P1_S1),
+            "P1_S1 must be pruned by background task: dead coordinator"
+        );
+        assert!(
+            !state.aborted.contains(&P1_S2),
+            "P1_S2 must be pruned by background task: dead coordinator"
+        );
+    }
+
+    /// Trace T2: background task does not prune entries from ports that still
+    /// have in-flight transactions (active write_buff entry protects them).
+    #[tokio::test]
+    async fn background_task_preserves_entries_protected_by_active_tx() {
+        let mut state = ShardState::new();
+
+        // P1_S1 aborted; P1_S2 still active in write_buff → min_active[P1]=2.
+        // P1_S1 seq=1 < 2 → will be pruned (normal watermark behavior).
+        // P2_S1 aborted; P2 has no active txs → will be pruned (dead port).
+        state.aborted.insert(P1_S1);
+        state.aborted.insert(P2_S1);
+        state
+            .write_buff
+            .entry(P1_S2)
+            .or_default()
+            .insert(1u64 as Key, Value(99));
+
+        let server = ShardServer::with_compact_interval(state, Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let state = server.state.lock().unwrap();
+        // P1_S1: seq=1 < min_active[P1]=2 → pruned by watermark.
+        assert!(
+            !state.aborted.contains(&P1_S1),
+            "P1_S1 seq<watermark must be pruned"
+        );
+        // P2_S1: no active P2 txs → pruned by dead-port eviction.
+        assert!(
+            !state.aborted.contains(&P2_S1),
+            "P2_S1 from dead port must be pruned"
+        );
+        // P1_S2 is still active (in write_buff), not in aborted — not affected.
+        assert!(
+            !state.aborted.contains(&P1_S2),
+            "P1_S2 was never aborted"
+        );
+    }
+}

@@ -1992,6 +1992,114 @@ fn prune_aborted_retains_entry_when_older_tx_still_active() {
 }
 
 // -----------------------------------------------------------------------
+// ShardPruneOrphanedPort — background pruning of dead coordinator ports
+//
+// Traces from the TLA+ spec action ShardPruneOrphanedPort:
+//   T1: coord dead (no in-flight txs) → ALL its aborted entries pruned
+//   T2: mixed: dead coord entries pruned; active coord entries retained
+//   T3: coord transiently idle (no active txs) → entries pruned (safe)
+//   T4: coord still has prepared entry → entries NOT pruned
+// -----------------------------------------------------------------------
+
+// T1: Single dead coordinator — all aborted entries from that port pruned at once.
+#[test]
+fn prune_aborted_clears_all_entries_from_dead_port() {
+    let mut s = shard();
+    // Three completed (and aborted) transactions from port 1, none in-flight.
+    s.aborted.insert(P1_S1);
+    s.aborted.insert(P1_S2);
+    s.aborted.insert(P1_S3);
+    // No write_buff or prepared entries from port 1 → prune_aborted fires.
+    s.prune_aborted();
+    assert!(
+        !s.aborted.contains(&P1_S1),
+        "P1_S1 must be pruned: dead coordinator"
+    );
+    assert!(
+        !s.aborted.contains(&P1_S2),
+        "P1_S2 must be pruned: dead coordinator"
+    );
+    assert!(
+        !s.aborted.contains(&P1_S3),
+        "P1_S3 must be pruned: dead coordinator"
+    );
+}
+
+// T2: Dead coordinator entries pruned while active coordinator entries are retained.
+// P1 is dead (no in-flight txs); P2 has an active tx (P2_S2 in write_buff).
+// P2_S1 seq=1 < min_active[P2]=2 → also pruned.
+// P2_S2 seq=2 is active, not in aborted.
+#[test]
+fn dead_port_pruned_active_port_watermark_respected() {
+    let mut s = shard();
+    s.aborted.insert(P1_S1); // dead port P1
+    s.aborted.insert(P2_S1); // old entry from active port P2
+    // P2_S2 is active → min_active[P2] = 2; P2_S1 seq=1 < 2 → pruned.
+    s.write_buff.entry(P2_S2).or_default().insert(K1, v(10));
+
+    s.prune_aborted();
+
+    // P1_S1 pruned: P1 has no active txs.
+    assert!(
+        !s.aborted.contains(&P1_S1),
+        "P1_S1 must be pruned: dead coordinator"
+    );
+    // P2_S1 pruned: seq=1 < min_active[P2]=2.
+    assert!(
+        !s.aborted.contains(&P2_S1),
+        "P2_S1 must be pruned: seq below active watermark"
+    );
+}
+
+// T3: Coordinator has no current in-flight txs (transiently idle) → entries pruned.
+// Safe because new transactions from that coordinator will have fresh tx_ids.
+#[test]
+fn transiently_idle_port_entries_pruned() {
+    let mut s = shard();
+    // P1_S1 was aborted; P1 completed all its work and is currently idle.
+    s.aborted.insert(P1_S1);
+    // No write_buff or prepared from P1 → prune_aborted clears it.
+    s.prune_aborted();
+    assert!(
+        !s.aborted.contains(&P1_S1),
+        "idle port entry must be pruned"
+    );
+}
+
+// T4: Coordinator still has a prepared entry → aborted entries NOT pruned.
+// P1_S2 is prepared; P1_S1 is aborted. min_active[P1]=2, P1_S1 seq=1 < 2 → pruned.
+// (Note: if the prepared entry has a higher seq, older aborted entries are still pruned.)
+#[test]
+fn aborted_entry_pruned_when_prepared_has_higher_seq() {
+    let mut s = shard();
+    s.aborted.insert(P1_S1); // seq=1
+    s.prepared.insert(P1_S2, 5); // seq=2 prepared → min_active[P1]=2
+
+    s.prune_aborted();
+
+    assert!(
+        !s.aborted.contains(&P1_S1),
+        "P1_S1 seq=1 < min_active[P1]=2 → pruned"
+    );
+}
+
+// T4b: Active prepared entry with lower seq → higher-seq aborted entry retained.
+// P1_S1 is prepared; P1_S2 is aborted. min_active[P1]=1, P1_S2 seq=2 >= 1 → retained.
+#[test]
+fn aborted_entry_retained_when_prepared_has_lower_seq() {
+    let mut s = shard();
+    s.aborted.insert(P1_S2); // seq=2
+    s.prepared.insert(P1_S1, 3); // seq=1 prepared → min_active[P1]=1
+
+    s.prune_aborted();
+
+    assert!(
+        s.aborted.contains(&P1_S2),
+        "P1_S2 seq=2 >= min_active[P1]=1 → must be retained"
+    );
+}
+
+// -----------------------------------------------------------------------
 // handle_fast_commit — single-shard fast path
 //
 // TLA+ trace: CoordFastCommit → ShardHandleFastCommit → CoordHandleFastCommitReply

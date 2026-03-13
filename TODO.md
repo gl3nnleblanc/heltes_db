@@ -6,7 +6,6 @@
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
 - **Circular inquiry deadlock between coordinators** — the `resolve_inquiry` path forwards NeedsInquiry results across coordinators; if coordinator A awaits B's transaction status while B concurrently awaits A's, both block forever; add a hop counter or visited-set to detect cycles and abort one side _(5 pts)_
 - **COMMIT delivery is not retried on shard RPC timeout** — when a shard's COMMIT RPC times out, the coordinator marks the transaction committed locally but that shard never installs the write; other shards may have committed, leaving the dataset permanently inconsistent; add best-effort in-memory COMMIT retry with bounded exponential backoff so a transient timeout does not silently drop a committed write _(8 pts)_
-- **Orphaned aborted-entry accumulation from dead coordinator ports** — `prune_aborted()` only fires when a new transaction arrives from the same coordinator port; if a coordinator crashes and never restarts, its aborted tx_ids accumulate on shards indefinitely; add a shard-side background task that TTL-evicts per-port aborted entries after a configurable quiescence period _(5 pts)_
 
 ## Benchmarking & Validation ← do these before any Performance work
 
