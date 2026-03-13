@@ -5,7 +5,7 @@ use tonic::transport::Server;
 
 use heltes_db::coordinator::{
     server::{CoordinatorServer, CoordinatorServiceServer},
-    CoordinatorState,
+    CoordinatorState, ReadRetryPolicy,
 };
 
 /// Usage: coordinator [BIND_ADDR] [SHARD_ADDR...] [-- PEER_COORD_ADDR...]
@@ -128,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_coordinator_addrs,
         shard_rpc_timeout,
         read_loop_timeout,
+        ReadRetryPolicy::default_policy(),
     )?;
 
     // Sync coordinator clock from all shards before serving requests.

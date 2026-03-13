@@ -246,6 +246,23 @@ CoordUpdate(id, k, v) ==
 \* because aborting a transaction is always safe w.r.t. SI1–SI4, and TLC
 \* will explore both the deadline-fires and deadline-does-not-fire paths,
 \* verifying safety in all branches.
+\*
+\* Implementation note — exponential backoff with jitter between retries:
+\*   After each NeedsInquiry reply the implementation sleeps for
+\*     base = min(initial_delay * 2^retry, max_delay)
+\*     jitter = deterministic pseudo-random in [0, jitter_max]
+\*   before sending the next READ_KEY to the shard.  This is purely a
+\*   timing concern and does not affect any TLA+ state variables; the
+\*   spec is unchanged.  The backoff is configured by ReadRetryPolicy
+\*   (initial_delay=5 ms, max_delay=100 ms, jitter_max=10 ms by default).
+\*
+\* Concrete execution traces modelled here (drive Phase-2 tests):
+\*   T1: READ_KEY → Value                             (no NeedsInquiry, no sleep)
+\*   T2: READ_KEY → NeedsInquiry → sleep(initial) → READ_KEY → Value
+\*   T3: READ_KEY → NeedsInquiry → sleep(initial) → READ_KEY →
+\*         NeedsInquiry → sleep(2*initial) → ... → CoordAbortReadDeadline
+\*   T4: delay doubles each retry but is capped at max_delay once 2^k * initial >= max
+\*   T5: initial_delay = 0  →  no sleep at all  (ReadRetryPolicy::no_backoff)
 CoordAbortReadDeadline(id) ==
     /\ tx_state[id] = "ACTIVE"
     /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]

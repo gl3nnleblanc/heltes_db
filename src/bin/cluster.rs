@@ -25,7 +25,7 @@ use tonic::transport::Server;
 
 use heltes_db::coordinator::{
     server::{CoordinatorServer, CoordinatorServiceServer},
-    CoordinatorState,
+    CoordinatorState, ReadRetryPolicy,
 };
 use heltes_db::shard::{
     server::{ShardServer, ShardServiceServer},
@@ -179,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             peers.clone(),
             shard_rpc_timeout,
             read_loop_timeout,
+            ReadRetryPolicy::default_policy(),
         )?;
 
         // Sync clock before serving to avoid CommittedConflict on a live cluster.

@@ -9,7 +9,8 @@ use tonic::{Request, Response, Status};
 
 use crate::coordinator::{
     coord_port_from_tx_id, routing::ConsistentHashRouter, BeginCommitResult, BeginFastCommitResult,
-    CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, SendCommitResult, TxIdGen,
+    CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, ReadRetryPolicy,
+    SendCommitResult, TxIdGen,
 };
 use crate::proto::coordinator_service_client::CoordinatorServiceClient;
 use crate::proto::coordinator_service_server::CoordinatorService;
@@ -46,6 +47,11 @@ pub struct CoordinatorServer {
     /// delayed indefinitely (e.g. coordinator crashed mid-2PC after the write
     /// committed). Matches CoordAbortReadDeadline in TLA+.
     read_loop_timeout: Duration,
+    /// Exponential-backoff policy applied between NeedsInquiry retries.
+    /// Prevents a thundering herd of Inquire RPCs when many readers are blocked
+    /// on the same prepared writer. Matches the implementation note on
+    /// CoordAbortReadDeadline in the TLA+ spec.
+    read_retry_policy: ReadRetryPolicy,
 }
 
 impl CoordinatorServer {
@@ -63,6 +69,7 @@ impl CoordinatorServer {
         peer_coordinator_addrs: Vec<SocketAddr>,
         shard_rpc_timeout: Duration,
         read_loop_timeout: Duration,
+        read_retry_policy: ReadRetryPolicy,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let router = ConsistentHashRouter::new(shard_addrs.iter().copied());
         let mut shard_clients = HashMap::new();
@@ -83,6 +90,7 @@ impl CoordinatorServer {
             coordinator_uris,
             shard_rpc_timeout,
             read_loop_timeout,
+            read_retry_policy,
         })
     }
 
@@ -227,8 +235,10 @@ impl CoordinatorService for CoordinatorServer {
         use crate::proto::read_reply::Result as R;
         use crate::proto::tx_read_reply::Result as TR;
 
-        let loop_result = tokio::time::timeout(self.read_loop_timeout, async {
+        let read_retry_policy = self.read_retry_policy.clone();
+        let loop_result = tokio::time::timeout(self.read_loop_timeout, async move {
             let mut inquiry_results: Vec<InquiryResult> = vec![];
+            let mut retry: u32 = 0;
             loop {
                 let reply = tokio::time::timeout(
                     self.shard_rpc_timeout,
@@ -279,6 +289,15 @@ impl CoordinatorService for CoordinatorServer {
                                 }),
                             }
                         }
+                        // Back off before retrying to avoid thundering-herd of
+                        // Inquire RPCs under high prepared-writer contention.
+                        // Matches the ReadRetryPolicy implementation note on
+                        // CoordAbortReadDeadline in the TLA+ spec.
+                        let sleep_dur = read_retry_policy.sleep_duration(retry);
+                        if !sleep_dur.is_zero() {
+                            tokio::time::sleep(sleep_dur).await;
+                        }
+                        retry = retry.saturating_add(1);
                     }
                     None => return Err(Status::internal("shard returned empty read result")),
                 }
@@ -611,6 +630,7 @@ mod tests {
             peers,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap()
     }
@@ -737,6 +757,7 @@ mod tests {
             vec![],
             timeout,
             Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap();
         assert_eq!(server.shard_rpc_timeout, timeout);
@@ -762,6 +783,7 @@ mod tests {
             vec![],
             Duration::from_millis(20),
             Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap();
 
@@ -802,6 +824,7 @@ mod tests {
             vec![],
             Duration::from_millis(20),
             Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap();
 
@@ -835,9 +858,31 @@ mod tests {
             vec![],
             Duration::from_secs(5),
             rlt,
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap();
         assert_eq!(server.read_loop_timeout, rlt);
+    }
+
+    // Trace T2: read_retry_policy is stored and accessible.
+    #[test]
+    fn read_retry_policy_is_stored() {
+        let policy = ReadRetryPolicy::new(
+            Duration::from_millis(7),
+            Duration::from_millis(50),
+            Duration::from_millis(3),
+        );
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],
+            vec![],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            policy.clone(),
+        )
+        .unwrap();
+        assert_eq!(server.read_retry_policy, policy);
     }
 
     // Trace 2: CoordAbortReadDeadline — read_loop_timeout fires before the shard
@@ -855,6 +900,7 @@ mod tests {
             vec![],
             Duration::from_millis(200), // shard_rpc_timeout (inner — fires later)
             Duration::from_millis(20),  // read_loop_timeout (outer — fires first)
+            ReadRetryPolicy::no_backoff(),
         )
         .unwrap();
 

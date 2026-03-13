@@ -1,6 +1,87 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::shard::{InquiryStatus, Timestamp, TxId};
+
+// ---------------------------------------------------------------------------
+// ReadRetryPolicy — backoff between NeedsInquiry retries
+// ---------------------------------------------------------------------------
+
+/// Controls exponential-backoff behaviour of the NeedsInquiry retry loop.
+///
+/// After each `NeedsInquiry` reply the read loop sleeps for
+///   `base = min(initial_delay * 2^retry, max_delay) + jitter`
+/// before sending the next `READ_KEY` to the shard.  Jitter is derived
+/// deterministically from the retry index (no external RNG needed).
+///
+/// Set `initial_delay = Duration::ZERO` to disable all backoff.
+///
+/// Matches the implementation note on `CoordAbortReadDeadline` in the TLA+ spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRetryPolicy {
+    /// Delay before the first retry.
+    pub initial_delay: Duration,
+    /// Upper bound on the base delay (before jitter is added).
+    pub max_delay: Duration,
+    /// Maximum jitter added to each sleep.
+    pub jitter_max: Duration,
+}
+
+impl ReadRetryPolicy {
+    pub fn new(initial_delay: Duration, max_delay: Duration, jitter_max: Duration) -> Self {
+        ReadRetryPolicy {
+            initial_delay,
+            max_delay,
+            jitter_max,
+        }
+    }
+
+    /// Default production policy: 5 ms initial, 100 ms cap, 10 ms jitter.
+    pub fn default_policy() -> Self {
+        Self::new(
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+    }
+
+    /// No backoff at all — retries are immediate.  Equivalent to the
+    /// previous behaviour before this feature was added; useful in tests.
+    pub fn no_backoff() -> Self {
+        Self::new(Duration::ZERO, Duration::ZERO, Duration::ZERO)
+    }
+
+    /// Compute the sleep duration before the `retry`-th retry (0-indexed).
+    ///
+    /// `base = min(initial_delay * 2^retry, max_delay)`
+    /// `jitter` is a deterministic pseudo-random value in `[0, jitter_max)`
+    /// derived from the retry index via Knuth's multiplicative hash.
+    pub fn sleep_duration(&self, retry: u32) -> Duration {
+        if self.initial_delay.is_zero() {
+            return Duration::ZERO;
+        }
+        // Saturating multiply: 2^retry * initial_delay, capped at max_delay.
+        let shift = retry.min(30); // guard against overflow in 1u32 << shift
+        let base = self
+            .initial_delay
+            .saturating_mul(1u32 << shift)
+            .min(self.max_delay);
+
+        let jitter = if self.jitter_max.is_zero() {
+            Duration::ZERO
+        } else {
+            // Knuth multiplicative hash for spread-out deterministic jitter.
+            let h = (retry as u64)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(1_013_904_223);
+            // jitter_max is expected to be small (ms range), fits in u64 nanos.
+            let max_ns = self.jitter_max.as_nanos() as u64;
+            Duration::from_nanos(h % max_ns)
+        };
+
+        base + jitter
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Types

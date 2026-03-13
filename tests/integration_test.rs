@@ -11,7 +11,7 @@ use tonic::transport::{Channel, Endpoint, Server};
 use heltes_db::coordinator::{
     routing::ConsistentHashRouter,
     server::{CoordinatorServer, CoordinatorServiceServer},
-    CoordinatorState,
+    CoordinatorState, ReadRetryPolicy,
 };
 use heltes_db::proto::{
     coordinator_service_client::CoordinatorServiceClient, shard_service_client::ShardServiceClient,
@@ -61,6 +61,7 @@ async fn spawn_coordinator(shard_addrs: Vec<SocketAddr>) -> CoordinatorServiceCl
         vec![],
         Duration::from_secs(5),
         Duration::from_secs(5),
+        ReadRetryPolicy::no_backoff(),
     )
     .unwrap();
     server.sync_clock_from_shards().await;

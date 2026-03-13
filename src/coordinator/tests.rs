@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::shard::InquiryStatus;
 
 use super::{
     coord_port_from_tx_id, coord_seq_from_tx_id, BeginCommitResult, BeginFastCommitResult,
-    CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, SendCommitResult, TxIdGen,
-    TxPhase,
+    CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, ReadRetryPolicy,
+    SendCommitResult, TxIdGen, TxPhase,
 };
 
 // ---------------------------------------------------------------------------
@@ -786,4 +787,132 @@ fn si2_fast_commit_txs_have_distinct_timestamps() {
     // the actual shard-assigned timestamp. Here we simulate shard returning 6.
     c.finalize_fast_commit(2, 6);
     assert_ne!(5u64, 6u64, "SI2: timestamps must be distinct");
+}
+
+// ---------------------------------------------------------------------------
+// ReadRetryPolicy — TLA+ traces T1–T5 (spec CoordAbortReadDeadline note)
+// ---------------------------------------------------------------------------
+
+// Trace T5: initial_delay = 0 → no backoff regardless of retry index.
+#[test]
+fn retry_policy_no_backoff_always_returns_zero() {
+    let p = ReadRetryPolicy::no_backoff();
+    assert_eq!(p.sleep_duration(0), Duration::ZERO);
+    assert_eq!(p.sleep_duration(1), Duration::ZERO);
+    assert_eq!(p.sleep_duration(10), Duration::ZERO);
+}
+
+// Trace T2: first retry (retry=0) returns initial_delay when jitter_max=0.
+#[test]
+fn retry_policy_first_retry_equals_initial_delay_without_jitter() {
+    let p = ReadRetryPolicy::new(
+        Duration::from_millis(5),
+        Duration::from_millis(100),
+        Duration::ZERO,
+    );
+    assert_eq!(p.sleep_duration(0), Duration::from_millis(5));
+}
+
+// Trace T3: delay doubles on each retry.
+#[test]
+fn retry_policy_delay_doubles_each_retry_without_jitter() {
+    let p = ReadRetryPolicy::new(
+        Duration::from_millis(5),
+        Duration::from_millis(1000), // high cap — not reached in first few retries
+        Duration::ZERO,
+    );
+    assert_eq!(p.sleep_duration(0), Duration::from_millis(5));
+    assert_eq!(p.sleep_duration(1), Duration::from_millis(10));
+    assert_eq!(p.sleep_duration(2), Duration::from_millis(20));
+    assert_eq!(p.sleep_duration(3), Duration::from_millis(40));
+}
+
+// Trace T4: delay is capped at max_delay once 2^k * initial >= max.
+#[test]
+fn retry_policy_delay_capped_at_max_delay() {
+    let p = ReadRetryPolicy::new(
+        Duration::from_millis(5),
+        Duration::from_millis(100),
+        Duration::ZERO,
+    );
+    // 5 * 2^0=5, 2^1=10, 2^2=20, 2^3=40, 2^4=80, 2^5=160 → capped at 100.
+    assert_eq!(p.sleep_duration(4), Duration::from_millis(80));
+    assert_eq!(p.sleep_duration(5), Duration::from_millis(100));
+    assert_eq!(p.sleep_duration(6), Duration::from_millis(100));
+    assert_eq!(p.sleep_duration(100), Duration::from_millis(100));
+}
+
+// Trace T4 (variant): once capped, every subsequent retry returns max_delay (no jitter).
+#[test]
+fn retry_policy_stays_at_max_once_capped() {
+    let p = ReadRetryPolicy::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::ZERO,
+    );
+    // initial == max → always returns max regardless of retry.
+    assert_eq!(p.sleep_duration(0), Duration::from_millis(10));
+    assert_eq!(p.sleep_duration(1), Duration::from_millis(10));
+    assert_eq!(p.sleep_duration(50), Duration::from_millis(10));
+}
+
+// Trace T2/T3: jitter is within [0, jitter_max) and total sleep <= max_delay + jitter_max.
+#[test]
+fn retry_policy_jitter_within_bounds() {
+    let initial = Duration::from_millis(5);
+    let max = Duration::from_millis(100);
+    let jitter_max = Duration::from_millis(10);
+    let p = ReadRetryPolicy::new(initial, max, jitter_max);
+    for retry in 0u32..20 {
+        let d = p.sleep_duration(retry);
+        // Must be at least initial_delay (jitter is additive, never subtractive).
+        assert!(
+            d >= initial,
+            "retry {retry}: expected >= {initial:?}, got {d:?}"
+        );
+        // Must not exceed max_delay + jitter_max.
+        assert!(
+            d <= max + jitter_max,
+            "retry {retry}: expected <= {:?}, got {d:?}",
+            max + jitter_max,
+        );
+    }
+}
+
+// Trace T3 (variant): different retry indices produce different jitter values
+// (hash is not degenerate — at least two distinct values across 10 retries).
+#[test]
+fn retry_policy_jitter_not_constant_across_retries() {
+    let p = ReadRetryPolicy::new(
+        Duration::from_millis(5),
+        Duration::from_millis(5), // base always 5ms — any variation comes from jitter
+        Duration::from_millis(10),
+    );
+    let durations: Vec<Duration> = (0u32..10).map(|r| p.sleep_duration(r)).collect();
+    let distinct: std::collections::HashSet<Duration> = durations.iter().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "expected at least two distinct sleep durations, got {durations:?}"
+    );
+}
+
+// Policy accessors: default_policy has non-zero values.
+#[test]
+fn retry_policy_default_has_non_zero_initial_and_max() {
+    let p = ReadRetryPolicy::default_policy();
+    assert!(p.initial_delay > Duration::ZERO);
+    assert!(p.max_delay >= p.initial_delay);
+}
+
+// Idempotency: calling sleep_duration with the same retry index twice returns same value.
+#[test]
+fn retry_policy_sleep_duration_is_deterministic() {
+    let p = ReadRetryPolicy::default_policy();
+    for retry in 0u32..5 {
+        assert_eq!(
+            p.sleep_duration(retry),
+            p.sleep_duration(retry),
+            "sleep_duration({retry}) is not deterministic"
+        );
+    }
 }
