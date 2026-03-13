@@ -176,6 +176,11 @@ InquireReply(id, r, t, dest) ==
 \* Reply ts = NONE means the shard aborted; ts ≠ NONE is the assigned commit timestamp.
 FastCommitMsg(id)        == [type |-> "FAST_COMMIT",       txid |-> id]
 FastCommitReply(id, ct)  == [type |-> "FAST_COMMIT_REPLY", txid |-> id, ts |-> ct]
+\* Write-and-fast-commit: coordinator sends a single RPC carrying the write payload,
+\* eliminating the separate UPDATE_KEY → FAST_COMMIT round trips.
+\* Only valid for single-write single-shard transactions (participants empty at send time).
+\* The shard reply reuses FastCommitReply (ts = NONE on abort/conflict).
+WriteAndFastCommitMsg(id, k, v) == [type |-> "WRITE_AND_FAST_COMMIT", txid |-> id, key |-> k, val |-> v]
 
 Send(m)  == msgs' = msgs \cup {m}
 SendAll(S) == msgs' = msgs \cup S
@@ -400,6 +405,69 @@ CoordHandleFastCommitReply(id) ==
                                     IF ct + 1 > c_clock[coord] THEN ct + 1 ELSE c_clock[coord]]
             /\ UNCHANGED <<start_t, participants, s_clock, versions,
                            write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers, msgs>>
+
+\* Single-RPC write-and-fast-commit optimisation: coordinator sends one message
+\* carrying the write payload to the owning shard.  The shard atomically checks
+\* conflicts, installs the write, and commits — eliminating the separate
+\* UPDATE_KEY → FAST_COMMIT round trips.
+\*
+\* Precondition: participants must be empty (no prior updates on this tx).
+\* This constraint ensures the optimisation path is only taken for fresh,
+\* single-write single-shard transactions, preserving protocol correctness.
+\*
+\* The coordinator transitions ACTIVE → PREPARING and records the participant
+\* shard before sending, exactly as CoordFastCommit does.  The reply handler
+\* CoordHandleFastCommitReply is reused unchanged.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   WF1: ACTIVE → PREPARING, shard ok, PREPARING → COMMITTED (normal path)
+\*   WF2: ACTIVE → PREPARING, shard conflicts → PREPARING → ABORTED
+\*   WF3: CoordAbortOnReply disabled during PREPARING (same guard as FastCommit)
+CoordWriteAndFastCommit(id, k, v) ==
+    /\ tx_state[id] = "ACTIVE"
+    /\ participants[id] = {}
+    /\ tx_state'     = [tx_state     EXCEPT ![id] = "PREPARING"]
+    /\ participants' = [participants EXCEPT ![id] = {ShardOf[k]}]
+    /\ Send(WriteAndFastCommitMsg(id, k, v))
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
+
+\* Shard handles WRITE_AND_FAST_COMMIT(id, k, v) — atomically check conflicts,
+\* install the write, and commit in a single step.
+\* Bypasses write_buff entirely: the write goes directly into versions[k].
+\* Reuses FastCommitReply for the response.
+\*
+\* Conflict checks are identical to ShardHandleUpdate:
+\*   CommittedConflict(k, t) — another tx committed k at ts >= start_t
+\*   PreparedConflict(s, k, t) — another prepared tx holds k with prep_t >= start_t
+\* On conflict the shard aborts this tx and replies with NONE.
+ShardHandleWriteAndFastCommit(s, id, k, v) ==
+    LET t  == start_t[id]
+        ct == s_clock[s] + 1
+        m  == WriteAndFastCommitMsg(id, k, v)
+    IN
+    /\ m \in msgs
+    /\ ShardOf[k] = s
+    /\ tx_state[id] = "PREPARING"
+    /\ ct \in Timestamps
+    /\ IF id \in s_aborted[s]
+       THEN \* already aborted at this shard — reply abort
+            /\ Send(FastCommitReply(id, NONE))
+            /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
+       ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t)
+            THEN \* write-write conflict — abort
+                 /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
+                 /\ Send(FastCommitReply(id, NONE))
+                 /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                                s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, s_readers>>
+            ELSE \* no conflict — install version directly (bypass write_buff)
+                 /\ versions'   = [versions   EXCEPT ![k] = @ \cup {<<v, ct>>}]
+                 /\ s_clock'    = [s_clock    EXCEPT ![s] = ct]
+                 /\ dirty_keys' = [dirty_keys EXCEPT ![s] = @ \cup {k}]
+                 /\ Send(FastCommitReply(id, ct))
+                 /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                                write_buff, write_key_owner, s_prepared, s_aborted, s_readers>>
 
 \* commit_tx(id): send PREPARE to all participant shards (2PC phase 1)
 \* Guard: all UPDATE_KEY messages for this tx have received OK replies,
@@ -903,6 +971,8 @@ Next ==
     \/ \E id \in TxIds, k \in Keys, v \in Values :
            \/ CoordUpdate(id, k, v)
            \/ ShardHandleUpdate(ShardOf[k], id, k, v)
+           \/ CoordWriteAndFastCommit(id, k, v)
+           \/ ShardHandleWriteAndFastCommit(ShardOf[k], id, k, v)
     \/ \E id \in TxIds, s \in Shards :
            \/ CoordHandleInquire(id, s)
            \/ ShardPruneAborted(s, id)

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use futures::future::join_all;
 use tonic::transport::{Channel, Endpoint};
@@ -20,7 +21,8 @@ use crate::proto::{
     FastCommitRequest as ShardFastCommitRequest, GetClockRequest, InquireReply, InquireRequest,
     InquiryResult, NeedsInquirySet, PrepareRequest, ReadRequest, TxAbortReply, TxAbortRequest,
     TxBeginReply, TxBeginRequest, TxCommitReply, TxCommitRequest, TxReadReply, TxReadRequest,
-    TxUpdateReply, TxUpdateRequest, UpdateRequest,
+    TxUpdateReply, TxUpdateRequest, TxWriteAndCommitReply, TxWriteAndCommitRequest, UpdateRequest,
+    WriteAndFastCommitRequest as ShardWriteAndFastCommitRequest,
 };
 use crate::shard::InquiryStatus;
 
@@ -44,6 +46,10 @@ pub struct CoordinatorServer {
     /// port → gRPC URI for peer coordinators (for cross-coordinator Inquire forwarding).
     /// Built from `peer_coordinator_addrs` supplied at construction time.
     coordinator_uris: HashMap<u16, String>,
+    /// port → cached gRPC client for peer coordinators.
+    /// Pre-built with lazy connections so cross-coordinator Inquire RPCs reuse the
+    /// existing HTTP/2 session rather than opening a new TCP connection per call.
+    coordinator_clients: HashMap<u16, CoordinatorServiceClient<Channel>>,
     /// Maximum time to wait for any individual shard RPC (or the full prepare phase).
     /// A timeout is treated as an ABORT from the shard: the coordinator aborts the
     /// transaction and returns Abort to the client. Matches CoordAbortOnReply in TLA+.
@@ -83,10 +89,14 @@ impl CoordinatorServer {
             let channel = Endpoint::from_shared(format!("http://{addr}"))?.connect_lazy();
             shard_clients.insert(addr.port() as u64, ShardServiceClient::new(channel));
         }
-        let coordinator_uris = peer_coordinator_addrs
-            .iter()
-            .map(|addr| (addr.port(), format!("http://{addr}")))
-            .collect();
+        let mut coordinator_uris = HashMap::new();
+        let mut coordinator_clients = HashMap::new();
+        for addr in &peer_coordinator_addrs {
+            let uri = format!("http://{addr}");
+            let channel = Endpoint::from_shared(uri.clone())?.connect_lazy();
+            coordinator_clients.insert(addr.port(), CoordinatorServiceClient::new(channel));
+            coordinator_uris.insert(addr.port(), uri);
+        }
         Ok(CoordinatorServer {
             state: Mutex::new(state),
             tx_id_gen: Mutex::new(TxIdGen::new(my_port)),
@@ -94,6 +104,7 @@ impl CoordinatorServer {
             shard_clients,
             my_port,
             coordinator_uris,
+            coordinator_clients,
             shard_rpc_timeout,
             read_loop_timeout,
             read_retry_policy,
@@ -126,18 +137,15 @@ impl CoordinatorServer {
             return Ok(self
                 .state
                 .lock()
-                .unwrap()
                 .handle_inquire(tx_id, reader_start_ts));
         }
-        let uri = self
-            .coordinator_uri_for_port(port)
+        let mut client = self
+            .coordinator_clients
+            .get(&port)
             .ok_or_else(|| {
                 Status::unavailable(format!("no address configured for coordinator port {port}"))
             })?
-            .to_owned();
-        let mut client = CoordinatorServiceClient::connect(uri)
-            .await
-            .map_err(|e| Status::unavailable(format!("coordinator :{port} unreachable: {e}")))?;
+            .clone();
         let reply = client
             .inquire(InquireRequest {
                 tx_id,
@@ -169,7 +177,7 @@ impl CoordinatorServer {
             let mut c = client.clone();
             if let Ok(reply) = c.get_clock(GetClockRequest {}).await {
                 let shard_clock = reply.into_inner().clock;
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 if shard_clock > state.clock {
                     state.clock = shard_clock;
                 }
@@ -181,7 +189,7 @@ impl CoordinatorServer {
     /// The abort RPCs are bounded by `shard_rpc_timeout`; hung shards are abandoned.
     /// Matches CoordAbortOnReply in the TLA+ spec.
     async fn abort_and_notify(&self, tx_id: u64) {
-        let participants = self.state.lock().unwrap().abort_tx(tx_id);
+        let participants = self.state.lock().abort_tx(tx_id);
         let futs = participants.into_iter().filter_map(|port| {
             self.shard_clients.get(&port).map(|c| {
                 let mut client = c.clone();
@@ -207,10 +215,9 @@ impl CoordinatorService for CoordinatorServer {
         let tx_id = self
             .tx_id_gen
             .lock()
-            .unwrap()
             .next()
             .expect("TxIdGen never exhausts");
-        let start_ts = self.state.lock().unwrap().start_tx(tx_id);
+        let start_ts = self.state.lock().start_tx(tx_id);
         Ok(Response::new(TxBeginReply { tx_id, start_ts }))
     }
 
@@ -228,7 +235,6 @@ impl CoordinatorService for CoordinatorServer {
         let start_ts = self
             .state
             .lock()
-            .unwrap()
             .start_ts(tx_id)
             .ok_or_else(|| Status::not_found("unknown tx_id"))?;
 
@@ -337,7 +343,6 @@ impl CoordinatorService for CoordinatorServer {
         let start_ts = self
             .state
             .lock()
-            .unwrap()
             .start_ts(tx_id)
             .ok_or_else(|| Status::not_found("unknown tx_id"))?;
 
@@ -349,7 +354,6 @@ impl CoordinatorService for CoordinatorServer {
 
         self.state
             .lock()
-            .unwrap()
             .add_participant(tx_id, shard_port);
 
         let mut client = self.shard_client(shard_port)?;
@@ -400,7 +404,7 @@ impl CoordinatorService for CoordinatorServer {
 
         // ── Fast path: single-shard transaction ──────────────────────────────
 
-        let fast_shard = self.state.lock().unwrap().begin_fast_commit(tx_id);
+        let fast_shard = self.state.lock().begin_fast_commit(tx_id);
         match fast_shard {
             BeginFastCommitResult::Ok(shard_port) => {
                 let mut client = self.shard_client(shard_port)?;
@@ -427,7 +431,6 @@ impl CoordinatorService for CoordinatorServer {
                         match self
                             .state
                             .lock()
-                            .unwrap()
                             .finalize_fast_commit(tx_id, commit_ts)
                         {
                             FinalizeFastCommitResult::Ok => {}
@@ -462,7 +465,7 @@ impl CoordinatorService for CoordinatorServer {
         // ── Phase 1: begin commit ────────────────────────────────────────────
 
         let participants: Vec<u64> = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             match state.begin_commit(tx_id) {
                 BeginCommitResult::Prepare(p) => p.into_iter().collect(),
                 BeginCommitResult::Aborted => {
@@ -524,7 +527,6 @@ impl CoordinatorService for CoordinatorServer {
             match self
                 .state
                 .lock()
-                .unwrap()
                 .collect_prepare_reply(tx_id, port, ts)
             {
                 CollectPrepareResult::Done { commit_ts: ct, .. } => commit_ts = Some(ct),
@@ -555,7 +557,7 @@ impl CoordinatorService for CoordinatorServer {
 
         // ── Phase 4: transition to COMMITTED ─────────────────────────────────
 
-        match self.state.lock().unwrap().send_commit(tx_id) {
+        match self.state.lock().send_commit(tx_id) {
             SendCommitResult::Ok { .. } => {}
             SendCommitResult::NotReady => {
                 return Err(Status::internal("unexpected state after prepare"));
@@ -591,6 +593,102 @@ impl CoordinatorService for CoordinatorServer {
         }))
     }
 
+    /// CoordWriteAndFastCommit: single-RPC fast path for single-write single-shard transactions.
+    ///
+    /// Combines the client-facing Update + Commit into a single coordinator RPC, which
+    /// routes to the owning shard's WriteAndFastCommit RPC (itself a single shard-level
+    /// operation). Eliminates two network round trips vs. the Update + Commit path.
+    ///
+    /// Matches `CoordWriteAndFastCommit + ShardHandleWriteAndFastCommit` in the TLA+ spec.
+    async fn write_and_commit(
+        &self,
+        request: Request<TxWriteAndCommitRequest>,
+    ) -> Result<Response<TxWriteAndCommitReply>, Status> {
+        let req = request.into_inner();
+        let tx_id = req.tx_id;
+        let key = req.key;
+        let value = req.value;
+
+        use crate::proto::tx_write_and_commit_reply::Result as TR;
+
+        let start_ts = self
+            .state
+            .lock()
+            .start_ts(tx_id)
+            .ok_or_else(|| Status::not_found("unknown tx_id"))?;
+
+        let shard_port = self
+            .router
+            .shard_for_key(key)
+            .ok_or_else(|| Status::unavailable("no shards registered"))?
+            .port() as u64;
+
+        // Record participant and immediately transition ACTIVE → PREPARING.
+        self.state.lock().add_participant(tx_id, shard_port);
+
+        let shard_id = match self.state.lock().begin_fast_commit(tx_id) {
+            BeginFastCommitResult::Ok(id) => id,
+            BeginFastCommitResult::Aborted => {
+                return Ok(Response::new(TxWriteAndCommitReply {
+                    result: Some(TR::Abort(Abort {})),
+                }));
+            }
+            BeginFastCommitResult::NotSingleShard => {
+                // Cannot happen: we just added exactly one participant above.
+                return Err(Status::internal("unexpected NotSingleShard in write_and_commit"));
+            }
+        };
+
+        let mut client = self.shard_client(shard_id)?;
+        let rpc_result = tokio::time::timeout(
+            self.shard_rpc_timeout,
+            client.write_and_fast_commit(ShardWriteAndFastCommitRequest {
+                tx_id,
+                start_ts,
+                key,
+                value,
+            }),
+        )
+        .await;
+
+        let reply = match rpc_result {
+            Ok(Ok(r)) => r.into_inner(),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                self.abort_and_notify(tx_id).await;
+                return Ok(Response::new(TxWriteAndCommitReply {
+                    result: Some(TR::Abort(Abort {})),
+                }));
+            }
+        };
+
+        use crate::proto::fast_commit_reply::Result as R;
+        match reply.result {
+            Some(R::CommitTs(commit_ts)) => {
+                match self.state.lock().finalize_fast_commit(tx_id, commit_ts) {
+                    FinalizeFastCommitResult::Ok => {}
+                    FinalizeFastCommitResult::NotReady => {
+                        return Err(Status::internal(
+                            "unexpected state after write_and_fast_commit",
+                        ));
+                    }
+                }
+                Ok(Response::new(TxWriteAndCommitReply {
+                    result: Some(TR::CommitTs(commit_ts)),
+                }))
+            }
+            Some(R::Abort(_)) => {
+                self.abort_and_notify(tx_id).await;
+                Ok(Response::new(TxWriteAndCommitReply {
+                    result: Some(TR::Abort(Abort {})),
+                }))
+            }
+            None => Err(Status::internal(
+                "shard returned empty write_and_fast_commit reply",
+            )),
+        }
+    }
+
     /// CoordAbortOnReply (manual): abort state and notify all participant shards.
     ///
     /// If the transaction is in `Preparing` phase (a fast-commit RPC is in flight),
@@ -606,7 +704,7 @@ impl CoordinatorService for CoordinatorServer {
         let tx_id = request.into_inner().tx_id;
         // Do not abort a tx whose fast-commit RPC is in flight (CoordAbortOnReply
         // requires ACTIVE; once in PREPARING the abort window is closed).
-        if self.state.lock().unwrap().tx_phase(tx_id) == Some(TxPhase::Preparing) {
+        if self.state.lock().tx_phase(tx_id) == Some(TxPhase::Preparing) {
             return Ok(Response::new(TxAbortReply {}));
         }
         self.abort_and_notify(tx_id).await;
@@ -631,7 +729,6 @@ impl CoordinatorService for CoordinatorServer {
         let status = self
             .state
             .lock()
-            .unwrap()
             .handle_inquire(req.tx_id, req.prep_ts);
         use crate::proto::inquire_reply::Status as S;
         let proto_status = match status {
@@ -682,8 +779,8 @@ mod tests {
     }
 
     // Trace: remote IPv4 peer in coordinator_uris → URI uses the configured address.
-    #[test]
-    fn coordinator_uri_for_known_ipv4_peer() {
+    #[tokio::test]
+    async fn coordinator_uri_for_known_ipv4_peer() {
         let server = test_server(50052, vec!["192.0.2.1:50053".parse().unwrap()]);
         assert_eq!(
             server.coordinator_uri_for_port(50053),
@@ -692,8 +789,8 @@ mod tests {
     }
 
     // Trace: remote IPv6 peer → URI wraps host in brackets (std::net formatting).
-    #[test]
-    fn coordinator_uri_for_known_ipv6_peer() {
+    #[tokio::test]
+    async fn coordinator_uri_for_known_ipv6_peer() {
         let server = test_server(50052, vec!["[::2]:50053".parse().unwrap()]);
         assert_eq!(
             server.coordinator_uri_for_port(50053),
@@ -709,8 +806,8 @@ mod tests {
     }
 
     // Trace: multiple peers → each independently addressable by port.
-    #[test]
-    fn coordinator_uri_for_multiple_peers() {
+    #[tokio::test]
+    async fn coordinator_uri_for_multiple_peers() {
         let server = test_server(
             50052,
             vec![
@@ -819,7 +916,7 @@ mod tests {
         // Register a transaction with 2 participants directly, bypassing begin/update RPCs.
         let tx_id: u64 = (50052u64 << 32) | 1;
         {
-            let mut state = server.state.lock().unwrap();
+            let mut state = server.state.lock();
             state.start_tx(tx_id);
             state.add_participant(tx_id, p1);
             state.add_participant(tx_id, p2);
@@ -859,7 +956,7 @@ mod tests {
 
         let tx_id: u64 = (50052u64 << 32) | 2;
         {
-            let mut state = server.state.lock().unwrap();
+            let mut state = server.state.lock();
             state.start_tx(tx_id);
             state.add_participant(tx_id, port);
         }
@@ -874,6 +971,113 @@ mod tests {
 
         use crate::proto::tx_commit_reply::Result as TR;
         assert_eq!(reply.result, Some(TR::Abort(Abort {})));
+    }
+
+    // ── write_and_commit tests ────────────────────────────────────────────────
+
+    // Trace WF1: write_and_commit with a hung shard → shard_rpc_timeout fires → Abort.
+    // (Same pattern as fast_commit_timeout_aborts_transaction, but via WriteAndCommit path.)
+    #[tokio::test]
+    async fn write_and_commit_timeout_aborts_transaction() {
+        let hang = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang],
+            vec![],
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 5;
+        server.state.lock().start_tx(tx_id);
+
+        let key = 42u64; // routes to the only shard (hang)
+        let reply = server
+            .write_and_commit(Request::new(TxWriteAndCommitRequest {
+                tx_id,
+                key,
+                value: 100,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use crate::proto::tx_write_and_commit_reply::Result as TR;
+        assert_eq!(reply.result, Some(TR::Abort(Abort {})));
+    }
+
+    // Trace WF2: write_and_commit on unknown tx_id → Status::not_found.
+    #[tokio::test]
+    async fn write_and_commit_unknown_tx_returns_not_found() {
+        let server = test_server(50052, vec![]);
+        let tx_id: u64 = (50052u64 << 32) | 99;
+        // tx_id was never registered via start_tx.
+        let result = server
+            .write_and_commit(Request::new(TxWriteAndCommitRequest {
+                tx_id,
+                key: 1,
+                value: 1,
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    // Trace WF3: write_and_commit with no shards registered → Status::unavailable.
+    #[tokio::test]
+    async fn write_and_commit_no_shards_returns_unavailable() {
+        let server = test_server(50052, vec![]);
+        let tx_id: u64 = (50052u64 << 32) | 6;
+        server.state.lock().start_tx(tx_id);
+        let result = server
+            .write_and_commit(Request::new(TxWriteAndCommitRequest {
+                tx_id,
+                key: 1,
+                value: 1,
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    // Trace WF4: after write_and_commit timeout, the tx is aborted in coordinator state.
+    #[tokio::test]
+    async fn write_and_commit_timeout_marks_tx_aborted() {
+        let hang = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang],
+            vec![],
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 7;
+        server.state.lock().start_tx(tx_id);
+
+        server
+            .write_and_commit(Request::new(TxWriteAndCommitRequest {
+                tx_id,
+                key: 1,
+                value: 1,
+            }))
+            .await
+            .unwrap();
+
+        // After abort, coordinator phase must be Aborted.
+        assert_eq!(
+            server.state.lock().tx_phase(tx_id),
+            Some(TxPhase::Aborted),
+            "tx must be aborted after write_and_commit timeout"
+        );
     }
 
     // Trace 4: read_loop_timeout is stored on the struct.
@@ -934,7 +1138,7 @@ mod tests {
         .unwrap();
 
         let tx_id: u64 = (50052u64 << 32) | 3;
-        server.state.lock().unwrap().start_tx(tx_id);
+        server.state.lock().start_tx(tx_id);
 
         let reply = server
             .read(Request::new(TxReadRequest { tx_id, key: 1 }))
@@ -959,7 +1163,7 @@ mod tests {
 
         let tx_id: u64 = (50052u64 << 32) | 10;
         {
-            let mut state = server.state.lock().unwrap();
+            let mut state = server.state.lock();
             state.start_tx(tx_id);
             state.add_participant(tx_id, 9999); // arbitrary shard port
 
@@ -975,7 +1179,7 @@ mod tests {
 
         // Verify phase is Preparing before the abort arrives.
         assert_eq!(
-            server.state.lock().unwrap().tx_phase(tx_id),
+            server.state.lock().tx_phase(tx_id),
             Some(TxPhase::Preparing),
             "phase must be Preparing after begin_fast_commit"
         );
@@ -990,7 +1194,7 @@ mod tests {
 
         // Phase must remain Preparing — the abort must not preempt the in-flight fast-commit.
         assert_eq!(
-            server.state.lock().unwrap().tx_phase(tx_id),
+            server.state.lock().tx_phase(tx_id),
             Some(TxPhase::Preparing),
             "abort RPC must not change phase from Preparing (CoordAbortOnReply requires ACTIVE)"
         );

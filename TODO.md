@@ -16,7 +16,6 @@
 
 - **Elle/Jepsen fault-injection correctness testing** — the TLA+ spec and unit tests verify correctness under sequential execution; Elle (Kyle Kingsbury's checker) can verify SI and serializability anomaly-freedom under real faults — process kills, network partitions, clock skew — against a running cluster; passing Elle's SI checker would be the strongest public proof of correctness achievable and puts this in the same tier as production databases that have undergone Jepsen testing _(13 pts)_
 - **Mechanized liveness proof with TLAPS** — the current TLA+ spec enforces safety invariants only; TLC cannot check liveness at scale; use TLAPS (the TLA+ Proof System) to write a mechanized proof that committed transactions eventually become durable and reads eventually terminate under fair scheduling; almost no open-source distributed systems carry a machine-checked liveness proof _(13 pts)_
-- **Technical writeup on the TLA+ → TDD → implementation methodology** — the workflow used here (spec in TLA+, generate traces with TLC, derive tests from traces, implement against failing tests) is a publishable contribution in its own right; write it up as a blog post or workshop paper with HeltesDB as the case study; SIGMOD, VLDB, or a systems blog would be the right venue _(5 pts)_
 
 ## Benchmarking & Validation ← CURRENT SPRINT — work only from this section until fully drained
 
@@ -27,7 +26,6 @@
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
 - **PreparedConflict O(P·W) scan on every update** — `handle_update`'s conflict check iterates all `s_prepared` entries for each key being written; with many concurrent 2PC transactions this becomes O(prepared_count × writes_per_tx) per update RPC; add an inverted index `prepared_by_key: HashMap<Key, BTreeSet<TxId>>` so conflict detection is O(1) per key _(3 pts)_
 - **`expire_prepared` O(P) scan on every RPC** — called on every read, update, and prepare RPC to evict timed-out prepared entries; iterates all `s_prepared` entries each call; replace with a `BinaryHeap` ordered by `prepare_time` so expiry is O(log P) amortised and the common case (nothing expired) is O(1) _(3 pts)_
-- **Coordinator channels recreated per Inquire RPC** — `resolve_inquiry()` calls `CoordinatorServiceClient::connect(uri).await` on every cross-coordinator inquiry, incurring a full TCP + HTTP/2 handshake per call; cache clients in a `coordinator_clients: HashMap<SocketAddr, CoordinatorServiceClient>` the same way `shard_clients` are cached at coordinator construction _(2 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
 
 ## Durability

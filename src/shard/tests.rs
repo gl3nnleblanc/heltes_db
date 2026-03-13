@@ -3353,3 +3353,139 @@ fn expire_reads_clears_stale_reader_allowing_compaction() {
         "K1@ts=1 compacted after T1's read entry expired"
     );
 }
+
+// -----------------------------------------------------------------------
+// handle_write_and_fast_commit — single-write fast path
+// -----------------------------------------------------------------------
+//
+// Traces WF1/WF2/WF3 from ShardHandleWriteAndFastCommit in TLA+ spec.
+
+// Trace WF1: no conflict — version installed directly, commit_ts = clock + 1.
+#[test]
+fn write_and_fast_commit_installs_version() {
+    let mut s = shard();
+    s.clock = 4;
+    let r = s.handle_write_and_fast_commit(T1, 3, K1, v(42));
+    let FastCommitResult::Ok(ct) = r else {
+        panic!("expected Ok, got {r:?}");
+    };
+    assert_eq!(ct, 5, "commit_ts = clock + 1 = 5");
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1);
+    assert_eq!(vs[0].value, v(42));
+    assert_eq!(vs[0].timestamp, 5);
+}
+
+// Trace WF1: commit_ts advances the shard clock.
+#[test]
+fn write_and_fast_commit_advances_clock() {
+    let mut s = shard();
+    s.clock = 7;
+    s.handle_write_and_fast_commit(T1, 5, K1, v(1));
+    assert_eq!(s.clock, 8, "clock must advance to commit_ts = 8");
+}
+
+// Trace WF1: key is added to dirty_keys after commit.
+#[test]
+fn write_and_fast_commit_marks_key_dirty() {
+    let mut s = shard();
+    s.handle_write_and_fast_commit(T1, 1, K1, v(10));
+    assert!(s.dirty_keys.contains(&K1), "K1 must be in dirty_keys");
+}
+
+// Trace WF1: committed version is visible to subsequent readers.
+#[test]
+fn write_and_fast_commit_version_is_readable() {
+    let mut s = shard();
+    s.clock = 2;
+    let FastCommitResult::Ok(ct) = s.handle_write_and_fast_commit(T1, 2, K1, v(99)) else {
+        panic!("expected Ok");
+    };
+    // T2 reads with start_ts = ct + 1 — should see the newly committed version.
+    assert_eq!(
+        s.handle_read(T2, ct + 1, K1, &no_inquiries()),
+        ReadResult::Value(v(99)),
+    );
+}
+
+// Trace WF2a: CommittedConflict — existing version at ts >= start_ts → Abort.
+#[test]
+fn write_and_fast_commit_aborts_on_committed_conflict() {
+    let mut s = shard();
+    // Install committed version at ts=5 for K1.
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(100),
+        timestamp: 5,
+    });
+    // T1 with start_ts=4: version at ts=5 >= 4 → CommittedConflict.
+    let r = s.handle_write_and_fast_commit(T1, 4, K1, v(99));
+    assert_eq!(r, FastCommitResult::Abort);
+    assert!(s.aborted.contains(&T1), "T1 must be in aborted set");
+}
+
+// Trace WF2b: PreparedConflict — another prepared tx wrote this key with prep_t >= start_ts.
+#[test]
+fn write_and_fast_commit_aborts_on_prepared_conflict() {
+    let mut s = shard();
+    // T2 prepared K1 at ts=6 (prep_t=6 >= start_ts=5).
+    s.prepared.insert(T2, 6);
+    s.write_buff.entry(T2).or_default().insert(K1, v(77));
+    let r = s.handle_write_and_fast_commit(T1, 5, K1, v(42));
+    assert_eq!(r, FastCommitResult::Abort);
+    assert!(s.aborted.contains(&T1));
+}
+
+// Trace WF3: tx already aborted — early return, no state change.
+#[test]
+fn write_and_fast_commit_on_aborted_tx_returns_abort() {
+    let mut s = shard();
+    s.aborted.insert(T1);
+    let old_clock = s.clock;
+    let r = s.handle_write_and_fast_commit(T1, 5, K1, v(1));
+    assert_eq!(r, FastCommitResult::Abort);
+    assert_eq!(s.clock, old_clock, "clock must not change for pre-aborted tx");
+    assert!(s.versions.get(&K1).is_none(), "no version must be installed");
+}
+
+// Trace WF1+WF2: two concurrent writes to same key — second one aborted by CommittedConflict.
+#[test]
+fn write_and_fast_commit_second_writer_sees_conflict() {
+    let mut s = shard();
+    s.clock = 4;
+    // T1 writes K1 at start_ts=4, committed at ts=5.
+    let FastCommitResult::Ok(ct) = s.handle_write_and_fast_commit(T1, 4, K1, v(10)) else {
+        panic!("T1 must succeed");
+    };
+    assert_eq!(ct, 5);
+    // T2 with start_ts=4: committed version at ts=5 >= 4 → CommittedConflict.
+    let r = s.handle_write_and_fast_commit(T2, 4, K1, v(20));
+    assert_eq!(r, FastCommitResult::Abort);
+}
+
+// Trace WF1: PreparedConflict guard — prepared tx with prep_t < start_ts is NOT a conflict.
+#[test]
+fn write_and_fast_commit_prepared_conflict_only_fires_at_or_above_start_ts() {
+    let mut s = shard();
+    // T2 prepared K1 at ts=3 (prep_t=3 < start_ts=5) — not a conflict.
+    s.prepared.insert(T2, 3);
+    s.write_buff.entry(T2).or_default().insert(K1, v(77));
+    let r = s.handle_write_and_fast_commit(T1, 5, K1, v(42));
+    let FastCommitResult::Ok(_) = r else {
+        panic!("expected Ok: prep_t < start_ts is not a conflict");
+    };
+}
+
+// Trace WF1: write does not disturb write_buff (bypass path — no write_buff entry created).
+#[test]
+fn write_and_fast_commit_does_not_use_write_buff() {
+    let mut s = shard();
+    s.handle_write_and_fast_commit(T1, 1, K1, v(5));
+    assert!(
+        s.write_buff.get(&T1).is_none(),
+        "write_and_fast_commit must bypass write_buff"
+    );
+    assert!(
+        s.write_keys.get(&K1).is_none(),
+        "write_and_fast_commit must not acquire write lock"
+    );
+}

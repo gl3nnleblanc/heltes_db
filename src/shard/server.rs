@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use tonic::{Request, Response, Status};
 
@@ -9,6 +11,7 @@ use crate::proto::{
     Abort, AbortReply, AbortRequest, Active, CommitReply, CommitRequest, FastCommitReply,
     FastCommitRequest, GetClockReply, GetClockRequest, InquiryResult, NeedsInquirySet,
     PrepareReply, PrepareRequest, ReadReply, ReadRequest, UpdateReply, UpdateRequest,
+    WriteAndFastCommitRequest,
 };
 use crate::shard::{CommitResult, InquiryStatus, ShardState};
 
@@ -41,7 +44,7 @@ impl ShardServer {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let mut state = bg_state.lock().unwrap();
+                let mut state = bg_state.lock();
                 state.compact_versions();
                 // Evict read tracking entries for abandoned read-only transactions.
                 // Transactions that only read (never write) don't send COMMIT/ABORT
@@ -88,7 +91,7 @@ impl ShardService for ShardServer {
         let inquiry_results = proto_inquiry_results(req.inquiry_results);
 
         let result = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.expire_prepared(Instant::now());
             state.handle_read(req.tx_id, req.start_ts, req.key, &inquiry_results)
         };
@@ -114,7 +117,7 @@ impl ShardService for ShardServer {
     ) -> Result<Response<UpdateReply>, Status> {
         let req = request.into_inner();
         let result = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.expire_prepared(Instant::now());
             state.handle_update(
                 req.tx_id,
@@ -143,7 +146,7 @@ impl ShardService for ShardServer {
     ) -> Result<Response<PrepareReply>, Status> {
         let req = request.into_inner();
         let result = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.expire_prepared(Instant::now());
             state.handle_prepare(req.tx_id)
         };
@@ -169,7 +172,6 @@ impl ShardService for ShardServer {
         let result = self
             .state
             .lock()
-            .unwrap()
             .handle_commit(req.tx_id, req.commit_ts);
 
         use crate::proto::commit_reply::Result as R;
@@ -184,7 +186,7 @@ impl ShardService for ShardServer {
 
     async fn abort(&self, request: Request<AbortRequest>) -> Result<Response<AbortReply>, Status> {
         let req = request.into_inner();
-        self.state.lock().unwrap().handle_abort(req.tx_id);
+        self.state.lock().handle_abort(req.tx_id);
         Ok(Response::new(AbortReply {}))
     }
 
@@ -194,7 +196,7 @@ impl ShardService for ShardServer {
         &self,
         _request: Request<GetClockRequest>,
     ) -> Result<Response<GetClockReply>, Status> {
-        let clock = self.state.lock().unwrap().clock;
+        let clock = self.state.lock().clock;
         Ok(Response::new(GetClockReply { clock }))
     }
 
@@ -203,7 +205,36 @@ impl ShardService for ShardServer {
         request: Request<FastCommitRequest>,
     ) -> Result<Response<FastCommitReply>, Status> {
         let req = request.into_inner();
-        let result = self.state.lock().unwrap().handle_fast_commit(req.tx_id);
+        let result = self.state.lock().handle_fast_commit(req.tx_id);
+
+        use crate::proto::fast_commit_reply::Result as R;
+        use crate::shard::FastCommitResult;
+
+        let proto_result = match result {
+            FastCommitResult::Ok(commit_ts) => R::CommitTs(commit_ts),
+            FastCommitResult::Abort => R::Abort(Abort {}),
+        };
+
+        Ok(Response::new(FastCommitReply {
+            result: Some(proto_result),
+        }))
+    }
+
+    /// ShardHandleWriteAndFastCommit: atomically check conflicts, install the write, commit.
+    ///
+    /// Single-write fast path: bypasses write_buff and installs the version directly.
+    /// Returns commit_ts on success or Abort on conflict / pre-existing abort.
+    async fn write_and_fast_commit(
+        &self,
+        request: Request<WriteAndFastCommitRequest>,
+    ) -> Result<Response<FastCommitReply>, Status> {
+        let req = request.into_inner();
+        let result = self.state.lock().handle_write_and_fast_commit(
+            req.tx_id,
+            req.start_ts,
+            req.key,
+            crate::shard::Value(req.value),
+        );
 
         use crate::proto::fast_commit_reply::Result as R;
         use crate::shard::FastCommitResult;
@@ -259,7 +290,7 @@ mod tests {
         // Wait for at least two ticks to be confident the background task ran.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let state = server.state.lock().unwrap();
+        let state = server.state.lock();
         assert!(
             !state.aborted.contains(&P1_S1),
             "P1_S1 must be pruned by background task: dead coordinator"
@@ -290,7 +321,7 @@ mod tests {
         let server = ShardServer::with_compact_interval(state, Duration::from_millis(5));
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let state = server.state.lock().unwrap();
+        let state = server.state.lock();
         // P1_S1: seq=1 < min_active[P1]=2 → pruned by watermark.
         assert!(
             !state.aborted.contains(&P1_S1),

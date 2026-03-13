@@ -27,7 +27,7 @@ use crate::coordinator::{
 };
 use crate::proto::{
     coordinator_service_client::CoordinatorServiceClient, TxAbortRequest, TxBeginRequest,
-    TxCommitRequest, TxReadRequest, TxUpdateRequest,
+    TxCommitRequest, TxReadRequest, TxUpdateRequest, TxWriteAndCommitRequest,
 };
 use crate::shard::{
     server::{ShardServer, ShardServiceServer},
@@ -402,6 +402,33 @@ async fn execute_transaction(
             .collect()
     };
 
+    // ── WriteAndCommit fast path: single-write single-shard ───────────────────
+    // Collapses Begin+Update+Commit (5 hops) into Begin+WriteAndCommit (3 hops).
+    // Only used when the transaction writes exactly one key and is not explicitly
+    // multi-shard (multi-shard txs need 2PC, which WriteAndCommit does not support).
+    if keys_to_write.len() == 1 && !is_multi_shard {
+        use crate::proto::tx_write_and_commit_reply::Result as WR;
+        let key = keys_to_write[0];
+        let val = rng.next_u64() % 1_000_000;
+        let reply = match client
+            .write_and_commit(TxWriteAndCommitRequest {
+                tx_id,
+                key,
+                value: val,
+            })
+            .await
+        {
+            Ok(r) => r.into_inner(),
+            Err(_) => return TxOutcome::Error,
+        };
+        return match reply.result {
+            Some(WR::CommitTs(_)) => TxOutcome::Completed,
+            Some(WR::Abort(_)) => TxOutcome::Aborted,
+            None => TxOutcome::Error,
+        };
+    }
+
+    // ── Standard Update + Commit path: multi-write or multi-shard ────────────
     for &key in &keys_to_write {
         let val = rng.next_u64() % 1_000_000;
         let reply = match client

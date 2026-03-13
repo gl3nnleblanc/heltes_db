@@ -25,6 +25,7 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 futures = "0.3"
+parking_lot = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
 tonic = "0.12"

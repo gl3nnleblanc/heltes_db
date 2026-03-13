@@ -483,6 +483,77 @@ impl ShardState {
         FastCommitResult::Ok(commit_ts)
     }
 
+    /// Handle WRITE_AND_FAST_COMMIT(id, start_ts, key, value) — single-write fast path.
+    ///
+    /// Atomically checks conflicts, installs the write directly into `versions[key]`
+    /// (bypassing `write_buff`), and commits in a single step.  This eliminates the
+    /// separate UPDATE_KEY → FAST_COMMIT round trip for single-write single-shard
+    /// transactions.
+    ///
+    /// Conflict checks are identical to `handle_update`:
+    ///   - CommittedConflict: any installed version of `key` at ts >= `start_ts`.
+    ///   - PreparedConflict: any prepared tx that wrote `key` with prep_t >= `start_ts`.
+    ///
+    /// On conflict the tx is aborted and `FastCommitResult::Abort` is returned.
+    /// On success the version is installed at `clock + 1`, the clock advances,
+    /// and `FastCommitResult::Ok(commit_ts)` is returned.
+    ///
+    /// Matches `ShardHandleWriteAndFastCommit` in the TLA+ spec.
+    pub fn handle_write_and_fast_commit(
+        &mut self,
+        tx_id: TxId,
+        start_ts: Timestamp,
+        key: Key,
+        value: Value,
+    ) -> FastCommitResult {
+        if self.aborted.contains(&tx_id) {
+            return FastCommitResult::Abort;
+        }
+
+        // CommittedConflict: any installed version with timestamp >= start_ts.
+        let committed_conflict = self
+            .versions
+            .get(&key)
+            .map(|vs| vs.partition_point(|v| v.timestamp < start_ts) < vs.len())
+            .unwrap_or(false);
+        if committed_conflict {
+            self.aborted.insert(tx_id);
+            return FastCommitResult::Abort;
+        }
+
+        // PreparedConflict: any other prepared tx that wrote this key has prep_t >= start_ts.
+        let prepared_conflict = self.prepared.iter().any(|(&other, &prep_t)| {
+            other != tx_id
+                && prep_t >= start_ts
+                && self
+                    .write_buff
+                    .get(&other)
+                    .map(|wb| wb.contains_key(&key))
+                    .unwrap_or(false)
+        });
+        if prepared_conflict {
+            self.aborted.insert(tx_id);
+            return FastCommitResult::Abort;
+        }
+
+        // No conflict — install version directly, bypassing write_buff.
+        let commit_ts = self.clock + 1;
+        self.clock = commit_ts;
+        let vs = self.versions.entry(key).or_default();
+        if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
+            vs.insert(
+                pos,
+                Version {
+                    value,
+                    timestamp: commit_ts,
+                },
+            );
+        }
+        self.dirty_keys.insert(key);
+        self.prune_aborted();
+        FastCommitResult::Ok(commit_ts)
+    }
+
     /// Discard MVCC versions that can never be read by any active transaction.
     ///
     /// Compaction watermark = min `start_ts` across all transactions that currently

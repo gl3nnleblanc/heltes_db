@@ -7,17 +7,22 @@ package heltes_db;
 // RPCs to drive the Heltes SI protocol on behalf of transactions.
 
 service ShardService {
-  rpc Read        (ReadRequest)        returns (ReadReply);
-  rpc Update      (UpdateRequest)      returns (UpdateReply);
-  rpc Prepare     (PrepareRequest)     returns (PrepareReply);
-  rpc Commit      (CommitRequest)      returns (CommitReply);
-  rpc Abort       (AbortRequest)       returns (AbortReply);
+  rpc Read               (ReadRequest)               returns (ReadReply);
+  rpc Update             (UpdateRequest)             returns (UpdateReply);
+  rpc Prepare            (PrepareRequest)            returns (PrepareReply);
+  rpc Commit             (CommitRequest)             returns (CommitReply);
+  rpc Abort              (AbortRequest)              returns (AbortReply);
   // Single-shard fast path: atomically prepare + commit in one round trip.
-  rpc FastCommit  (FastCommitRequest)  returns (FastCommitReply);
+  rpc FastCommit         (FastCommitRequest)         returns (FastCommitReply);
+  // Write-and-fast-commit: single RPC carrying the write payload; shard atomically
+  // checks conflicts, installs the write, and commits.  Eliminates the separate
+  // Update → FastCommit round trips for single-write single-shard transactions.
+  // (ShardHandleWriteAndFastCommit in TLA+)
+  rpc WriteAndFastCommit (WriteAndFastCommitRequest) returns (FastCommitReply);
   // Returns the shard's current logical clock.  Used by coordinators at startup
   // to sync c_clock to max(s_clock) across all shards before serving requests,
   // preventing CommittedConflict aborts from clock divergence (CoordSyncClock in TLA+).
-  rpc GetClock    (GetClockRequest)    returns (GetClockReply);
+  rpc GetClock           (GetClockRequest)           returns (GetClockReply);
 }
 
 // ── Coordinator service ───────────────────────────────────────────────────────
@@ -34,14 +39,19 @@ service ShardService {
 
 service CoordinatorService {
   // Client-facing
-  rpc Begin   (TxBeginRequest)   returns (TxBeginReply);
-  rpc Read    (TxReadRequest)    returns (TxReadReply);
-  rpc Update  (TxUpdateRequest)  returns (TxUpdateReply);
-  rpc Commit  (TxCommitRequest)  returns (TxCommitReply);
-  rpc Abort   (TxAbortRequest)   returns (TxAbortReply);
+  rpc Begin            (TxBeginRequest)            returns (TxBeginReply);
+  rpc Read             (TxReadRequest)             returns (TxReadReply);
+  rpc Update           (TxUpdateRequest)           returns (TxUpdateReply);
+  rpc Commit           (TxCommitRequest)           returns (TxCommitReply);
+  rpc Abort            (TxAbortRequest)            returns (TxAbortReply);
+  // Write-and-commit fast path: single client RPC for single-write single-shard
+  // transactions.  The coordinator routes to the owning shard's WriteAndFastCommit
+  // RPC, eliminating the separate Update + Commit round trips.
+  // (CoordWriteAndFastCommit + ShardHandleWriteAndFastCommit in TLA+)
+  rpc WriteAndCommit   (TxWriteAndCommitRequest)   returns (TxWriteAndCommitReply);
 
   // Internal: shard → coordinator
-  rpc Inquire (InquireRequest)   returns (InquireReply);
+  rpc Inquire          (InquireRequest)            returns (InquireReply);
 }
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
@@ -124,6 +134,36 @@ message FastCommitReply {
   oneof result {
     uint64 commit_ts = 1;  // committed at this shard-assigned timestamp
     Abort  abort     = 2;  // transaction was already aborted at this shard
+  }
+}
+
+// ── WriteAndFastCommit ────────────────────────────────────────────────────────
+// Shard-level: atomically check conflicts, buffer + commit a single write.
+// Reuses FastCommitReply (commit_ts on success, Abort on conflict/error).
+
+message WriteAndFastCommitRequest {
+  uint64 tx_id    = 1;
+  uint64 start_ts = 2;
+  uint64 key      = 3;
+  uint64 value    = 4;
+}
+
+// ── WriteAndCommit (coordinator client-facing) ────────────────────────────────
+// Client-facing fast path for single-write single-shard transactions.
+// The coordinator routes to the owning shard's WriteAndFastCommit RPC,
+// eliminating the separate Update + Commit round trips.
+// (CoordWriteAndFastCommit + ShardHandleWriteAndFastCommit in TLA+)
+
+message TxWriteAndCommitRequest {
+  uint64 tx_id  = 1;
+  uint64 key    = 2;
+  uint64 value  = 3;
+}
+
+message TxWriteAndCommitReply {
+  oneof result {
+    uint64 commit_ts = 1;  // committed at this timestamp
+    Abort  abort     = 2;  // conflict detected or coordinator-level abort
   }
 }
 
