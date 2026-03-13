@@ -314,7 +314,10 @@ async fn snapshot_isolation_stale_reader() {
 
     // Tx A (started before the write) must not see 777.
     let r_a = client
-        .read(TxReadRequest { tx_id: tx_a, key: 3 })
+        .read(TxReadRequest {
+            tx_id: tx_a,
+            key: 3,
+        })
         .await
         .unwrap()
         .into_inner();
