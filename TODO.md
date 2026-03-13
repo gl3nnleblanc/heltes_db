@@ -15,7 +15,6 @@
 - **Committed baselines for all Performance TODOs** — before touching any Performance item, run the benchmark across at least three workload profiles and commit the results to `bench/baselines/<change-name>.json`; the PR that implements the change must include a before/after table; without this, performance claims are unverifiable _(3 pts)_
 - **Criterion.rs micro-benchmarks for shard hot paths** — hot-path operations (`handle_read`, `handle_update`, `handle_commit`, `compact_versions`) have no isolated timing; add criterion.rs benchmarks so algorithmic changes can be validated independently of network noise _(3 pts)_
 - **CI throughput regression gate** — run a fixed workload in CI on every PR and fail if throughput drops >10% or p99 latency increases >20% relative to the committed baseline; this prevents accidentally shipping regressions under the banner of "improvements" _(5 pts)_
-- **NeedsInquiry end-to-end integration test** — the NeedsInquiry → coordinator inquiry → resolved-status → retry → correct version path is the most complex part of the SI protocol and has no integration-level test; add a test that prepares T2 (without committing) then starts T3 reading the same key, verifies T3 blocks and receives the pre-T2 version once inquiry resolves T2 as active _(3 pts)_
 
 ## Performance
 
