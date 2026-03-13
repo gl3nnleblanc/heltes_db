@@ -230,6 +230,26 @@ CoordUpdate(id, k, v) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
 
+\* Coordinator aborts a transaction because the read-loop global deadline expired.
+\*
+\* The coordinator's read() handler wraps the NeedsInquiry retry loop in a
+\* tokio::time::timeout(read_loop_timeout, ...).  If the loop cannot resolve all
+\* prepared writers within that wall-clock window (e.g. because a committed
+\* writer's version has not yet been installed at the shard), the coordinator
+\* aborts the reader transaction and returns Abort to the client.
+\*
+\* In the spec, deadlines are modelled as non-deterministic: any ACTIVE
+\* transaction may be aborted by the deadline at any point.  This is sound
+\* because aborting a transaction is always safe w.r.t. SI1–SI4, and TLC
+\* will explore both the deadline-fires and deadline-does-not-fire paths,
+\* verifying safety in all branches.
+CoordAbortReadDeadline(id) ==
+    /\ tx_state[id] = "ACTIVE"
+    /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
+    /\ SendAll({AbortMsg(id)})
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+
 \* Coordinator receives an ABORT reply from a read or update operation
 CoordAbortOnReply(id) ==
     /\ tx_state[id] = "ACTIVE"
@@ -605,6 +625,7 @@ Next ==
            \/ CoordFinalizePrepare(id)
            \/ CoordSendCommit(id)
            \/ CoordAbortOnReply(id)
+           \/ CoordAbortReadDeadline(id)
     \/ \E id \in TxIds, k \in Keys :
            \/ CoordRead(id, k)
            \/ ShardHandlePrepare(ShardOf[k], id)

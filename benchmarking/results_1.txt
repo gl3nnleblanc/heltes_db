@@ -1,0 +1,31 @@
+warming up (2s, 100 workers) ...
+
+hammering [::1]:50052  workers=100   keyspace=10000   updates/tx=1  dur=30s
+
+[  1.0s]  committed    9484  (+ 9484/s)  aborted    132  (+ 132/s)  errors    0[  2.0s]  committed   21351  (+11867/s)  aborted    317  (+ 185/s)  errors    0[  3.0s]  committed   32357  (+11006/s)  aborted    454  (+ 137/s)  errors    0[  4.0s]  committed   42590  (+10233/s)  aborted    613  (+ 159/s)  errors    0[  5.0s]  committed   52455  (+ 9865/s)  aborted    758  (+ 145/s)  errors    0[  6.0s]  committed   61229  (+ 8774/s)  aborted    880  (+ 122/s)  errors    0[  7.0s]  committed   70829  (+ 9600/s)  aborted   1034  (+ 154/s)  errors    0[  8.0s]  committed   80781  (+ 9952/s)  aborted   1177  (+ 143/s)  errors    0[  9.0s]  committed   89853  (+ 9072/s)  aborted   1312  (+ 135/s)  errors    0[ 10.0s]  committed   99153  (+ 9300/s)  aborted   1462  (+ 150/s)  errors    0[ 11.0s]  committed  109826  (+10673/s)  aborted   1639  (+ 177/s)  errors    0[ 12.0s]  committed  118823  (+ 8997/s)  aborted   1755  (+ 116/s)  errors    0[ 13.0s]  committed  128285  (+ 9462/s)  aborted   1893  (+ 138/s)  errors    0[ 14.0s]  committed  137959  (+ 9674/s)  aborted   2035  (+ 142/s)  errors    0[ 15.0s]  committed  147508  (+ 9549/s)  aborted   2165  (+ 130/s)  errors    0[ 16.0s]  committed  156198  (+ 8690/s)  aborted   2296  (+ 131/s)  errors    0[ 17.0s]  committed  165612  (+ 9414/s)  aborted   2440  (+ 144/s)  errors    0[ 18.0s]  committed  175854  (+10242/s)  aborted   2588  (+ 148/s)  errors    0[ 19.0s]  committed  186173  (+10319/s)  aborted   2744  (+ 156/s)  errors    0[ 20.0s]  committed  196122  (+ 9949/s)  aborted   2895  (+ 151/s)  errors    0[ 21.0s]  committed  205422  (+ 9300/s)  aborted   3043  (+ 148/s)  errors    0[ 22.0s]  committed  213793  (+ 8371/s)  aborted   3161  (+ 118/s)  errors    0[ 23.0s]  committed  222254  (+ 8461/s)  aborted   3275  (+ 114/s)  errors    0[ 24.0s]  committed  232569  (+10315/s)  aborted   3399  (+ 124/s)  errors    0[ 25.0s]  committed  240385  (+ 7816/s)  aborted   3505  (+ 106/s)  errors    0[ 26.0s]  committed  249516  (+ 9131/s)  aborted   3616  (+ 111/s)  errors    0[ 27.0s]  committed  257759  (+ 8243/s)  aborted   3752  (+ 136/s)  errors    0[ 28.0s]  committed  267765  (+10006/s)  aborted   3887  (+ 135/s)  errors    0[ 29.0s]  committed  276125  (+ 8360/s)  aborted   4001  (+ 114/s)  errors    0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+duration     30s
+committed    285257  (9509 tx/s)
+aborted      4136  (1.4%)
+errors       100
+
+latency (committed transactions only)
+  p50   5.783ms
+  p90   20.732ms
+  p95   33.878ms
+  p99   87.243ms
+  p99.9 139.335ms
+  max   230.194ms
+
+latency distribution:
+    216µs – 23.214ms │████████████████████████████████████████ 261261
+  23.214ms – 46.212ms │██ 13843
+  46.212ms – 69.21ms │ 5158
+  69.21ms – 92.207ms │ 2401
+  92.207ms – 115.205ms │ 1117
+  115.205ms – 138.203ms │ 1156
+  138.203ms – 161.201ms │ 284
+  161.201ms – 184.198ms │ 22
+  184.198ms – 207.196ms │ 13
+  207.196ms – 230.194ms │ 2

@@ -41,6 +41,11 @@ pub struct CoordinatorServer {
     /// A timeout is treated as an ABORT from the shard: the coordinator aborts the
     /// transaction and returns Abort to the client. Matches CoordAbortOnReply in TLA+.
     shard_rpc_timeout: Duration,
+    /// Maximum wall-clock time for the entire NeedsInquiry retry loop in read().
+    /// Bounds the total latency of a read even when a prepared writer's COMMIT is
+    /// delayed indefinitely (e.g. coordinator crashed mid-2PC after the write
+    /// committed). Matches CoordAbortReadDeadline in TLA+.
+    read_loop_timeout: Duration,
 }
 
 impl CoordinatorServer {
@@ -57,6 +62,7 @@ impl CoordinatorServer {
         shard_addrs: Vec<SocketAddr>,
         peer_coordinator_addrs: Vec<SocketAddr>,
         shard_rpc_timeout: Duration,
+        read_loop_timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let router = ConsistentHashRouter::new(shard_addrs.iter().copied());
         let mut shard_clients = HashMap::new();
@@ -76,6 +82,7 @@ impl CoordinatorServer {
             my_port,
             coordinator_uris,
             shard_rpc_timeout,
+            read_loop_timeout,
         })
     }
 
@@ -170,6 +177,11 @@ impl CoordinatorService for CoordinatorServer {
     }
 
     /// CoordRead: route to the owning shard, resolve any NeedsInquiry loops.
+    ///
+    /// The NeedsInquiry retry loop is bounded by `read_loop_timeout`: if the loop
+    /// has not produced a Value/NotFound result within that wall-clock window the
+    /// coordinator aborts the transaction and returns Abort to the client.
+    /// Matches CoordAbortReadDeadline in the TLA+ spec.
     async fn read(&self, request: Request<TxReadRequest>) -> Result<Response<TxReadReply>, Status> {
         let req = request.into_inner();
         let tx_id = req.tx_id;
@@ -192,59 +204,73 @@ impl CoordinatorService for CoordinatorServer {
         use crate::proto::read_reply::Result as R;
         use crate::proto::tx_read_reply::Result as TR;
 
-        let mut inquiry_results: Vec<InquiryResult> = vec![];
-        loop {
-            let reply = tokio::time::timeout(
-                self.shard_rpc_timeout,
-                client.read(ReadRequest {
-                    tx_id,
-                    start_ts,
-                    key,
-                    inquiry_results: inquiry_results.clone(),
-                }),
-            )
-            .await
-            .map_err(|_| Status::deadline_exceeded("shard read RPC timed out"))??
-            .into_inner();
+        let loop_result = tokio::time::timeout(self.read_loop_timeout, async {
+            let mut inquiry_results: Vec<InquiryResult> = vec![];
+            loop {
+                let reply = tokio::time::timeout(
+                    self.shard_rpc_timeout,
+                    client.read(ReadRequest {
+                        tx_id,
+                        start_ts,
+                        key,
+                        inquiry_results: inquiry_results.clone(),
+                    }),
+                )
+                .await
+                .map_err(|_| Status::deadline_exceeded("shard read RPC timed out"))??
+                .into_inner();
 
-            match reply.result {
-                Some(R::Value(v)) => {
-                    return Ok(Response::new(TxReadReply {
-                        result: Some(TR::Value(v)),
-                    }));
-                }
-                Some(R::NotFound(_)) => {
-                    return Ok(Response::new(TxReadReply {
-                        result: Some(TR::NotFound(true)),
-                    }));
-                }
-                Some(R::Abort(_)) => {
-                    self.abort_and_notify(tx_id).await;
-                    return Ok(Response::new(TxReadReply {
-                        result: Some(TR::Abort(Abort {})),
-                    }));
-                }
-                Some(R::NeedsInquiry(NeedsInquirySet { tx_ids })) => {
-                    for id in tx_ids {
-                        let status = self.resolve_inquiry(id, start_ts).await?;
-                        let proto_status = match status {
-                            InquiryStatus::Committed(ts) => {
-                                crate::proto::inquiry_result::Status::CommittedAt(ts)
+                match reply.result {
+                    Some(R::Value(v)) => {
+                        return Ok(Response::new(TxReadReply {
+                            result: Some(TR::Value(v)),
+                        }));
+                    }
+                    Some(R::NotFound(_)) => {
+                        return Ok(Response::new(TxReadReply {
+                            result: Some(TR::NotFound(true)),
+                        }));
+                    }
+                    Some(R::Abort(_)) => {
+                        self.abort_and_notify(tx_id).await;
+                        return Ok(Response::new(TxReadReply {
+                            result: Some(TR::Abort(Abort {})),
+                        }));
+                    }
+                    Some(R::NeedsInquiry(NeedsInquirySet { tx_ids })) => {
+                        for id in tx_ids {
+                            let status = self.resolve_inquiry(id, start_ts).await?;
+                            let proto_status = match status {
+                                InquiryStatus::Committed(ts) => {
+                                    crate::proto::inquiry_result::Status::CommittedAt(ts)
+                                }
+                                InquiryStatus::Active => {
+                                    crate::proto::inquiry_result::Status::Active(Active {})
+                                }
+                            };
+                            match inquiry_results.iter_mut().find(|r| r.tx_id == id) {
+                                Some(r) => r.status = Some(proto_status),
+                                None => inquiry_results.push(InquiryResult {
+                                    tx_id: id,
+                                    status: Some(proto_status),
+                                }),
                             }
-                            InquiryStatus::Active => {
-                                crate::proto::inquiry_result::Status::Active(Active {})
-                            }
-                        };
-                        match inquiry_results.iter_mut().find(|r| r.tx_id == id) {
-                            Some(r) => r.status = Some(proto_status),
-                            None => inquiry_results.push(InquiryResult {
-                                tx_id: id,
-                                status: Some(proto_status),
-                            }),
                         }
                     }
+                    None => return Err(Status::internal("shard returned empty read result")),
                 }
-                None => return Err(Status::internal("shard returned empty read result")),
+            }
+        })
+        .await;
+
+        match loop_result {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // read_loop_timeout fired — CoordAbortReadDeadline in TLA+.
+                self.abort_and_notify(tx_id).await;
+                Ok(Response::new(TxReadReply {
+                    result: Some(TR::Abort(Abort {})),
+                }))
             }
         }
     }
@@ -561,6 +587,7 @@ mod tests {
             vec![],
             peers,
             Duration::from_secs(5),
+            Duration::from_secs(5),
         )
         .unwrap()
     }
@@ -680,9 +707,15 @@ mod tests {
     #[test]
     fn shard_rpc_timeout_is_stored() {
         let timeout = Duration::from_secs(7);
-        let server =
-            CoordinatorServer::new(CoordinatorState::new(), 50052, vec![], vec![], timeout)
-                .unwrap();
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],
+            vec![],
+            timeout,
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(server.shard_rpc_timeout, timeout);
     }
 
@@ -705,6 +738,7 @@ mod tests {
             vec![hang1, hang2],
             vec![],
             Duration::from_millis(20),
+            Duration::from_secs(5),
         )
         .unwrap();
 
@@ -744,6 +778,7 @@ mod tests {
             vec![hang],
             vec![],
             Duration::from_millis(20),
+            Duration::from_secs(5),
         )
         .unwrap();
 
@@ -763,6 +798,53 @@ mod tests {
             .into_inner();
 
         use crate::proto::tx_commit_reply::Result as TR;
+        assert_eq!(reply.result, Some(TR::Abort(Abort {})));
+    }
+
+    // Trace 4: read_loop_timeout is stored on the struct.
+    #[test]
+    fn read_loop_timeout_is_stored() {
+        let rlt = Duration::from_secs(42);
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],
+            vec![],
+            Duration::from_secs(5),
+            rlt,
+        )
+        .unwrap();
+        assert_eq!(server.read_loop_timeout, rlt);
+    }
+
+    // Trace 2: CoordAbortReadDeadline — read_loop_timeout fires before the shard
+    // replies. With read_loop_timeout < shard_rpc_timeout and a hung shard, the
+    // outer deadline cancels the loop first, causing the coordinator to abort the
+    // read transaction and return Abort to the client.
+    #[tokio::test]
+    async fn read_loop_deadline_aborts_when_shard_hangs() {
+        let hang = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang],
+            vec![],
+            Duration::from_millis(200), // shard_rpc_timeout (inner — fires later)
+            Duration::from_millis(20),  // read_loop_timeout (outer — fires first)
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 3;
+        server.state.lock().unwrap().start_tx(tx_id);
+
+        let reply = server
+            .read(Request::new(TxReadRequest { tx_id, key: 1 }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use crate::proto::tx_read_reply::Result as TR;
         assert_eq!(reply.result, Some(TR::Abort(Abort {})));
     }
 }

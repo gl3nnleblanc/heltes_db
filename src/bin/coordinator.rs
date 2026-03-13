@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard_addrs,
         peer_coordinator_addrs,
         std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
     )?;
 
     Server::builder()
