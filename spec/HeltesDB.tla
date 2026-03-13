@@ -318,6 +318,9 @@ CoordHandleFastCommitReply(id) ==
 \* abort path as CoordAbortOnReply. The same deadline guards FastCommit, Read,
 \* and Update shard RPCs — a timeout on any of those propagates as an error to
 \* the client and (for write-path RPCs) aborts the transaction.
+\* shard_rpc_timeout and read_loop_timeout are configurable at startup via
+\* --shard-rpc-timeout-ms and --read-loop-timeout-ms CLI flags on the
+\* coordinator binary (default: 30 000 ms each).
 CoordBeginCommit(id) ==
     /\ tx_state[id] = "ACTIVE"
     /\ participants[id] # {}
@@ -592,6 +595,8 @@ ShardHandleAbort(s, id) ==
 \* handle_prepare time, then calls expire_prepared(Instant::now()) lazily at
 \* the start of each update/prepare/read RPC handler. Entries older than
 \* prepare_ttl are aborted with the same cleanup as handle_abort.
+\* prepare_ttl is configurable at startup via the --prepare-ttl-ms CLI flag
+\* on the shard binary (default: 30 000 ms).
 ShardTimeoutPrepared(s, id) ==
     /\ id \in {pair[1] : pair \in s_prepared[s]}
     /\ tx_state[id] = "PREPARING"
