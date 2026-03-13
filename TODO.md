@@ -2,6 +2,9 @@
 
 ## Correctness
 
+- **Lamport clock not propagated in cross-coordinator Inquire replies** — `resolve_inquiry` receives `CommittedAt(ts)` from a peer coordinator but never advances the local coordinator's clock to `max(current, ts)`; coordinator A at clock=100 can then assign start_ts=101 on the next Begin and miss all writes committed by coordinator B at ts=102–5000 before the transaction started in real time, violating SI snapshot boundaries across coordinator boundaries; fix by adding a `coordinator_clock` field to `InquireReply` and advancing the caller's clock on receipt _(5 pts)_
+- **2PC Prepare phase waits for all shards before surfacing first abort** — `join_all(prepare_futs)` blocks until every participating shard responds before the coordinator inspects any reply; if shard 1 returns Abort immediately but shard 2 is slow (or hits `shard_rpc_timeout`), the abort isn't surfaced until all futures settle, adding the slowest-shard latency to every aborted transaction; replace with `FuturesUnordered` so the coordinator detects and acts on the first Abort reply immediately _(3 pts)_
+- **No admission control for concurrent coordinator transactions** — `Begin` accepts unlimited concurrent calls, each allocating a tx_id entry and eventually spawning shard RPC tasks; under a client flood the transaction table and tokio task queue grow without bound, exhausting coordinator memory before any individual transaction times out; add a semaphore-gated `max_concurrent_txs` limit in `begin()` that returns an explicit backpressure error rather than silently queueing _(3 pts)_
 - **Handle coordinator crash mid-2PC** — transactions left in PREPARING or COMMIT_WAIT are permanently stuck on shards; need a recovery protocol or coordinator-side WAL _(13 pts)_
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
 - **COMMIT delivery is not retried on shard RPC timeout** — when a shard's COMMIT RPC times out, the coordinator marks the transaction committed locally but that shard never installs the write; other shards may have committed, leaving the dataset permanently inconsistent; add best-effort in-memory COMMIT retry with bounded exponential backoff so a transient timeout does not silently drop a committed write _(8 pts)_
@@ -39,6 +42,7 @@
 
 - **Read-only transactions** — currently unmodelled and unimplemented; read-only txns don't need 2PC and can be significantly cheaper _(5 pts)_
 - **Multi-key atomic reads** — the current Read RPC is per-key; a snapshot read of multiple keys requires multiple round trips with no atomicity guarantee across them _(8 pts)_
+- **Snapshot Isolation permits write-skew anomalies** — two concurrent transactions can each read an overlapping set of keys, then write to disjoint keys based on what they read, producing a result impossible under serializability (classic: two doctors both check "is another doctor on call?" and both go off-call); the current implementation has no read-set tracking and cannot detect anti-dependencies; spec and implement Serializable Snapshot Isolation (SSI) via read-key tracking in the coordinator and cycle detection at commit time _(13 pts)_
 
 ## Other
 
