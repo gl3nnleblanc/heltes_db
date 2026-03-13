@@ -488,16 +488,28 @@ impl CoordinatorService for CoordinatorServer {
         }
 
         // ── Phase 5: COMMIT concurrently ─────────────────────────────────────
+        // Each future resolves to `true` if the shard rejected the commit
+        // (CommitResult::Abort — TTL expiry race), `false` for success or RPC error.
 
         let commit_futs = participants.iter().filter_map(|&port| {
             self.shard_clients.get(&port).map(|c| {
                 let mut client = c.clone();
                 async move {
-                    let _ = client.commit(ShardCommitRequest { tx_id, commit_ts }).await;
+                    let reply = client.commit(ShardCommitRequest { tx_id, commit_ts }).await;
+                    use crate::proto::commit_reply::Result as R;
+                    matches!(
+                        reply.ok().and_then(|r| r.into_inner().result),
+                        Some(R::Abort(_))
+                    )
                 }
             })
         });
-        join_all(commit_futs).await;
+        let any_abort = join_all(commit_futs).await.into_iter().any(|a| a);
+        if any_abort {
+            return Ok(Response::new(TxCommitReply {
+                result: Some(TR::Abort(Abort {})),
+            }));
+        }
 
         Ok(Response::new(TxCommitReply {
             result: Some(TR::CommitTs(commit_ts)),

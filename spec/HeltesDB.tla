@@ -511,12 +511,25 @@ ShardHandleFastCommit(s, id) ==
                            tx_state, s_aborted>>
 
 \* Shard handles COMMIT(id, ct) — install buffered writes as new MVCC versions
+\*
+\* Guard id \notin s_aborted[s]: if the shard already auto-aborted this prepared
+\* entry (ShardTimeoutPrepared), it must REJECT the COMMIT and signal an error
+\* rather than silently succeeding with an empty write_buff. This prevents silent
+\* data loss when expire_prepared fires between the coordinator's PREPARE phase
+\* and the arrival of the COMMIT message.
+\*
+\* In the spec this guard is vacuously always satisfied: ShardTimeoutPrepared
+\* requires tx_state[id] = "PREPARING", but ShardHandleCommit requires
+\* is_committed[id] (set by CoordSendCommit which requires COMMIT_WAIT), so the
+\* two actions are mutually exclusive. The guard documents the implementation
+\* invariant that handle_commit must enforce defensively.
 ShardHandleCommit(s, id) ==
     LET ct == commit_t[id]
     IN
     /\ CommitMsg(id, ct) \in msgs
     /\ s \in participants[id]
-    /\ is_committed[id]       \* coordinator has set the flag
+    /\ is_committed[id]         \* coordinator has set the flag
+    /\ id \notin s_aborted[s]   \* shard has not TTL-aborted this entry
     /\ versions' = [k \in Keys |->
            LET kWrites == {kv \in write_buff[id] : kv[1] = k}
            IN IF kWrites # {}

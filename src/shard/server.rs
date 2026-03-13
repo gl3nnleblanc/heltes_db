@@ -10,7 +10,7 @@ use crate::proto::{
     FastCommitRequest, InquiryResult, NeedsInquirySet, PrepareReply, PrepareRequest, ReadReply,
     ReadRequest, UpdateReply, UpdateRequest,
 };
-use crate::shard::{InquiryStatus, ShardState};
+use crate::shard::{CommitResult, InquiryStatus, ShardState};
 
 pub use crate::proto::shard_service_server::ShardServiceServer;
 
@@ -130,11 +130,16 @@ impl ShardService for ShardServer {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitReply>, Status> {
         let req = request.into_inner();
-        self.state
-            .lock()
-            .unwrap()
-            .handle_commit(req.tx_id, req.commit_ts);
-        Ok(Response::new(CommitReply {}))
+        let result = self.state.lock().unwrap().handle_commit(req.tx_id, req.commit_ts);
+
+        use crate::proto::commit_reply::Result as R;
+        let proto_result = match result {
+            CommitResult::Ok => R::Ok(true),
+            CommitResult::Abort => R::Abort(Abort {}),
+        };
+        Ok(Response::new(CommitReply {
+            result: Some(proto_result),
+        }))
     }
 
     async fn abort(&self, request: Request<AbortRequest>) -> Result<Response<AbortReply>, Status> {

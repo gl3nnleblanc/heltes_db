@@ -60,6 +60,16 @@ pub enum FastCommitResult {
     Abort,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitResult {
+    /// Writes installed (or nothing to install — idempotent re-commit).
+    Ok,
+    /// Transaction was already aborted at this shard before COMMIT arrived
+    /// (e.g. via TTL expiry). No data was installed; the coordinator must
+    /// signal failure to the client rather than silently reporting success.
+    Abort,
+}
+
 /// The coordinator's answer to an INQUIRE for a prepared transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InquiryStatus {
@@ -96,6 +106,12 @@ pub struct ShardState {
     /// by `expire_prepared`. Protects conflicting writers from being permanently
     /// blocked by a coordinator that crashed mid-2PC (ShardTimeoutPrepared in TLA+).
     pub prepare_ttl: Duration,
+    /// TxIds that were auto-aborted by `expire_prepared` and have not yet received
+    /// a COMMIT or ABORT from the coordinator. Checked by `handle_commit` to detect
+    /// the TTL-expiry + late-COMMIT race: entries in `aborted` may be pruned by the
+    /// watermark before COMMIT arrives, so we need a separate durable signal.
+    /// Cleared by `handle_commit` (returns Abort) and `handle_abort`.
+    ttl_expired: HashSet<TxId>,
 }
 
 impl Default for ShardState {
@@ -117,6 +133,7 @@ impl ShardState {
             aborted: HashSet::new(),
             prepare_times: HashMap::new(),
             prepare_ttl: Duration::from_secs(30),
+            ttl_expired: HashSet::new(),
         }
     }
 
@@ -305,9 +322,22 @@ impl ShardState {
 
     /// Handle COMMIT(id, commit_ts).
     ///
-    /// Installs all buffered writes for `tx_id` as new MVCC versions at
+    /// Returns `CommitResult::Abort` if `tx_id` is in `self.aborted` (e.g. due
+    /// to TTL expiry via `expire_prepared`). In that case no data is installed
+    /// and the caller must surface a failure to the client — not silently succeed.
+    ///
+    /// Otherwise installs all buffered writes for `tx_id` as new MVCC versions at
     /// `commit_ts`, clears the write buffer, and removes the tx from `prepared`.
-    pub fn handle_commit(&mut self, tx_id: TxId, commit_ts: Timestamp) {
+    pub fn handle_commit(&mut self, tx_id: TxId, commit_ts: Timestamp) -> CommitResult {
+        // Check TTL-expiry first: `aborted` may have been pruned by the watermark
+        // before this COMMIT arrived, but `ttl_expired` persists until this handler.
+        if self.ttl_expired.remove(&tx_id) {
+            self.aborted.remove(&tx_id);
+            return CommitResult::Abort;
+        }
+        if self.aborted.contains(&tx_id) {
+            return CommitResult::Abort;
+        }
         if let Some(writes) = self.write_buff.remove(&tx_id) {
             for (key, value) in writes {
                 // Release write lock.
@@ -330,6 +360,7 @@ impl ShardState {
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
         self.prune_aborted();
+        CommitResult::Ok
     }
 
     /// Handle ABORT(id).
@@ -337,6 +368,7 @@ impl ShardState {
     /// Marks `tx_id` as aborted, clears its write buffer, and removes it from
     /// `prepared`.
     pub fn handle_abort(&mut self, tx_id: TxId) {
+        self.ttl_expired.remove(&tx_id);
         self.aborted.insert(tx_id);
         if let Some(writes) = self.write_buff.remove(&tx_id) {
             for key in writes.into_keys() {
@@ -446,6 +478,7 @@ impl ShardState {
         for &tx_id in &expired {
             self.prepare_times.remove(&tx_id);
             self.aborted.insert(tx_id);
+            self.ttl_expired.insert(tx_id);
             if let Some(writes) = self.write_buff.remove(&tx_id) {
                 for key in writes.into_keys() {
                     self.write_keys.remove(&key);

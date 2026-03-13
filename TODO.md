@@ -4,6 +4,8 @@
 
 - **Handle coordinator crash mid-2PC** — transactions left in PREPARING or COMMIT_WAIT are permanently stuck on shards; need a recovery protocol or coordinator-side WAL _(13 pts)_
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
+- **Read loop global deadline** — the coordinator `read()` handler retries on `NeedsInquiry` indefinitely with only per-RPC timeouts; a writer stuck in PREPARING can spin the reader forever; add a total-operation deadline that aborts the read transaction if not resolved within a bounded wall-clock window _(3 pts)_
+- **Circular inquiry deadlock between coordinators** — the `resolve_inquiry` path forwards NeedsInquiry results across coordinators; if coordinator A awaits B's transaction status while B concurrently awaits A's, both block forever; add a hop counter or visited-set to detect cycles and abort one side _(5 pts)_
 
 ## Performance
 
@@ -21,6 +23,8 @@
 - **Multi-machine deployment** — coordinator→shard and coordinator→coordinator addressing is hardcoded to localhost; needs a service discovery mechanism or config-driven address resolution _(5 pts)_
 - **Shard rebalancing** — consistent hashing minimises disruption on shard add/remove but there is no tooling to actually migrate versions to the new owner _(13 pts)_
 - **Metrics and observability** — no latency histograms, queue depths, or conflict rate counters exposed from the server processes themselves _(5 pts)_
+- **Runtime-configurable timeouts** — `prepare_ttl` (30 s hardcoded in `ShardState::new`) and `shard_rpc_timeout` (30 s hardcoded in `src/bin/coordinator.rs`) require code changes to tune; expose both via `--prepare-ttl-ms` and `--shard-rpc-timeout-ms` CLI flags on their respective binaries _(3 pts)_
+- **Graceful shutdown with in-flight drain** — SIGTERM kills coordinator and shard processes immediately; clients see connection resets and in-flight coordinator transactions are never aborted cleanly; install a signal handler that stops accepting new RPCs, waits for active RPCs to complete or time out, then exits _(5 pts)_
 
 ## Protocol extensions
 

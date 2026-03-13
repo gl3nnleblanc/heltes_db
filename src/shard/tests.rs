@@ -2585,3 +2585,89 @@ fn expire_prepared_ignores_unprepared_tx() {
     assert!(expired.is_empty());
     assert!(s.write_buff.contains_key(&T1)); // write buffer untouched
 }
+
+// -----------------------------------------------------------------------
+// handle_commit — rejection of TTL-aborted entries (silent data loss fix)
+// -----------------------------------------------------------------------
+
+// Trace 1 (normal 2PC): prepare → commit with no intervening abort →
+// data is installed and CommitResult::Ok is returned.
+#[test]
+fn handle_commit_on_prepared_tx_returns_ok_and_installs_versions() {
+    let mut s = shard();
+    s.handle_update(T1, 1, K1, v(42));
+    s.handle_prepare(T1);
+    let result = s.handle_commit(T1, 2);
+    assert_eq!(result, CommitResult::Ok);
+    // Version must be installed.
+    assert!(s.versions.get(&K1).unwrap().iter().any(|v| v.timestamp == 2));
+}
+
+// Trace 2 (TTL expiry then COMMIT): prepare → expire_prepared fires →
+// late COMMIT must return Abort and must NOT install any version.
+// This is the exact race fixed by the guard id ∉ s_aborted[s] in the spec.
+#[test]
+fn handle_commit_after_expire_prepared_returns_abort_and_installs_nothing() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(99));
+    s.handle_prepare(T1);
+
+    // Simulate prepare_ttl elapsed: some other RPC triggered expire_prepared.
+    s.expire_prepared(far_future());
+
+    // Coordinator (which had already collected all PREPARE replies) now sends COMMIT.
+    let result = s.handle_commit(T1, 5);
+    assert_eq!(result, CommitResult::Abort);
+    // No version must be installed — data must NOT be silently lost.
+    assert!(!s.versions.contains_key(&K1));
+}
+
+// Trace 3 (handle_abort then COMMIT): explicit abort + no TTL flag means
+// write_buff is already cleared. `handle_commit` returns Ok (no-op: nothing
+// to install) but — critically — no version is installed.
+//
+// NOTE: This scenario cannot arise in the correct protocol (coordinator sends
+// either ABORT or COMMIT, never both). We verify the safe no-op property only.
+#[test]
+fn handle_commit_after_handle_abort_is_noop_and_installs_nothing() {
+    let mut s = shard();
+    s.handle_update(T1, 1, K1, v(7));
+    s.handle_prepare(T1);
+    s.handle_abort(T1);
+
+    let result = s.handle_commit(T1, 3);
+    assert_eq!(result, CommitResult::Ok); // no-op; write_buff already cleared
+    assert!(!s.versions.contains_key(&K1)); // no data installed
+}
+
+// Trace 4 (idempotent re-commit): first commit installs, second commit is a no-op.
+// tx_id is never added to aborted, so the second call must return Ok.
+#[test]
+fn handle_commit_is_idempotent_when_not_aborted() {
+    let mut s = shard();
+    s.handle_update(T1, 1, K1, v(5));
+    s.handle_prepare(T1);
+    let r1 = s.handle_commit(T1, 2);
+    let r2 = s.handle_commit(T1, 2);
+    assert_eq!(r1, CommitResult::Ok);
+    assert_eq!(r2, CommitResult::Ok);
+    // Exactly one version at ts=2.
+    let versions = s.versions.get(&K1).unwrap();
+    assert_eq!(versions.iter().filter(|v| v.timestamp == 2).count(), 1);
+}
+
+// Trace 5 (write lock released on TTL expiry + COMMIT rejection):
+// after expire_prepared aborts T1, K1's write lock must be free so T2 can write.
+#[test]
+fn write_lock_released_after_expire_and_commit_rejected() {
+    let mut s = shard_with_ttl(Duration::from_secs(30));
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_prepare(T1);
+    s.expire_prepared(far_future());
+
+    // COMMIT is rejected.
+    assert_eq!(s.handle_commit(T1, 5), CommitResult::Abort);
+
+    // T2 should now be able to acquire K1 without conflict.
+    assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
+}

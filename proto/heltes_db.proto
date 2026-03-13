@@ -130,7 +130,12 @@ message CommitRequest {
   uint64 commit_ts = 2;
 }
 
-message CommitReply {}
+message CommitReply {
+  oneof result {
+    bool  ok    = 1;  // writes installed successfully
+    Abort abort = 2;  // tx was already aborted at this shard (e.g. TTL expiry)
+  }
+}
 
 // ── Abort ─────────────────────────────────────────────────────────────────────
 
