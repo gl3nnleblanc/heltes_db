@@ -37,6 +37,12 @@ fn parse_args() -> Result<(WorkloadConfig, Option<String>), Box<dyn std::error::
                     other => return Err(format!("unknown profile: {other}").into()),
                 };
             }
+            "--coordinators" => {
+                let v = args.next().ok_or("--coordinators requires a value")?;
+                config.coordinators = v
+                    .parse()
+                    .map_err(|_| format!("invalid --coordinators: {v}"))?;
+            }
             "--shards" => {
                 let v = args.next().ok_or("--shards requires a value")?;
                 config.shards = v.parse().map_err(|_| format!("invalid --shards: {v}"))?;
@@ -100,6 +106,7 @@ fn print_usage() {
     eprintln!("Usage: bench [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
+    eprintln!("  --coordinators <N>          number of coordinators (default: 1)");
     eprintln!("  --shards <N>                number of shards (default: 4)");
     eprintln!("  --workers <N>               concurrent workers (default: 50)");
     eprintln!("  --duration <secs>           measurement window (default: 10)");
@@ -129,8 +136,12 @@ async fn main() {
     };
 
     eprintln!(
-        "Starting: {} shard(s), {} worker(s), {}s measurement + {}s warmup",
-        config.shards, config.workers, config.duration_secs, config.warmup_secs
+        "Starting: {} coordinator(s), {} shard(s), {} worker(s), {}s measurement + {}s warmup",
+        config.coordinators,
+        config.shards,
+        config.workers,
+        config.duration_secs,
+        config.warmup_secs
     );
     eprintln!(
         "  keyspace={}, zipf_alpha={:.2}, read_frac={:.2}, \

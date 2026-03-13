@@ -80,6 +80,7 @@ fn zipf_sampler_single_element() {
 #[tokio::test]
 async fn bench_single_shard_uniform_write() {
     let config = WorkloadConfig {
+        coordinators: 1,
         shards: 1,
         workers: 4,
         duration_secs: 1,
@@ -110,6 +111,7 @@ async fn bench_single_shard_uniform_write() {
 #[tokio::test]
 async fn bench_multi_shard_2pc_write() {
     let config = WorkloadConfig {
+        coordinators: 1,
         shards: 2,
         workers: 4,
         duration_secs: 1,
@@ -135,6 +137,7 @@ async fn bench_multi_shard_2pc_write() {
 #[tokio::test]
 async fn bench_read_heavy_workload() {
     let config = WorkloadConfig {
+        coordinators: 1,
         shards: 1,
         workers: 4,
         duration_secs: 1,
@@ -165,6 +168,7 @@ async fn bench_read_heavy_workload() {
 #[tokio::test]
 async fn bench_hot_key_workload_produces_aborts() {
     let config = WorkloadConfig {
+        coordinators: 1,
         shards: 1,
         workers: 20,
         duration_secs: 1,
@@ -188,6 +192,7 @@ async fn bench_hot_key_workload_produces_aborts() {
 #[tokio::test]
 async fn bench_result_to_json_has_required_fields() {
     let config = WorkloadConfig {
+        coordinators: 1,
         shards: 1,
         workers: 2,
         duration_secs: 1,
@@ -211,12 +216,40 @@ async fn bench_result_to_json_has_required_fields() {
         "\"total_committed\"",
         "\"total_aborted\"",
         "\"total_errors\"",
+        "\"coordinators\"",
         "\"zipf_alpha\"",
         "\"read_fraction\"",
         "\"multi_shard_fraction\"",
     ] {
         assert!(json.contains(field), "JSON missing field {field}");
     }
+}
+
+/// Trace "multi-coordinator":
+///   Three coordinators share five shards. Workers round-robin across coordinators.
+///   Cross-coordinator Inquire may fire when two coordinators handle transactions
+///   for the same key. Expect: committed > 0, errors = 0.
+#[tokio::test]
+async fn bench_multi_coordinator_cluster() {
+    let config = WorkloadConfig {
+        coordinators: 3,
+        shards: 5,
+        workers: 12,
+        duration_secs: 1,
+        warmup_secs: 0,
+        keyspace: 1_000,
+        zipf_alpha: 0.0,
+        read_fraction: 0.0,
+        multi_shard_fraction: 0.0,
+        updates_per_tx: 1,
+    };
+    let result = run_benchmark(config).await;
+    assert!(
+        result.total_committed > 0,
+        "expected committed > 0, got {}",
+        result.total_committed
+    );
+    assert_eq!(result.total_errors, 0);
 }
 
 /// Preset constructors produce configs with the expected distinguishing parameters.

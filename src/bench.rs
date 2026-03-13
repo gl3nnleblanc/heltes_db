@@ -39,6 +39,8 @@ use crate::shard::{
 /// Workload configuration for a single benchmark run.
 #[derive(Clone, Debug)]
 pub struct WorkloadConfig {
+    /// Number of coordinator processes to spin up in-process.
+    pub coordinators: usize,
     /// Number of shard processes to spin up in-process.
     pub shards: usize,
     /// Number of concurrent async worker tasks.
@@ -62,6 +64,7 @@ pub struct WorkloadConfig {
 impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
+            coordinators: 1,
             shards: 4,
             workers: 50,
             duration_secs: 10,
@@ -138,6 +141,7 @@ impl BenchResult {
         format!(
             "{{\n\
              \x20 \"config\": {{\n\
+             \x20   \"coordinators\": {coordinators},\n\
              \x20   \"shards\": {shards},\n\
              \x20   \"workers\": {workers},\n\
              \x20   \"duration_secs\": {duration},\n\
@@ -159,6 +163,7 @@ impl BenchResult {
              \x20   \"total_errors\": {errors}\n\
              \x20 }}\n\
              }}",
+            coordinators = self.config.coordinators,
             shards = self.config.shards,
             workers = self.config.workers,
             duration = self.config.duration_secs,
@@ -446,36 +451,62 @@ async fn spawn_shard_server() -> SocketAddr {
     addr
 }
 
-async fn spawn_coordinator_server(
+/// Spawn N coordinators with full peer awareness, return one client per coordinator.
+///
+/// All coordinator ports are bound upfront so each coordinator is constructed
+/// with the complete peer list — matching the pattern in `src/bin/cluster.rs`.
+async fn spawn_coordinator_cluster(
+    n: usize,
     shard_addrs: Vec<SocketAddr>,
-) -> CoordinatorServiceClient<Channel> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let port = addr.port();
-    let incoming = stream::unfold(listener, |l| async move {
-        let r = l.accept().await.map(|(s, _)| s);
-        Some((r, l))
-    });
-    let server = CoordinatorServer::new(
-        CoordinatorState::new(),
-        port,
-        shard_addrs,
-        vec![],
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-        ReadRetryPolicy::default_policy(),
-    )
-    .unwrap();
-    server.sync_clock_from_shards().await;
-    tokio::spawn(
-        Server::builder()
-            .add_service(CoordinatorServiceServer::new(server))
-            .serve_with_incoming(incoming),
-    );
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    CoordinatorServiceClient::connect(format!("http://{addr}"))
-        .await
-        .unwrap()
+) -> Vec<CoordinatorServiceClient<Channel>> {
+    assert!(n > 0);
+    // Bind all listeners upfront so every coordinator knows its peers' addresses.
+    let mut listeners = Vec::with_capacity(n);
+    let mut coord_addrs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        coord_addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+
+    let mut clients = Vec::with_capacity(n);
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let addr = coord_addrs[i];
+        let port = addr.port();
+        let peers: Vec<SocketAddr> = coord_addrs
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &a)| a)
+            .collect();
+        let incoming = stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            port,
+            shard_addrs.clone(),
+            peers,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            ReadRetryPolicy::default_policy(),
+        )
+        .unwrap();
+        server.sync_clock_from_shards().await;
+        tokio::spawn(
+            Server::builder()
+                .add_service(CoordinatorServiceServer::new(server))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        clients.push(
+            CoordinatorServiceClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap(),
+        );
+    }
+    clients
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -485,6 +516,7 @@ async fn spawn_coordinator_server(
 /// The cluster is torn down implicitly when all spawned tokio tasks complete
 /// (the tokio runtime drops the server futures when no more clients hold refs).
 pub async fn run_benchmark(config: WorkloadConfig) -> BenchResult {
+    assert!(config.coordinators > 0, "need at least one coordinator");
     assert!(config.shards > 0, "need at least one shard");
     assert!(config.workers > 0, "need at least one worker");
     assert!(config.keyspace > 0, "keyspace must be positive");
@@ -494,11 +526,11 @@ pub async fn run_benchmark(config: WorkloadConfig) -> BenchResult {
     for _ in 0..config.shards {
         shard_addrs.push(spawn_shard_server().await);
     }
-    // Give shards a moment to start accepting before the coordinator syncs clocks.
+    // Give shards a moment to start accepting before coordinators sync clocks.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // ── Spawn coordinator ─────────────────────────────────────────────────────
-    let client = spawn_coordinator_server(shard_addrs.clone()).await;
+    // ── Spawn coordinators (peer-aware) ───────────────────────────────────────
+    let coord_clients = spawn_coordinator_cluster(config.coordinators, shard_addrs.clone()).await;
 
     // ── Build key partition ───────────────────────────────────────────────────
     let router = ConsistentHashRouter::new(shard_addrs.iter().copied());
@@ -526,15 +558,16 @@ pub async fn run_benchmark(config: WorkloadConfig) -> BenchResult {
         vec![]
     };
 
-    // ── Launch workers ────────────────────────────────────────────────────────
+    // ── Launch workers (round-robin across coordinators) ──────────────────────
     let bench_start = Instant::now();
     let warmup_end = bench_start + Duration::from_secs(config.warmup_secs);
     let bench_end = warmup_end + Duration::from_secs(config.duration_secs);
 
     let mut handles = Vec::with_capacity(config.workers);
     for worker_id in 0..config.workers as u64 {
+        let coord_client = coord_clients[worker_id as usize % coord_clients.len()].clone();
         handles.push(tokio::spawn(run_worker(
-            client.clone(),
+            coord_client,
             config.clone(),
             all_keys.clone(),
             cross_shard_pairs.clone(),
