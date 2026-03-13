@@ -3,6 +3,7 @@
 ## Correctness
 
 - **Handle coordinator crash mid-2PC** — transactions left in PREPARING or COMMIT_WAIT are permanently stuck on shards; need a recovery protocol or coordinator-side WAL _(13 pts)_
+- **Read snapshot not tracked in compaction watermark** — `compact_versions()` uses `min(write_start_ts.values())` as the safe floor, but a transaction that reads before its first write on a shard has no `write_start_ts` entry; if a concurrent writer has a higher start_ts, compaction can remove MVCC versions that the earlier reader still needs, causing it to observe a wrong value or NotFound; fix by tracking all active transaction start timestamps in the per-shard watermark, not just write-buffered ones _(5 pts)_
 - **Abandoned transaction reaper** — a client that crashes mid-transaction holds write locks on shards forever; need a heartbeat/TTL mechanism so coordinators can detect and abort orphaned active transactions _(8 pts)_
 - **Circular inquiry deadlock between coordinators** — the `resolve_inquiry` path forwards NeedsInquiry results across coordinators; if coordinator A awaits B's transaction status while B concurrently awaits A's, both block forever; add a hop counter or visited-set to detect cycles and abort one side _(5 pts)_
 - **COMMIT delivery is not retried on shard RPC timeout** — when a shard's COMMIT RPC times out, the coordinator marks the transaction committed locally but that shard never installs the write; other shards may have committed, leaving the dataset permanently inconsistent; add best-effort in-memory COMMIT retry with bounded exponential backoff so a transient timeout does not silently drop a committed write _(8 pts)_
@@ -18,6 +19,9 @@
 ## Performance
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
+- **PreparedConflict O(P·W) scan on every update** — `handle_update`'s conflict check iterates all `s_prepared` entries for each key being written; with many concurrent 2PC transactions this becomes O(prepared_count × writes_per_tx) per update RPC; add an inverted index `prepared_by_key: HashMap<Key, BTreeSet<TxId>>` so conflict detection is O(1) per key _(3 pts)_
+- **`expire_prepared` O(P) scan on every RPC** — called on every read, update, and prepare RPC to evict timed-out prepared entries; iterates all `s_prepared` entries each call; replace with a `BinaryHeap` ordered by `prepare_time` so expiry is O(log P) amortised and the common case (nothing expired) is O(1) _(3 pts)_
+- **Coordinator channels recreated per Inquire RPC** — `resolve_inquiry()` calls `CoordinatorServiceClient::connect(uri).await` on every cross-coordinator inquiry, incurring a full TCP + HTTP/2 handshake per call; cache clients in a `coordinator_clients: HashMap<SocketAddr, CoordinatorServiceClient>` the same way `shard_clients` are cached at coordinator construction _(2 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
 
 ## Durability
