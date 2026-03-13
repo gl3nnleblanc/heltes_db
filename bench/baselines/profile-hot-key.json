@@ -1,0 +1,23 @@
+{
+  "config": {
+    "shards": 4,
+    "workers": 50,
+    "duration_secs": 10,
+    "warmup_secs": 2,
+    "keyspace": 10000,
+    "zipf_alpha": 2.00,
+    "read_fraction": 0.00,
+    "multi_shard_fraction": 0.00,
+    "updates_per_tx": 1
+  },
+  "results": {
+    "throughput_tps": 6462.8,
+    "latency_p50_us": 2030,
+    "latency_p95_us": 2567,
+    "latency_p99_us": 2843,
+    "abort_rate": 0.7692,
+    "total_committed": 64628,
+    "total_aborted": 215369,
+    "total_errors": 0
+  }
+}

@@ -11,9 +11,6 @@
 
 ## Benchmarking & Validation ← CURRENT SPRINT — work only from this section until fully drained
 
-- **End-to-end benchmark binary with configurable workload** — no reproducible benchmark exists; build a `bench` binary that spins up an in-process cluster (like the integration tests), runs N concurrent client goroutines for T seconds, and emits JSON with throughput (tx/s), latency percentiles (p50/p95/p99 in µs), and abort rate; must be fully scriptable so CI and humans get identical numbers _(5 pts)_
-- **Workload profiles covering the conflict spectrum** — a single throughput number is meaningless without knowing the workload shape; the benchmark must support: (a) conflict rate via hot-key skew (Zipf α parameter), (b) read/write ratio, (c) single-shard vs multi-shard transaction mix; these are the knobs that determine whether a performance change is real or an artefact of the test _(3 pts)_
-- **Committed baselines for all Performance TODOs** — before touching any Performance item, run the benchmark across at least three workload profiles and commit the results to `bench/baselines/<change-name>.json`; the PR that implements the change must include a before/after table; without this, performance claims are unverifiable _(3 pts)_
 - **Criterion.rs micro-benchmarks for shard hot paths** — hot-path operations (`handle_read`, `handle_update`, `handle_commit`, `compact_versions`) have no isolated timing; add criterion.rs benchmarks so algorithmic changes can be validated independently of network noise _(3 pts)_
 - **CI throughput regression gate** — run a fixed workload in CI on every PR and fail if throughput drops >10% or p99 latency increases >20% relative to the committed baseline; this prevents accidentally shipping regressions under the banner of "improvements" _(5 pts)_
 

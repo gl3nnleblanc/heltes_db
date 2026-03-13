@@ -56,6 +56,31 @@ ASSUME \A k  \in Keys     : ShardOf[k]  \in Shards
 Timestamps == 0..MaxTimestamp
 
 ------------------------------------------------------------------------
+(*
+ * Benchmark workload profiles (informational — no new protocol actions).
+ *
+ * The bench binary exercises the following existing spec actions.  All paths
+ * are already covered by the spec; no new states or transitions are needed.
+ *
+ * Profile "uniform-write-single-shard":
+ *   ClientBegin → ClientUpdate → CoordFastCommit (ShardFastCommit).
+ *   Conflict rate: near zero with uniform key distribution.
+ *
+ * Profile "uniform-write-multi-shard":
+ *   ClientBegin → ClientUpdate × 2 → CoordBeginCommit → ShardPrepare × 2
+ *     → CoordCollectPrepare × 2 → CoordSendCommit → ShardCommit × 2.
+ *   Exercises the full two-phase commit path.
+ *
+ * Profile "hot-key" (Zipf α ≥ 1):
+ *   Same as uniform-write but many transactions race on the same hot key.
+ *   Exercises CommittedConflict (write_start_ts < commit_t of a concurrent
+ *   writer) and PreparedConflict (write_key_owner already set) abort paths.
+ *
+ * Profile "read-heavy":
+ *   ClientBegin → ShardRead (loop) → CoordHandleInquiry (if needed) → Abort.
+ *   Exercises the NeedsInquiry / resolve_inquiry path under high concurrency.
+ *)
+------------------------------------------------------------------------
 (* State variables *)
 
 VARIABLES

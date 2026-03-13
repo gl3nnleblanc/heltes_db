@@ -19,6 +19,10 @@ path = "src/bin/coordinator.rs"
 name = "cluster"
 path = "src/bin/cluster.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 futures = "0.3"
 prost = "0.13"
