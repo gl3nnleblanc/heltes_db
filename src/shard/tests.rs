@@ -2822,3 +2822,161 @@ fn compact_watermark_is_minimum_of_active_start_ts() {
     assert_eq!(vs.len(), 1);
     assert_eq!(vs[0].value, Value(30));
 }
+
+// -----------------------------------------------------------------------
+// dirty_keys — compaction only scans committed keys
+// -----------------------------------------------------------------------
+
+// Trace T1: commit a key via fast-commit → key appears in dirty_keys.
+#[test]
+fn dirty_keys_populated_on_fast_commit() {
+    let mut s = shard();
+    let start_ts = s.clock + 1;
+    s.handle_update(T1, start_ts, K1, Value(10));
+    s.handle_fast_commit(T1);
+    assert!(
+        s.dirty_keys.contains(&K1),
+        "fast-committed key must be in dirty_keys"
+    );
+}
+
+// Trace T1 (2PC path): commit a key via handle_commit → key appears in dirty_keys.
+#[test]
+fn dirty_keys_populated_on_handle_commit() {
+    let mut s = shard();
+    let start_ts = s.clock + 1;
+    s.handle_update(T1, start_ts, K1, Value(10));
+    s.handle_prepare(T1);
+    s.handle_commit(T1, 5);
+    assert!(
+        s.dirty_keys.contains(&K1),
+        "2PC-committed key must be in dirty_keys"
+    );
+}
+
+// Trace T2: after compact_versions, dirty_keys no longer contains the key.
+#[test]
+fn dirty_keys_cleared_after_compact() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    assert!(s.dirty_keys.contains(&K1));
+
+    // Active writer establishes watermark above all versions.
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+
+    s.compact_versions();
+
+    assert!(
+        !s.dirty_keys.contains(&K1),
+        "compact_versions must remove key from dirty_keys"
+    );
+}
+
+// Trace T3: a key that was never committed is not in dirty_keys and is not
+// touched by compact_versions (O(dirty_keys) not O(all keys)).
+#[test]
+fn dirty_keys_empty_for_uncommitted_key() {
+    let mut s = shard();
+    // Write but don't commit.
+    let start_ts = s.clock + 1;
+    s.handle_update(T1, start_ts, K1, Value(10));
+
+    assert!(
+        !s.dirty_keys.contains(&K1),
+        "write-buffered but uncommitted key must not be in dirty_keys"
+    );
+
+    // Compact should not panic or touch K1's (absent) versions.
+    s.compact_versions();
+    assert!(!s.dirty_keys.contains(&K1));
+}
+
+// Trace T4: dirty_keys is cleared after compact even when no versions are removed
+// (only one version below watermark — nothing to discard, but key leaves dirty set).
+#[test]
+fn dirty_keys_cleared_even_when_nothing_compacted() {
+    let mut s = shard();
+    // Single version for K1.
+    commit_versions(&mut s, K1, &[(T1, 10)]);
+    assert!(s.dirty_keys.contains(&K1));
+
+    // Active writer sets watermark above the single version.
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+
+    s.compact_versions();
+
+    // The single version is kept (it's the latest below watermark), but
+    // the key must still be removed from dirty_keys.
+    assert_eq!(s.versions[&K1].len(), 1, "single version must be kept");
+    assert!(
+        !s.dirty_keys.contains(&K1),
+        "key must leave dirty_keys even when no version was removed"
+    );
+}
+
+// Trace T5: committing two keys → both appear in dirty_keys; compact each
+// separately removes them individually, not together.
+#[test]
+fn dirty_keys_tracks_multiple_committed_keys() {
+    let mut s = shard();
+
+    let s1 = s.clock + 1;
+    s.handle_update(T1, s1, K1, Value(10));
+    s.handle_fast_commit(T1);
+
+    let s2 = s.clock + 1;
+    s.handle_update(T2, s2, K2, Value(20));
+    s.handle_fast_commit(T2);
+
+    assert!(s.dirty_keys.contains(&K1));
+    assert!(s.dirty_keys.contains(&K2));
+
+    // Active writer to establish watermark.
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K3, Value(99));
+
+    s.compact_versions();
+
+    // Both keys processed — both removed from dirty_keys.
+    assert!(
+        !s.dirty_keys.contains(&K1),
+        "K1 must leave dirty_keys after compact"
+    );
+    assert!(
+        !s.dirty_keys.contains(&K2),
+        "K2 must leave dirty_keys after compact"
+    );
+}
+
+// Trace: compact without an active writer returns immediately without
+// clearing dirty_keys (watermark=0, nothing safe to compact).
+#[test]
+fn dirty_keys_not_cleared_when_no_active_writers() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20)]);
+    assert!(s.dirty_keys.contains(&K1));
+
+    // No active write-buffered transactions → watermark = 0 → early return.
+    s.compact_versions();
+
+    // Versions untouched and dirty_keys unchanged (key still dirty for next tick).
+    assert_eq!(s.versions[&K1].len(), 2);
+    assert!(
+        s.dirty_keys.contains(&K1),
+        "dirty_keys must persist when compact bails out due to no active writers"
+    );
+}
+
+// Trace: multiple commits to the same key — dirty_keys still only contains it once.
+#[test]
+fn dirty_keys_deduplicates_same_key() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+
+    // dirty_keys is a set — K1 appears at most once regardless of how many
+    // times it was committed to.
+    let count = s.dirty_keys.iter().filter(|&&k| k == K1).count();
+    assert_eq!(count, 1, "dirty_keys must deduplicate repeated commits to K1");
+}

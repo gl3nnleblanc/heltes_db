@@ -76,12 +76,13 @@ VARIABLES
                     \*   Maintained by ShardHandleUpdate (set), ShardHandleCommit/Abort (clear).
     s_prepared,     \* s_prepared[shard]    : SUBSET (TxId x Timestamp)   (id -> prep_t)
     s_aborted,      \* s_aborted[shard]     : SUBSET TxIds
+    dirty_keys,     \* dirty_keys[shard]    : SUBSET Keys  (keys committed since last compaction)
 
     \* -- Network --
     msgs            \* msgs : SUBSET Message  (unordered, duplicates allowed)
 
 vars == <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-          s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+          s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
 
 ------------------------------------------------------------------------
 (* Types *)
@@ -101,6 +102,7 @@ TypeInvariant ==
     /\ write_key_owner  \in [Keys -> TxIds \cup {NONE}]
     /\ s_prepared       \in [Shards -> SUBSET (TxIds \X Timestamps)]
     /\ s_aborted        \in [Shards -> SUBSET TxIds]
+    /\ dirty_keys       \in [Shards -> SUBSET Keys]
 
 ------------------------------------------------------------------------
 (* Message constructors *)
@@ -199,6 +201,7 @@ Init ==
     /\ write_key_owner  = [k  \in Keys   |-> NONE]
     /\ s_prepared       = [s  \in Shards |-> {}]
     /\ s_aborted        = [s  \in Shards |-> {}]
+    /\ dirty_keys       = [s  \in Shards |-> {}]
     /\ msgs             = {}
 
 ------------------------------------------------------------------------
@@ -216,14 +219,14 @@ CoordStartTx(id) ==
     /\ c_clock'      = [c_clock      EXCEPT ![coord] = t]
     /\ is_committed' = [is_committed EXCEPT ![id]    = FALSE]
     /\ participants' = [participants EXCEPT ![id]    = {}]
-    /\ UNCHANGED <<commit_t, s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+    /\ UNCHANGED <<commit_t, s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
 
 \* read(id, k): send READ_KEY to the owning shard
 CoordRead(id, k) ==
     /\ tx_state[id] = "ACTIVE"
     /\ Send(ReadKeyMsg(id, start_t[id], k))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* update(id, k, v): track participant shard, send UPDATE_KEY
 CoordUpdate(id, k, v) ==
@@ -231,7 +234,7 @@ CoordUpdate(id, k, v) ==
     /\ participants' = [participants EXCEPT ![id] = @ \cup {ShardOf[k]}]
     /\ Send(UpdateKeyMsg(id, start_t[id], k, v))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Coordinator aborts a transaction because the read-loop global deadline expired.
 \*
@@ -268,7 +271,7 @@ CoordAbortReadDeadline(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
     /\ SendAll({AbortMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Coordinator receives an ABORT reply from a read or update operation
 CoordAbortOnReply(id) ==
@@ -278,7 +281,7 @@ CoordAbortOnReply(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
     /\ SendAll({AbortMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Single-shard fast path: coordinator sends FAST_COMMIT to the sole participant
 \* shard, skipping the two-round-trip Prepare → Commit sequence.
@@ -294,7 +297,7 @@ CoordFastCommit(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "PREPARING"]
     /\ Send(FastCommitMsg(id))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Coordinator receives a FastCommitReply.
 \* ts = NONE means the shard aborted; ts ≠ NONE is the assigned commit timestamp.
@@ -310,7 +313,7 @@ CoordHandleFastCommitReply(id) ==
        THEN \* shard aborted
             /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
        ELSE \* shard committed — finalise at the coordinator
             LET ct == reply.ts
             IN
@@ -322,7 +325,7 @@ CoordHandleFastCommitReply(id) ==
             /\ c_clock'      = [c_clock      EXCEPT ![coord] =
                                     IF ct + 1 > c_clock[coord] THEN ct + 1 ELSE c_clock[coord]]
             /\ UNCHANGED <<start_t, participants, s_clock, versions,
-                           write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+                           write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
 
 \* commit_tx(id): send PREPARE to all participant shards (2PC phase 1)
 \* Guard: all UPDATE_KEY messages for this tx have received OK replies,
@@ -347,7 +350,7 @@ CoordBeginCommit(id) ==
     /\ tx_state' = [tx_state EXCEPT ![id] = "PREPARING"]
     /\ SendAll({PrepareMsg(id)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* After receiving all PREPARE_REPLYs: compute commit_t, enter COMMIT_WAIT
 \* commit_t = max(clock, all prepare timestamps)
@@ -370,7 +373,7 @@ CoordFinalizePrepare(id) ==
     \* ensuring SI2 (unique commit timestamps).
     /\ c_clock'   = [c_clock   EXCEPT ![coord] = ct + 1]
     /\ UNCHANGED <<start_t, is_committed, participants, s_clock, versions,
-                   write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+                   write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
 
 \* Commit-wait passes (now().earliest > commit_t): send COMMIT to all participants.
 \* In the logical clock model we abstract TrueTime commit-wait as: some other
@@ -385,7 +388,7 @@ CoordSendCommit(id) ==
     /\ is_committed'  = [is_committed  EXCEPT ![id] = TRUE]
     /\ SendAll({CommitMsg(id, ct)})
     /\ UNCHANGED <<c_clock, start_t, commit_t, participants,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Coordinator handles INQUIRE(id, t) from shard s.
 \*
@@ -413,7 +416,7 @@ CoordHandleInquire(id, s) ==
                       IF m.ts > c_clock[coord] THEN m.ts ELSE c_clock[coord]]
     /\ Send(reply)
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 ------------------------------------------------------------------------
 (* Shard actions *)
@@ -452,7 +455,7 @@ ShardHandleRead(s, id, k) ==
     /\ s_clock' = [s_clock EXCEPT ![s] = IF t > s_clock[s] THEN t ELSE s_clock[s]]
     /\ Send(reply)
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Shard initiates INQUIRE for a prepared writer of k before replying to a read.
 \* (Separate action so model checker can interleave it.)
@@ -472,7 +475,7 @@ ShardSendInquire(s, id, prepId, k) ==
              /\ r.to   = s)
     /\ Send(InquireMsg(prepId, t, s))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
 
 \* Shard handles UPDATE_KEY(id, t, k, v)
 \*
@@ -490,13 +493,13 @@ ShardHandleUpdate(s, id, k, v) ==
        THEN \* Already aborted at this shard
             /\ Send(UpdateKeyReply(id, k, ABORT))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
        ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t) \/ WriteBuffConflictFast(k, id)
             THEN \* Write-write conflict — abort
                  /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
                  /\ Send(UpdateKeyReply(id, k, ABORT))
                  /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                                tx_state, s_clock, versions, write_buff, write_key_owner, s_prepared>>
+                                tx_state, s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys>>
             ELSE \* No conflict — buffer the write (overwrite any prior write to k by id)
                  /\ write_buff' = [write_buff EXCEPT ![id] =
                         (@ \ {kv \in @ : kv[1] = k}) \cup {<<k, v>>}]
@@ -505,7 +508,7 @@ ShardHandleUpdate(s, id, k, v) ==
                         IF t > s_clock[s] THEN t ELSE s_clock[s]]
                  /\ Send(UpdateKeyReply(id, k, "OK"))
                  /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                                tx_state, versions, s_prepared, s_aborted>>
+                                tx_state, versions, s_prepared, s_aborted, dirty_keys>>
 
 \* Shard handles PREPARE(id) — assign a prepare timestamp and record it.
 \* Guard: not already prepared (message set is persistent; prevent re-firing).
@@ -521,7 +524,7 @@ ShardHandlePrepare(s, id) ==
     /\ s_clock'    = [s_clock    EXCEPT ![s] = t]
     /\ Send(PrepareReply(id, t))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   versions, write_buff, write_key_owner, s_aborted>>
+                   versions, write_buff, write_key_owner, s_aborted, dirty_keys>>
 
 \* Shard handles FAST_COMMIT(id) — atomically prepare + commit for single-shard txns.
 \* Combines ShardHandlePrepare + ShardHandleCommit in one step.
@@ -537,7 +540,7 @@ ShardHandleFastCommit(s, id) ==
        THEN \* tx was aborted before the fast-commit arrived — reply abort
             /\ Send(FastCommitReply(id, NONE))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted>>
+                           s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys>>
        ELSE \* prepare + commit atomically
             /\ versions' = [k \in Keys |->
                    LET kWrites == {kv \in write_buff[id] : kv[1] = k}
@@ -549,6 +552,8 @@ ShardHandleFastCommit(s, id) ==
                    IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
             /\ s_prepared'      = [s_prepared      EXCEPT ![s]  = {p \in @ : p[1] # id}]
             /\ s_clock'         = [s_clock         EXCEPT ![s]  = ct]
+            /\ dirty_keys'      = [dirty_keys      EXCEPT ![s]  =
+                   @ \cup {k \in Keys : \E kv \in write_buff[id] : kv[1] = k}]
             /\ Send(FastCommitReply(id, ct))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
                            tx_state, s_aborted>>
@@ -582,6 +587,8 @@ ShardHandleCommit(s, id) ==
     /\ write_key_owner' = [k \in Keys |->
            IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
     /\ s_prepared'      = [s_prepared      EXCEPT ![s]  = {p \in @ : p[1] # id}]
+    /\ dirty_keys'      = [dirty_keys      EXCEPT ![s]  =
+           @ \cup {k \in Keys : \E kv \in write_buff[id] : kv[1] = k}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, s_aborted, msgs>>
 
@@ -594,7 +601,7 @@ ShardHandleAbort(s, id) ==
            IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
     /\ s_prepared'      = [s_prepared       EXCEPT ![s]  = {p \in @ : p[1] # id}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, msgs>>
+                   s_clock, versions, dirty_keys, msgs>>
 
 \* Shard auto-aborts a prepared entry whose coordinator has become unresponsive.
 \*
@@ -623,7 +630,7 @@ ShardTimeoutPrepared(s, id) ==
            IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
     /\ s_prepared'      = [s_prepared      EXCEPT ![s] = {p \in @ : p[1] # id}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, msgs>>
+                   s_clock, versions, dirty_keys, msgs>>
 
 \* Shard compacts MVCC versions for key k, discarding versions that are
 \* permanently shadowed and can never be the result of LatestVersionBefore
@@ -644,6 +651,15 @@ ShardTimeoutPrepared(s, id) ==
 \*
 \* Safety: this action is purely a restriction of versions[] and does not affect
 \* any coordinator or network state, so SI1-SI4 are preserved.
+\*
+\* Implementation note — dirty_keys optimization:
+\*   Rather than scanning all keys on every compaction tick, the implementation
+\*   maintains a dirty_keys set per shard.  A key is added to dirty_keys when a
+\*   version is committed for it (handle_commit / handle_fast_commit). The
+\*   compaction pass iterates only over dirty_keys and clears each key it visits,
+\*   reducing the per-tick cost from O(N_keys) to O(committed_since_last_tick).
+\*   In the spec this is modelled by gating ShardCompactVersions on k ∈ dirty_keys[s]
+\*   and clearing k from dirty_keys after each compaction step.
 ShardCompactVersions(s, k) ==
     LET activeWriters == {id \in TxIds : write_buff[id] # {}}
         watermark ==
@@ -657,8 +673,9 @@ ShardCompactVersions(s, k) ==
         toRemove == {tv \in vsBelowWatermark : tv[2] < maxBelowTs}
     IN
     /\ ShardOf[k] = s
-    /\ toRemove # {}
+    /\ k \in dirty_keys[s]
     /\ versions' = [versions EXCEPT ![k] = @ \ toRemove]
+    /\ dirty_keys' = [dirty_keys EXCEPT ![s] = @ \ {k}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
 
@@ -673,7 +690,7 @@ ShardPruneAborted(s, id) ==
     /\ id \in s_aborted[s]
     /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \ {id}]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, msgs>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, msgs>>
 
 \* Coordinator reads s_clock[s] from a shard and advances its own clock.
 \*
@@ -692,7 +709,7 @@ CoordSyncClock(coord, s) ==
                       THEN s_clock[s]
                       ELSE c_clock[coord]]
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, msgs>>
 
 ------------------------------------------------------------------------
 (* Next-state relation *)

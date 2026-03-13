@@ -112,6 +112,13 @@ pub struct ShardState {
     /// watermark before COMMIT arrives, so we need a separate durable signal.
     /// Cleared by `handle_commit` (returns Abort) and `handle_abort`.
     ttl_expired: HashSet<TxId>,
+    /// Keys that have had a version committed since the last compaction tick.
+    /// `compact_versions` iterates only this set instead of all keys, reducing
+    /// the per-tick cost from O(N_keys) to O(keys committed since last tick).
+    /// Keys are added by `handle_commit` and `handle_fast_commit`, and removed
+    /// (cleared) by `compact_versions` after processing each key.
+    /// (dirty_keys in TLA+)
+    pub dirty_keys: HashSet<Key>,
     /// Records the `start_ts` supplied in the first `handle_update` call for each
     /// transaction that currently has a write buffer on this shard.  Cleared on
     /// commit, abort, or TTL expiry.
@@ -145,6 +152,7 @@ impl ShardState {
             prepare_ttl: Duration::from_secs(30),
             ttl_expired: HashSet::new(),
             write_start_ts: HashMap::new(),
+            dirty_keys: HashSet::new(),
         }
     }
 
@@ -368,6 +376,7 @@ impl ShardState {
                         },
                     );
                 }
+                self.dirty_keys.insert(key);
             }
         }
         self.prepared.remove(&tx_id);
@@ -424,6 +433,7 @@ impl ShardState {
                         },
                     );
                 }
+                self.dirty_keys.insert(key);
             }
         }
         self.prepared.remove(&tx_id);
@@ -451,13 +461,19 @@ impl ShardState {
             Some(w) => w,
             None => return, // no active write-buffered transactions; nothing to compact
         };
-        for versions in self.versions.values_mut() {
-            // Index of the first version with timestamp >= watermark.
-            let cutoff = versions.partition_point(|v| v.timestamp < watermark);
-            // versions[..cutoff] are all below the watermark.
-            // Keep versions[cutoff-1] (latest before watermark); drain the rest.
-            if cutoff > 1 {
-                versions.drain(..cutoff - 1);
+        // Only scan keys that have been committed to since the last compaction tick,
+        // reducing per-tick cost from O(N_keys) to O(|dirty_keys|).
+        // (ShardCompactVersions in TLA+: gated on k ∈ dirty_keys[s])
+        let dirty: Vec<Key> = self.dirty_keys.drain().collect();
+        for key in dirty {
+            if let Some(versions) = self.versions.get_mut(&key) {
+                // Index of the first version with timestamp >= watermark.
+                let cutoff = versions.partition_point(|v| v.timestamp < watermark);
+                // versions[..cutoff] are all below the watermark.
+                // Keep versions[cutoff-1] (latest before watermark); drain the rest.
+                if cutoff > 1 {
+                    versions.drain(..cutoff - 1);
+                }
             }
         }
     }

@@ -20,7 +20,6 @@
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
-- **Compaction scans all keys on every tick** — `compact_versions()` iterates over the entire `versions` map every 100 ms regardless of recent write activity; on a shard with many keys but few active writers this is O(N_keys) wasted work per tick; track a `dirty_keys` set populated on each write/commit and restrict compaction to only those keys _(3 pts)_
 
 ## Durability
 
