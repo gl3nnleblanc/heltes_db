@@ -2,6 +2,15 @@
 
 ## Workflow
 
+## Task selection order
+
+**The "Benchmarking & Validation" section of TODO.md is the current sprint.**
+When picking the next task — for `/slopper` or otherwise — you MUST select from that section first.
+Do not pick any task from any other section (Correctness, Performance, Durability, Operability, Protocol extensions, Other) while any Benchmarking & Validation item remains on the list.
+Once that section is fully drained, remove this constraint and resume normal priority judgement.
+
+---
+
 All functional changes follow a strict three-phase process. Do not skip phases or work them out of order.
 
 ### Phase 1: TLA+ specification
