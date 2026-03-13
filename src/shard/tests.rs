@@ -3088,3 +3088,195 @@ fn dirty_keys_deduplicates_same_key() {
     let count = s.dirty_keys.iter().filter(|&&k| k == K1).count();
     assert_eq!(count, 1, "dirty_keys must deduplicate repeated commits to K1");
 }
+
+// -----------------------------------------------------------------------
+// read snapshot watermark — spec traces T1–T6
+// -----------------------------------------------------------------------
+
+// Spec T1: The core bug.
+// T1 reads K1 (start_ts=2) before its first write; T2 writes K2 (start_ts=100).
+// OLD watermark = min(write_start_ts) = 100 → removes K1@ts=1 (shadowed by ts=3).
+// NEW watermark = min(read_start_ts ∪ write_start_ts) = min(2, 100) = 2
+//              → vsBelowWatermark = {ts=1}, maxBelowTs=1, toRemove = {} → nothing removed.
+// T1 can still read K1@ts=1 after compaction.
+#[test]
+fn compact_preserves_version_needed_by_read_before_first_write() {
+    let mut s = shard();
+    // Build K1 with two committed versions: ts=1 (v10) and ts=3 (v30).
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.dirty_keys.insert(K1);
+    s.clock = 3;
+
+    // T1 reads K1 with start_ts=2 (needs v10@ts=1; ts=3 is invisible at snapshot 2).
+    // This must register start_ts=2 in the compaction watermark.
+    let res = s.handle_read(T1, 2, K1, &no_inquiries());
+    assert_eq!(res, ReadResult::Value(v(10)), "T1 must see v10@ts=1 before compaction");
+
+    // T2 writes K2 with start_ts=100 (concurrent writer, sets write-side watermark to 100).
+    s.handle_update(T2, 100, K2, v(99));
+
+    // compact: must use watermark=2 (T1's start_ts), NOT 100 (T2's start_ts).
+    // With watermark=2: only K1@ts=1 is below it; it's the max-below-2; nothing removed.
+    s.compact_versions();
+
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 2, "K1@ts=1 and K1@ts=3 must both survive; K1@ts=1 is T1's snapshot");
+
+    // T1 must still read correctly after compaction (retry scenario).
+    let res2 = s.handle_read(T1, 2, K1, &no_inquiries());
+    assert_eq!(res2, ReadResult::Value(v(10)), "T1 must still see v10@ts=1 after compaction");
+}
+
+// Spec T2: Tx that reads then writes — both read and write tracking at same start_ts.
+// After fast-commit, read_start_ts must be cleared (same as write_start_ts cleanup).
+#[test]
+fn read_start_ts_cleared_on_fast_commit() {
+    let mut s = shard();
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.clock = 1;
+
+    // T1 reads K1 (start_ts=5) then writes K2 (start_ts=5).
+    s.handle_read(T1, 5, K1, &no_inquiries());
+    s.handle_update(T1, 5, K2, v(99));
+
+    // After fast-commit: both read and write tracking must be cleared.
+    s.handle_fast_commit(T1);
+
+    // No read-side entry → compact_versions must not see T1 in the watermark.
+    // Verify by adding a competing reader T2 with low start_ts.
+    // If T1 were still tracked, watermark = min(5,...); if cleared, no T1 in watermark.
+    // Build K2 versions and compact to confirm T1's read tracking is gone.
+    s.versions.entry(K2).or_default().push(Version { value: v(1), timestamp: 1 });
+    s.versions.entry(K2).or_default().push(Version { value: v(2), timestamp: 2 });
+    s.dirty_keys.insert(K2);
+
+    // T3 writes K3 with start_ts=100 (sets write watermark=100 → can compact).
+    s.handle_update(T3, 100, K3, v(0));
+    s.compact_versions(); // watermark=100, K2@ts=1 shadowed by ts=2 → ts=1 removed
+
+    let vs = s.versions.get(&K2).unwrap();
+    assert_eq!(vs.len(), 1, "K2@ts=1 compacted; T1's read tracking cleared on fast_commit");
+}
+
+// Spec T3 (read-only tx): read_start_ts anchors watermark while tx is active,
+// preventing premature compaction of the version it needs.
+#[test]
+fn compact_read_only_reader_anchors_watermark() {
+    let mut s = shard();
+    // K1: two versions ts=1 and ts=3.
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.dirty_keys.insert(K1);
+    s.clock = 3;
+
+    // Read-only T1 with start_ts=2 reads K1.  No subsequent write on this shard.
+    s.handle_read(T1, 2, K1, &no_inquiries());
+
+    // Another writer T2 with start_ts=100.
+    s.handle_update(T2, 100, K2, v(0));
+
+    // Watermark = min(2, 100) = 2.
+    // vsBelowWatermark = {ts=1}, maxBelowTs=1, toRemove = {} → K1@ts=1 preserved.
+    s.compact_versions();
+
+    assert_eq!(
+        s.versions.get(&K1).unwrap().len(),
+        2,
+        "read-only T1 (start_ts=2) must keep K1@ts=1 alive"
+    );
+}
+
+// Spec T4: handle_abort clears read_start_ts; watermark reverts to write-side only.
+#[test]
+fn compact_after_reader_abort_reverts_to_write_watermark() {
+    let mut s = shard();
+    // K1: two versions ts=1 and ts=3.
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.dirty_keys.insert(K1);
+    s.clock = 3;
+
+    // T1 reads K1 (start_ts=2), then aborts.
+    s.handle_read(T1, 2, K1, &no_inquiries());
+    s.handle_abort(T1);
+
+    // T2 writes K2 with start_ts=100.  After T1's abort, watermark = 100.
+    // vsBelowWatermark = {ts=1, ts=3}, maxBelowTs=3, toRemove = {ts=1} → K1@ts=1 removed.
+    s.handle_update(T2, 100, K2, v(0));
+    s.compact_versions();
+
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1, "K1@ts=1 safe to compact after T1 aborted");
+    assert_eq!(vs[0].timestamp, 3);
+}
+
+// Spec T4b: handle_commit clears read_start_ts.
+#[test]
+fn read_start_ts_cleared_on_commit() {
+    let mut s = shard();
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.clock = 1;
+
+    // T1 reads K1 then writes K1; commit via prepare+commit.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+    s.handle_update(T1, 5, K1, v(99));
+    s.handle_prepare(T1);
+    s.handle_commit(T1, 6);
+
+    // Verify: read_start_ts cleared — no T1 watermark anchor.
+    // Another writer T2 with start_ts=100 → watermark=100; K1@ts=1 now compactable.
+    s.versions.entry(K1).or_default(); // ensure K1 entry exists
+    s.dirty_keys.insert(K1);
+    s.handle_update(T2, 100, K2, v(0));
+    s.compact_versions();
+
+    // K1 now has committed version at ts=6 (from T1's commit) plus old ts=1.
+    // With watermark=100, K1@ts=1 is below watermark and shadowed by ts=6 → removed.
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1, "K1@ts=1 compacted; T1's read tracking cleared on commit");
+    assert_eq!(vs[0].timestamp, 6);
+}
+
+// Spec T5/T6: no active readers or writers → watermark=0 → nothing compacted.
+// (Handles both the "s_readers empty" and "tx_state ≠ ACTIVE" spec cases.)
+#[test]
+fn compact_noop_when_no_readers_and_no_writers() {
+    let mut s = shard();
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version { value: v(20), timestamp: 2 });
+    s.dirty_keys.insert(K1);
+    s.clock = 5;
+
+    // No handle_read calls, no handle_update calls → watermark=0 → early return.
+    s.compact_versions();
+
+    assert_eq!(s.versions.get(&K1).unwrap().len(), 2, "nothing compacted with no active txs");
+}
+
+// Spec T3 variant: expire_reads removes stale read-only entries, allowing compaction.
+#[test]
+fn expire_reads_clears_stale_reader_allowing_compaction() {
+    let mut s = shard();
+    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version { value: v(20), timestamp: 3 });
+    s.dirty_keys.insert(K1);
+    s.clock = 3;
+
+    // T1 reads with start_ts=2. This anchors the watermark at 2.
+    s.handle_read(T1, 2, K1, &no_inquiries());
+
+    // Force T1's read time to be very old (simulates abandoned transaction).
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+
+    // expire_reads with the default TTL should evict T1.
+    s.expire_reads(Instant::now());
+
+    // Now only T2's write anchors the watermark.
+    s.handle_update(T2, 100, K2, v(0));
+    s.compact_versions();
+
+    // With T1 gone, watermark=100 → K1@ts=1 is below 100 and shadowed by ts=3 → removed.
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1, "K1@ts=1 compacted after T1's read entry expired");
+}

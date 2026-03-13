@@ -43,6 +43,11 @@ impl ShardServer {
                 interval.tick().await;
                 let mut state = bg_state.lock().unwrap();
                 state.compact_versions();
+                // Evict read tracking entries for abandoned read-only transactions.
+                // Transactions that only read (never write) don't send COMMIT/ABORT
+                // to this shard, so their read_start_ts entries must be expired here
+                // to prevent them from pinning the compaction watermark indefinitely.
+                state.expire_reads(Instant::now());
                 // Prune aborted entries from dead coordinator ports.
                 // prune_aborted() already runs on every commit/abort RPC, but if a
                 // coordinator crashes and never restarts, no new RPCs arrive from that

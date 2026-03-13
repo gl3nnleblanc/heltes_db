@@ -123,12 +123,37 @@ pub struct ShardState {
     /// transaction that currently has a write buffer on this shard.  Cleared on
     /// commit, abort, or TTL expiry.
     ///
-    /// Used by `compact_versions` to compute the compaction watermark:
-    ///   watermark = min(write_start_ts.values())
-    /// Any MVCC version that is strictly older than the watermark AND is shadowed
-    /// by a newer version that is also below the watermark can be discarded
-    /// (ShardCompactVersions in TLA+).
+    /// Used by `compact_versions` to compute the compaction watermark.
+    /// (One of two inputs — see also `read_start_ts`.)
     write_start_ts: HashMap<TxId, Timestamp>,
+
+    /// Records the `start_ts` of every transaction that has issued a read to
+    /// this shard and has not yet committed, aborted, or been TTL-expired.
+    /// Populated by `handle_read`. Cleared by `handle_commit`, `handle_abort`,
+    /// `handle_fast_commit`, and `expire_prepared` (write-side abort).
+    ///
+    /// Used by `compact_versions` together with `write_start_ts`:
+    ///   watermark = min(write_start_ts.values() ∪ read_start_ts.values())
+    ///
+    /// Without this tracking, a transaction T with start_ts=5 that reads before
+    /// its first write on this shard has no `write_start_ts` entry. A concurrent
+    /// writer with start_ts=100 would set watermark=100, potentially compacting
+    /// away MVCC versions that T's snapshot still needs (ShardCompactVersions fix
+    /// in TLA+ spec: activeOnShard includes s_readers, not just write_buff).
+    ///
+    /// Read-only transactions (never in `write_buff`) stay in this map until
+    /// `expire_reads` evicts them via TTL — see `read_ttl`.
+    read_start_ts: HashMap<TxId, Timestamp>,
+
+    /// Wall-clock instant at which each transaction's first read to this shard
+    /// was recorded. Used by `expire_reads` to evict abandoned read-only
+    /// transactions that never commit or abort (client crashed, etc.).
+    read_times: HashMap<TxId, Instant>,
+
+    /// Maximum time a read-only tracking entry may sit in `read_start_ts` before
+    /// `expire_reads` discards it. Defaults to the same value as `prepare_ttl`.
+    /// Should be set to at least the maximum expected client transaction duration.
+    pub read_ttl: Duration,
 }
 
 impl Default for ShardState {
@@ -152,6 +177,9 @@ impl ShardState {
             prepare_ttl: Duration::from_secs(30),
             ttl_expired: HashSet::new(),
             write_start_ts: HashMap::new(),
+            read_start_ts: HashMap::new(),
+            read_times: HashMap::new(),
+            read_ttl: Duration::from_secs(30),
             dirty_keys: HashSet::new(),
         }
     }
@@ -248,6 +276,12 @@ impl ShardState {
             .cloned();
 
         self.clock = self.clock.max(start_ts);
+        // Track this transaction's start_ts so compact_versions includes it in the
+        // watermark. Without this, a reader whose start_ts is lower than all active
+        // writers' start_ts values would be invisible to the watermark, allowing
+        // compaction to remove MVCC versions that this reader's snapshot still needs.
+        self.read_start_ts.entry(tx_id).or_insert(start_ts);
+        self.read_times.entry(tx_id).or_insert_with(Instant::now);
         match best {
             Some(ver) => ReadResult::Value(ver.value),
             None => ReadResult::NotFound,
@@ -382,6 +416,8 @@ impl ShardState {
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
+        self.read_start_ts.remove(&tx_id);
+        self.read_times.remove(&tx_id);
         self.prune_aborted();
         CommitResult::Ok
     }
@@ -401,6 +437,8 @@ impl ShardState {
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
+        self.read_start_ts.remove(&tx_id);
+        self.read_times.remove(&tx_id);
         self.prune_aborted();
     }
 
@@ -439,6 +477,8 @@ impl ShardState {
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
+        self.read_start_ts.remove(&tx_id);
+        self.read_times.remove(&tx_id);
         self.prune_aborted();
         FastCommitResult::Ok(commit_ts)
     }
@@ -457,9 +497,22 @@ impl ShardState {
     ///
     /// Matches `ShardCompactVersions` in the TLA+ spec.
     pub fn compact_versions(&mut self) {
-        let watermark = match self.write_start_ts.values().copied().min() {
+        // Watermark = min start_ts across all active transactions on this shard:
+        //   - write-buffered transactions (write_start_ts)
+        //   - transactions that have read from this shard (read_start_ts)
+        // Without read tracking, a transaction T (start_ts=5) that reads before its
+        // first write on this shard would be invisible to the watermark, and a
+        // concurrent writer (start_ts=100) would raise the watermark to 100, allowing
+        // compaction to discard MVCC versions that T's snapshot still needs.
+        let watermark = self
+            .write_start_ts
+            .values()
+            .chain(self.read_start_ts.values())
+            .copied()
+            .min();
+        let watermark = match watermark {
             Some(w) => w,
-            None => return, // no active write-buffered transactions; nothing to compact
+            None => return, // no active transactions; nothing to compact
         };
         // Only scan keys that have been committed to since the last compaction tick,
         // reducing per-tick cost from O(N_keys) to O(|dirty_keys|).
@@ -547,6 +600,8 @@ impl ShardState {
             }
             self.prepared.remove(&tx_id);
             self.write_start_ts.remove(&tx_id);
+            self.read_start_ts.remove(&tx_id);
+            self.read_times.remove(&tx_id);
         }
 
         if !expired.is_empty() {
@@ -554,6 +609,41 @@ impl ShardState {
         }
 
         expired
+    }
+
+    /// Evict `read_start_ts` / `read_times` entries for transactions that have
+    /// been tracking a read on this shard longer than `read_ttl`.
+    ///
+    /// This is the cleanup path for abandoned read-only transactions (client
+    /// crashed, network partition, etc.) that never send a COMMIT or ABORT to
+    /// this shard. Without eviction, their `start_ts` would anchor the
+    /// compaction watermark forever, preventing MVCC history from shrinking.
+    ///
+    /// Transactions that hold write buffers on this shard are NOT evicted here —
+    /// those are handled by `expire_prepared` via the write-side `prepare_ttl`.
+    ///
+    /// Pass `now = Instant::now()` in production. In tests, pass a future instant
+    /// to force eviction without sleeping.
+    pub fn expire_reads(&mut self, now: Instant) {
+        let expired: Vec<TxId> = self
+            .read_times
+            .iter()
+            .filter(|(_, &t)| now.saturating_duration_since(t) >= self.read_ttl)
+            .map(|(&tx_id, _)| tx_id)
+            .collect();
+
+        for tx_id in expired {
+            self.read_times.remove(&tx_id);
+            self.read_start_ts.remove(&tx_id);
+        }
+    }
+
+    /// Override the recorded read time for `tx_id`. Only for use in tests
+    /// to simulate entries that were read at an arbitrary past instant without
+    /// requiring the test to sleep.
+    #[cfg(test)]
+    pub fn force_read_time(&mut self, tx_id: TxId, t: Instant) {
+        self.read_times.insert(tx_id, t);
     }
 
     /// Override the recorded prepare time for `tx_id`. Only for use in tests
