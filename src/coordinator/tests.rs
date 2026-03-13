@@ -742,7 +742,7 @@ fn finalize_fast_commit_does_not_regress_clock() {
     c.start_tx(2); // clock → 2
     c.add_participant(1, 100);
     c.begin_fast_commit(1); // phase → Preparing
-    // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance past commit_ts=2).
+                            // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance past commit_ts=2).
     c.finalize_fast_commit(1, 1);
     assert!(
         c.clock >= 2,
@@ -838,7 +838,10 @@ fn si2_fast_commit_clock_advances_prevent_timestamp_reuse() {
     let r = c.finalize_fast_commit(1, 5);
     assert_eq!(r, FinalizeFastCommitResult::Ok);
     // Coordinator clock must now be > 5 so T2 starts at a strictly later time.
-    assert!(c.clock > 5, "clock must advance past T1 commit_ts to prevent SI2 violation");
+    assert!(
+        c.clock > 5,
+        "clock must advance past T1 commit_ts to prevent SI2 violation"
+    );
 
     // T2 starts after T1 committed; its start_ts > T1's commit_ts.
     let t2_start = c.start_tx(2);
@@ -853,7 +856,8 @@ fn si2_fast_commit_clock_advances_prevent_timestamp_reuse() {
     c.finalize_fast_commit(2, 6);
     // Both commit timestamps are distinct — SI2 holds.
     assert_ne!(
-        c.start_ts(1), c.start_ts(2),
+        c.start_ts(1),
+        c.start_ts(2),
         "SI2: two committed transactions must not share a start timestamp"
     );
 }

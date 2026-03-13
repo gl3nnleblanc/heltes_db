@@ -2034,7 +2034,7 @@ fn dead_port_pruned_active_port_watermark_respected() {
     let mut s = shard();
     s.aborted.insert(P1_S1); // dead port P1
     s.aborted.insert(P2_S1); // old entry from active port P2
-    // P2_S2 is active → min_active[P2] = 2; P2_S1 seq=1 < 2 → pruned.
+                             // P2_S2 is active → min_active[P2] = 2; P2_S1 seq=1 < 2 → pruned.
     s.write_buff.entry(P2_S2).or_default().insert(K1, v(10));
 
     s.prune_aborted();
@@ -3086,7 +3086,10 @@ fn dirty_keys_deduplicates_same_key() {
     // dirty_keys is a set — K1 appears at most once regardless of how many
     // times it was committed to.
     let count = s.dirty_keys.iter().filter(|&&k| k == K1).count();
-    assert_eq!(count, 1, "dirty_keys must deduplicate repeated commits to K1");
+    assert_eq!(
+        count, 1,
+        "dirty_keys must deduplicate repeated commits to K1"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -3103,15 +3106,25 @@ fn dirty_keys_deduplicates_same_key() {
 fn compact_preserves_version_needed_by_read_before_first_write() {
     let mut s = shard();
     // Build K1 with two committed versions: ts=1 (v10) and ts=3 (v30).
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
-    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(30),
+        timestamp: 3,
+    });
     s.dirty_keys.insert(K1);
     s.clock = 3;
 
     // T1 reads K1 with start_ts=2 (needs v10@ts=1; ts=3 is invisible at snapshot 2).
     // This must register start_ts=2 in the compaction watermark.
     let res = s.handle_read(T1, 2, K1, &no_inquiries());
-    assert_eq!(res, ReadResult::Value(v(10)), "T1 must see v10@ts=1 before compaction");
+    assert_eq!(
+        res,
+        ReadResult::Value(v(10)),
+        "T1 must see v10@ts=1 before compaction"
+    );
 
     // T2 writes K2 with start_ts=100 (concurrent writer, sets write-side watermark to 100).
     s.handle_update(T2, 100, K2, v(99));
@@ -3121,11 +3134,19 @@ fn compact_preserves_version_needed_by_read_before_first_write() {
     s.compact_versions();
 
     let vs = s.versions.get(&K1).unwrap();
-    assert_eq!(vs.len(), 2, "K1@ts=1 and K1@ts=3 must both survive; K1@ts=1 is T1's snapshot");
+    assert_eq!(
+        vs.len(),
+        2,
+        "K1@ts=1 and K1@ts=3 must both survive; K1@ts=1 is T1's snapshot"
+    );
 
     // T1 must still read correctly after compaction (retry scenario).
     let res2 = s.handle_read(T1, 2, K1, &no_inquiries());
-    assert_eq!(res2, ReadResult::Value(v(10)), "T1 must still see v10@ts=1 after compaction");
+    assert_eq!(
+        res2,
+        ReadResult::Value(v(10)),
+        "T1 must still see v10@ts=1 after compaction"
+    );
 }
 
 // Spec T2: Tx that reads then writes — both read and write tracking at same start_ts.
@@ -3133,7 +3154,10 @@ fn compact_preserves_version_needed_by_read_before_first_write() {
 #[test]
 fn read_start_ts_cleared_on_fast_commit() {
     let mut s = shard();
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
     s.clock = 1;
 
     // T1 reads K1 (start_ts=5) then writes K2 (start_ts=5).
@@ -3147,8 +3171,14 @@ fn read_start_ts_cleared_on_fast_commit() {
     // Verify by adding a competing reader T2 with low start_ts.
     // If T1 were still tracked, watermark = min(5,...); if cleared, no T1 in watermark.
     // Build K2 versions and compact to confirm T1's read tracking is gone.
-    s.versions.entry(K2).or_default().push(Version { value: v(1), timestamp: 1 });
-    s.versions.entry(K2).or_default().push(Version { value: v(2), timestamp: 2 });
+    s.versions.entry(K2).or_default().push(Version {
+        value: v(1),
+        timestamp: 1,
+    });
+    s.versions.entry(K2).or_default().push(Version {
+        value: v(2),
+        timestamp: 2,
+    });
     s.dirty_keys.insert(K2);
 
     // T3 writes K3 with start_ts=100 (sets write watermark=100 → can compact).
@@ -3156,7 +3186,11 @@ fn read_start_ts_cleared_on_fast_commit() {
     s.compact_versions(); // watermark=100, K2@ts=1 shadowed by ts=2 → ts=1 removed
 
     let vs = s.versions.get(&K2).unwrap();
-    assert_eq!(vs.len(), 1, "K2@ts=1 compacted; T1's read tracking cleared on fast_commit");
+    assert_eq!(
+        vs.len(),
+        1,
+        "K2@ts=1 compacted; T1's read tracking cleared on fast_commit"
+    );
 }
 
 // Spec T3 (read-only tx): read_start_ts anchors watermark while tx is active,
@@ -3165,8 +3199,14 @@ fn read_start_ts_cleared_on_fast_commit() {
 fn compact_read_only_reader_anchors_watermark() {
     let mut s = shard();
     // K1: two versions ts=1 and ts=3.
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
-    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(30),
+        timestamp: 3,
+    });
     s.dirty_keys.insert(K1);
     s.clock = 3;
 
@@ -3192,8 +3232,14 @@ fn compact_read_only_reader_anchors_watermark() {
 fn compact_after_reader_abort_reverts_to_write_watermark() {
     let mut s = shard();
     // K1: two versions ts=1 and ts=3.
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
-    s.versions.entry(K1).or_default().push(Version { value: v(30), timestamp: 3 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(30),
+        timestamp: 3,
+    });
     s.dirty_keys.insert(K1);
     s.clock = 3;
 
@@ -3215,7 +3261,10 @@ fn compact_after_reader_abort_reverts_to_write_watermark() {
 #[test]
 fn read_start_ts_cleared_on_commit() {
     let mut s = shard();
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
     s.clock = 1;
 
     // T1 reads K1 then writes K1; commit via prepare+commit.
@@ -3234,7 +3283,11 @@ fn read_start_ts_cleared_on_commit() {
     // K1 now has committed version at ts=6 (from T1's commit) plus old ts=1.
     // With watermark=100, K1@ts=1 is below watermark and shadowed by ts=6 → removed.
     let vs = s.versions.get(&K1).unwrap();
-    assert_eq!(vs.len(), 1, "K1@ts=1 compacted; T1's read tracking cleared on commit");
+    assert_eq!(
+        vs.len(),
+        1,
+        "K1@ts=1 compacted; T1's read tracking cleared on commit"
+    );
     assert_eq!(vs[0].timestamp, 6);
 }
 
@@ -3243,23 +3296,39 @@ fn read_start_ts_cleared_on_commit() {
 #[test]
 fn compact_noop_when_no_readers_and_no_writers() {
     let mut s = shard();
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
-    s.versions.entry(K1).or_default().push(Version { value: v(20), timestamp: 2 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(20),
+        timestamp: 2,
+    });
     s.dirty_keys.insert(K1);
     s.clock = 5;
 
     // No handle_read calls, no handle_update calls → watermark=0 → early return.
     s.compact_versions();
 
-    assert_eq!(s.versions.get(&K1).unwrap().len(), 2, "nothing compacted with no active txs");
+    assert_eq!(
+        s.versions.get(&K1).unwrap().len(),
+        2,
+        "nothing compacted with no active txs"
+    );
 }
 
 // Spec T3 variant: expire_reads removes stale read-only entries, allowing compaction.
 #[test]
 fn expire_reads_clears_stale_reader_allowing_compaction() {
     let mut s = shard();
-    s.versions.entry(K1).or_default().push(Version { value: v(10), timestamp: 1 });
-    s.versions.entry(K1).or_default().push(Version { value: v(20), timestamp: 3 });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(20),
+        timestamp: 3,
+    });
     s.dirty_keys.insert(K1);
     s.clock = 3;
 
@@ -3278,5 +3347,9 @@ fn expire_reads_clears_stale_reader_allowing_compaction() {
 
     // With T1 gone, watermark=100 → K1@ts=1 is below 100 and shadowed by ts=3 → removed.
     let vs = s.versions.get(&K1).unwrap();
-    assert_eq!(vs.len(), 1, "K1@ts=1 compacted after T1's read entry expired");
+    assert_eq!(
+        vs.len(),
+        1,
+        "K1@ts=1 compacted after T1's read entry expired"
+    );
 }

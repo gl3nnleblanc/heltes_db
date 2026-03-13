@@ -302,9 +302,6 @@ mod tests {
             "P2_S1 from dead port must be pruned"
         );
         // P1_S2 is still active (in write_buff), not in aborted — not affected.
-        assert!(
-            !state.aborted.contains(&P1_S2),
-            "P1_S2 was never aborted"
-        );
+        assert!(!state.aborted.contains(&P1_S2), "P1_S2 was never aborted");
     }
 }
