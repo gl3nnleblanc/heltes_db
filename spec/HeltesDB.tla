@@ -287,6 +287,25 @@ CoordAbortOnReply(id) ==
 \* shard, skipping the two-round-trip Prepare → Commit sequence.
 \* Guard conditions mirror CoordBeginCommit (all update acks received).
 \* Reuses the PREPARING phase while waiting for FastCommitReply.
+\*
+\* Implementation note — concurrent-abort protection:
+\*   The implementation's `begin_fast_commit` transitions `tx.phase → Preparing`
+\*   before returning the shard id to the caller.  This matches the spec's
+\*   `tx_state' = PREPARING` assignment here.  The implementation's `abort()` RPC
+\*   handler checks the current phase and is a no-op when phase = Preparing, because
+\*   `CoordAbortOnReply` requires `tx_state = "ACTIVE"` and cannot fire during PREPARING.
+\*   Without this guard, a concurrent client abort could set coordinator state to
+\*   ABORTED while the shard's handle_fast_commit has already installed the write,
+\*   leaving coordinator = Aborted with data permanently visible to future readers.
+\*   The `finalize_fast_commit` implementation checks for `Preparing` phase (not Active)
+\*   and transitions directly to Committed, matching CoordHandleFastCommitReply here.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   T1: ACTIVE→PREPARING (begin_fast_commit), shard ok, PREPARING→COMMITTED (finalize)
+\*   T2: ACTIVE→PREPARING (begin_fast_commit), shard abort, PREPARING→ABORTED (abort_tx)
+\*   T3: CoordAbortOnReply disabled during PREPARING — client abort RPC is no-op
+\*   T4: Internal abort (shard reply path calls abort_tx) still transitions PREPARING→ABORTED
+\*   T5: finalize_fast_commit on ACTIVE phase (begin_fast_commit never called) → NotReady
 CoordFastCommit(id) ==
     /\ tx_state[id] = "ACTIVE"
     /\ participants[id] # {}

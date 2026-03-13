@@ -685,45 +685,64 @@ fn begin_fast_commit_unknown_tx_returns_aborted() {
     assert_eq!(c.begin_fast_commit(99), BeginFastCommitResult::Aborted);
 }
 
-/// Trace: CoordHandleFastCommitReply success — tx transitions to Committed.
+/// Trace T1: CoordFastCommit — begin_fast_commit transitions phase ACTIVE → PREPARING.
+#[test]
+fn begin_fast_commit_transitions_phase_to_preparing() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Active));
+    c.begin_fast_commit(1);
+    assert_eq!(
+        c.tx_phase(1),
+        Some(TxPhase::Preparing),
+        "begin_fast_commit must transition phase to Preparing (CoordFastCommit in TLA+)"
+    );
+}
+
+/// Trace T1: CoordHandleFastCommitReply success — tx transitions PREPARING → Committed.
 #[test]
 fn finalize_fast_commit_transitions_to_committed() {
     let mut c = coord();
     c.start_tx(1);
     c.add_participant(1, 100);
+    c.begin_fast_commit(1); // phase → Preparing
     assert_eq!(c.finalize_fast_commit(1, 5), FinalizeFastCommitResult::Ok);
     assert_eq!(c.tx_phase(1), Some(TxPhase::Committed));
 }
 
-/// Trace: CoordHandleFastCommitReply — sets is_committed so Inquire replies correctly.
+/// Trace T1: CoordHandleFastCommitReply — sets is_committed so Inquire replies correctly.
 #[test]
 fn finalize_fast_commit_makes_tx_visible_to_inquire() {
     let mut c = coord();
     c.start_tx(1);
     c.add_participant(1, 100);
+    c.begin_fast_commit(1); // phase → Preparing
     c.finalize_fast_commit(1, 7);
     use crate::shard::InquiryStatus;
     assert_eq!(c.handle_inquire(1, 0), InquiryStatus::Committed(7));
 }
 
-/// Trace: CoordHandleFastCommitReply — coordinator clock advances past commit_ts (SI2).
+/// Trace T1: CoordHandleFastCommitReply — coordinator clock advances past commit_ts (SI2).
 #[test]
 fn finalize_fast_commit_advances_clock_past_commit_ts() {
     let mut c = coord();
     c.start_tx(1); // clock → 1
     c.add_participant(1, 100);
+    c.begin_fast_commit(1); // phase → Preparing
     c.finalize_fast_commit(1, 8); // commit_ts = 8; clock must → 9
     assert_eq!(c.clock, 9);
 }
 
-/// Trace: CoordHandleFastCommitReply — clock only advances, never regresses.
+/// Trace T1: CoordHandleFastCommitReply — clock only advances, never regresses.
 #[test]
 fn finalize_fast_commit_does_not_regress_clock() {
     let mut c = coord();
     c.start_tx(1); // clock → 1
     c.start_tx(2); // clock → 2
     c.add_participant(1, 100);
-    // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance to 2).
+    c.begin_fast_commit(1); // phase → Preparing
+    // commit_ts = 1 < clock = 2; clock must stay at 2 (or advance past commit_ts=2).
     c.finalize_fast_commit(1, 1);
     assert!(
         c.clock >= 2,
@@ -731,9 +750,45 @@ fn finalize_fast_commit_does_not_regress_clock() {
     );
 }
 
-/// Trace: CoordHandleFastCommitReply on wrong phase → NotReady.
+/// Trace T2: abort_tx called on PREPARING tx (internal abort path, e.g. shard returned abort)
+/// — still transitions PREPARING → Aborted so finalize returns NotReady.
 #[test]
-fn finalize_fast_commit_on_wrong_phase_returns_not_ready() {
+fn abort_tx_on_preparing_tx_sets_aborted() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    c.begin_fast_commit(1); // phase → Preparing
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Preparing));
+    c.abort_tx(1); // internal abort (e.g. shard replied Abort to FastCommit RPC)
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Aborted));
+    // finalize must return NotReady when phase is Aborted
+    assert_eq!(
+        c.finalize_fast_commit(1, 99),
+        FinalizeFastCommitResult::NotReady
+    );
+}
+
+/// Trace T5: finalize_fast_commit on ACTIVE phase (begin_fast_commit never called) → NotReady.
+/// The implementation requires PREPARING phase; calling finalize directly from ACTIVE is
+/// a misuse — the caller must call begin_fast_commit first (CoordFastCommit in TLA+).
+#[test]
+fn finalize_fast_commit_on_active_phase_returns_not_ready() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 100);
+    // Phase is Active — begin_fast_commit not called
+    assert_eq!(
+        c.finalize_fast_commit(1, 5),
+        FinalizeFastCommitResult::NotReady,
+        "finalize_fast_commit must require Preparing phase, not Active"
+    );
+    // Phase must remain Active (finalize did nothing)
+    assert_eq!(c.tx_phase(1), Some(TxPhase::Active));
+}
+
+/// Trace T5 variant: CoordHandleFastCommitReply on wrong phase (Aborted) → NotReady.
+#[test]
+fn finalize_fast_commit_on_aborted_phase_returns_not_ready() {
     let mut c = coord();
     c.start_tx(1);
     c.add_participant(1, 100);
@@ -769,24 +824,38 @@ fn path_single_shard_fast_commit() {
     assert_eq!(c.clock, 4); // advanced past commit_ts=3
 }
 
-/// SI2: sequential fast-commit txs must have distinct commit timestamps.
+/// SI2: after T1 fast-commits at ts=5, coordinator clock advances to 6.
+/// T2 therefore gets start_ts=7, which ensures any shard assigned commit_ts for T2
+/// is necessarily > T1's commit_ts, preventing duplicate commit timestamps.
 #[test]
-fn si2_fast_commit_txs_have_distinct_timestamps() {
+fn si2_fast_commit_clock_advances_prevent_timestamp_reuse() {
     let mut c = coord();
 
+    // T1 fast-commits at shard-assigned timestamp 5.
     c.start_tx(1);
     c.add_participant(1, 100);
-    c.finalize_fast_commit(1, 5); // T1 commits at 5; clock → 6
+    c.begin_fast_commit(1); // phase → Preparing
+    let r = c.finalize_fast_commit(1, 5);
+    assert_eq!(r, FinalizeFastCommitResult::Ok);
+    // Coordinator clock must now be > 5 so T2 starts at a strictly later time.
+    assert!(c.clock > 5, "clock must advance past T1 commit_ts to prevent SI2 violation");
 
-    c.start_tx(2);
+    // T2 starts after T1 committed; its start_ts > T1's commit_ts.
+    let t2_start = c.start_tx(2);
+    assert!(
+        t2_start > 5,
+        "T2 start_ts={t2_start} must be > T1 commit_ts=5"
+    );
+
+    // T2 fast-commits at shard-assigned timestamp 6 (shard clock advanced past T1's ts).
     c.add_participant(2, 100);
-    // T2's shard timestamp would be based on shard clock, but coordinator clock
-    // is 6; if the shard replies with 5 again (reuse), coordinator must not
-    // issue the same timestamp.
-    // The fast path uses the SHARD's commit_ts directly — callers must pass
-    // the actual shard-assigned timestamp. Here we simulate shard returning 6.
+    c.begin_fast_commit(2);
     c.finalize_fast_commit(2, 6);
-    assert_ne!(5u64, 6u64, "SI2: timestamps must be distinct");
+    // Both commit timestamps are distinct — SI2 holds.
+    assert_ne!(
+        c.start_ts(1), c.start_ts(2),
+        "SI2: two committed transactions must not share a start timestamp"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -314,13 +314,18 @@ impl CoordinatorState {
         }
     }
 
-    /// CoordFastCommit (phase 1): validate that this is a single-shard transaction
-    /// and return the sole participant so the caller can send a FastCommit RPC.
+    /// CoordFastCommit (phase 1): validate that this is a single-shard transaction,
+    /// transition ACTIVE → PREPARING, and return the sole participant so the caller
+    /// can send a FastCommit RPC.
     ///
-    /// Does NOT change the transaction phase (the coordinator goes ACTIVE →
-    /// COMMITTED atomically in `finalize_fast_commit` once the shard replies).
+    /// Setting PREPARING before returning matches the `CoordFastCommit` action in the
+    /// TLA+ spec (`tx_state' = "PREPARING"`).  This prevents a concurrent client
+    /// `abort()` RPC from preempting the in-flight FastCommit: `CoordAbortOnReply`
+    /// requires `tx_state = "ACTIVE"`, so the abort handler is a no-op during PREPARING.
+    /// Without this transition, a concurrent abort could set coordinator state to
+    /// ABORTED while the shard's `handle_fast_commit` has already committed the write.
     pub fn begin_fast_commit(&mut self, tx_id: TxId) -> BeginFastCommitResult {
-        let tx = match self.transactions.get(&tx_id) {
+        let tx = match self.transactions.get_mut(&tx_id) {
             Some(t) => t,
             None => return BeginFastCommitResult::Aborted,
         };
@@ -333,12 +338,19 @@ impl CoordinatorState {
             return BeginFastCommitResult::NotSingleShard;
         }
         let shard_id = *tx.participants.iter().next().unwrap();
+        // Transition ACTIVE → PREPARING before returning the shard id.
+        // Matches CoordFastCommit in the TLA+ spec: tx_state' = "PREPARING".
+        tx.phase = TxPhase::Preparing;
         BeginFastCommitResult::Ok(shard_id)
     }
 
     /// CoordHandleFastCommitReply: record the shard's assigned commit_ts and
-    /// transition ACTIVE → COMMITTED. Advances the coordinator clock to
+    /// transition PREPARING → COMMITTED. Advances the coordinator clock to
     /// `commit_ts + 1` to maintain SI2.
+    ///
+    /// Requires `Preparing` phase (not `Active`): the caller must have called
+    /// `begin_fast_commit` first, which transitions ACTIVE → PREPARING per the
+    /// TLA+ spec (`CoordFastCommit` sets `tx_state → PREPARING`).
     pub fn finalize_fast_commit(
         &mut self,
         tx_id: TxId,
@@ -348,7 +360,7 @@ impl CoordinatorState {
             Some(t) => t,
             None => return FinalizeFastCommitResult::NotReady,
         };
-        if tx.phase != TxPhase::Active {
+        if tx.phase != TxPhase::Preparing {
             return FinalizeFastCommitResult::NotReady;
         }
         tx.phase = TxPhase::Committed;

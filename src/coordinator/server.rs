@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 use crate::coordinator::{
     coord_port_from_tx_id, routing::ConsistentHashRouter, BeginCommitResult, BeginFastCommitResult,
     CollectPrepareResult, CoordinatorState, FinalizeFastCommitResult, ReadRetryPolicy,
-    SendCommitResult, TxIdGen,
+    SendCommitResult, TxIdGen, TxPhase,
 };
 use crate::proto::coordinator_service_client::CoordinatorServiceClient;
 use crate::proto::coordinator_service_server::CoordinatorService;
@@ -585,11 +585,24 @@ impl CoordinatorService for CoordinatorServer {
     }
 
     /// CoordAbortOnReply (manual): abort state and notify all participant shards.
+    ///
+    /// If the transaction is in `Preparing` phase (a fast-commit RPC is in flight),
+    /// the abort is silently ignored and `AbortReply` is still returned to the caller.
+    /// This matches the TLA+ spec: `CoordAbortOnReply` requires `tx_state = "ACTIVE"`,
+    /// so it cannot fire once the coordinator is in PREPARING.  Aborting a PREPARING
+    /// fast-commit would leave coordinator state = Aborted while the shard may already
+    /// have committed the write, creating a permanent inconsistency.
     async fn abort(
         &self,
         request: Request<TxAbortRequest>,
     ) -> Result<Response<TxAbortReply>, Status> {
-        self.abort_and_notify(request.into_inner().tx_id).await;
+        let tx_id = request.into_inner().tx_id;
+        // Do not abort a tx whose fast-commit RPC is in flight (CoordAbortOnReply
+        // requires ACTIVE; once in PREPARING the abort window is closed).
+        if self.state.lock().unwrap().tx_phase(tx_id) == Some(TxPhase::Preparing) {
+            return Ok(Response::new(TxAbortReply {}));
+        }
+        self.abort_and_notify(tx_id).await;
         Ok(Response::new(TxAbortReply {}))
     }
 
@@ -915,5 +928,55 @@ mod tests {
 
         use crate::proto::tx_read_reply::Result as TR;
         assert_eq!(reply.result, Some(TR::Abort(Abort {})));
+    }
+
+    // Trace T3: CoordAbortOnReply disabled during PREPARING — a client abort() RPC
+    // on a transaction in Preparing phase (fast-commit in-flight) must be ignored.
+    // The abort RPC returns success (idempotent) but the coordinator phase stays Preparing
+    // so that finalize_fast_commit can still transition it to Committed when the shard
+    // replies.  This prevents the race where coordinator = Aborted while shard = Committed.
+    #[tokio::test]
+    async fn abort_rpc_is_no_op_when_tx_is_preparing() {
+        use crate::coordinator::TxPhase;
+
+        let server = test_server(50052, vec![]);
+
+        let tx_id: u64 = (50052u64 << 32) | 10;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, 9999); // arbitrary shard port
+
+            // Manually drive the tx into Preparing (as begin_fast_commit would).
+            // We call begin_fast_commit via the state machine.
+            use crate::coordinator::BeginFastCommitResult;
+            let r = state.begin_fast_commit(tx_id);
+            assert!(
+                matches!(r, BeginFastCommitResult::Ok(_)),
+                "begin_fast_commit must succeed"
+            );
+        }
+
+        // Verify phase is Preparing before the abort arrives.
+        assert_eq!(
+            server.state.lock().unwrap().tx_phase(tx_id),
+            Some(TxPhase::Preparing),
+            "phase must be Preparing after begin_fast_commit"
+        );
+
+        // Client sends an abort RPC (e.g. client-side timeout while commit is in-flight).
+        let reply = server
+            .abort(Request::new(TxAbortRequest { tx_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        let _ = reply; // AbortReply has no fields; just verify it succeeds
+
+        // Phase must remain Preparing — the abort must not preempt the in-flight fast-commit.
+        assert_eq!(
+            server.state.lock().unwrap().tx_phase(tx_id),
+            Some(TxPhase::Preparing),
+            "abort RPC must not change phase from Preparing (CoordAbortOnReply requires ACTIVE)"
+        );
     }
 }
