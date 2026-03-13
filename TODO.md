@@ -10,7 +10,6 @@
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
 - **Pipeline coordinator lock acquisitions** — the coordinator `Mutex<CoordinatorState>` is acquired multiple times per transaction; batching or a lock-free structure would raise the coordinator throughput ceiling _(5 pts)_
-- **MVCC version compaction** — `versions[key]` grows without bound as a key receives repeated writes; GC old versions that predate the earliest active snapshot (min `start_ts` across all in-flight transactions) to bound both memory and binary-search work _(8 pts)_
 
 ## Durability
 

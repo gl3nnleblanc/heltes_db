@@ -180,6 +180,9 @@ WriteKeyOwnerConsistent ==
 \* Max of a non-empty set of naturals
 MaxOf(S) == CHOOSE x \in S : \A y \in S : y <= x
 
+\* Min of a non-empty set of naturals
+MinOf(S) == CHOOSE x \in S : \A y \in S : y >= x
+
 ------------------------------------------------------------------------
 (* Initial state *)
 
@@ -600,6 +603,43 @@ ShardTimeoutPrepared(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, msgs>>
 
+\* Shard compacts MVCC versions for key k, discarding versions that are
+\* permanently shadowed and can never be the result of LatestVersionBefore
+\* for any active transaction's snapshot.
+\*
+\* Watermark = min start_t across all transactions with a non-empty write buffer
+\* (conservative approximation: read-only transactions are not tracked, so the
+\* watermark may be higher than the true global minimum start_t, but the
+\* implementation only observes write-buffered transactions at the shard).
+\*
+\* A version at timestamp t for key k is removable when:
+\*   (1) t < watermark  (older than all active snapshots we track)
+\*   (2) there exists a newer committed version at t' with t < t' < watermark
+\*       (so no active snapshot would choose t over t')
+\*
+\* Equivalently: among versions with timestamp < watermark, only the one with
+\* the highest timestamp (maxBelowTs) need be kept; all older ones are redundant.
+\*
+\* Safety: this action is purely a restriction of versions[] and does not affect
+\* any coordinator or network state, so SI1-SI4 are preserved.
+ShardCompactVersions(s, k) ==
+    LET activeWriters == {id \in TxIds : write_buff[id] # {}}
+        watermark ==
+            IF activeWriters = {}
+            THEN 0  \* no active write-buffered txs: nothing safe to compact
+            ELSE MinOf({start_t[id] : id \in activeWriters})
+        vsBelowWatermark == {tv \in versions[k] : tv[2] < watermark}
+        maxBelowTs ==
+            IF vsBelowWatermark = {} THEN 0
+            ELSE MaxOf({tv[2] : tv \in vsBelowWatermark})
+        toRemove == {tv \in vsBelowWatermark : tv[2] < maxBelowTs}
+    IN
+    /\ ShardOf[k] = s
+    /\ toRemove # {}
+    /\ versions' = [versions EXCEPT ![k] = @ \ toRemove]
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, write_buff, write_key_owner, s_prepared, s_aborted, msgs>>
+
 \* Shard prunes a resolved transaction from its aborted set.
 \* Safe once the coordinator has fully finalized the transaction:
 \*   tx_state[id] = COMMITTED => coordinator sent COMMIT; no further writes for id possible.
@@ -661,6 +701,8 @@ Next ==
            \/ ShardPruneAborted(s, id)
            \/ ShardHandleFastCommit(s, id)
            \/ ShardTimeoutPrepared(s, id)
+    \/ \E s \in Shards, k \in Keys :
+           ShardCompactVersions(s, k)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :
            ShardSendInquire(s, id, prepId, k)
 

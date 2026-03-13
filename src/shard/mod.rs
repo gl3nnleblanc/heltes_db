@@ -112,6 +112,16 @@ pub struct ShardState {
     /// watermark before COMMIT arrives, so we need a separate durable signal.
     /// Cleared by `handle_commit` (returns Abort) and `handle_abort`.
     ttl_expired: HashSet<TxId>,
+    /// Records the `start_ts` supplied in the first `handle_update` call for each
+    /// transaction that currently has a write buffer on this shard.  Cleared on
+    /// commit, abort, or TTL expiry.
+    ///
+    /// Used by `compact_versions` to compute the compaction watermark:
+    ///   watermark = min(write_start_ts.values())
+    /// Any MVCC version that is strictly older than the watermark AND is shadowed
+    /// by a newer version that is also below the watermark can be discarded
+    /// (ShardCompactVersions in TLA+).
+    write_start_ts: HashMap<TxId, Timestamp>,
 }
 
 impl Default for ShardState {
@@ -134,6 +144,7 @@ impl ShardState {
             prepare_times: HashMap::new(),
             prepare_ttl: Duration::from_secs(30),
             ttl_expired: HashSet::new(),
+            write_start_ts: HashMap::new(),
         }
     }
 
@@ -298,6 +309,8 @@ impl ShardState {
         // Acquire the write lock for this key in the O(1) index.
         self.write_keys.insert(key, tx_id);
         self.clock = self.clock.max(start_ts);
+        // Record start_ts for compaction watermark (only on first write for this tx).
+        self.write_start_ts.entry(tx_id).or_insert(start_ts);
         UpdateResult::Ok
     }
 
@@ -359,7 +372,9 @@ impl ShardState {
         }
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
+        self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
+        self.compact_versions();
         CommitResult::Ok
     }
 
@@ -377,7 +392,9 @@ impl ShardState {
         }
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
+        self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
+        self.compact_versions();
     }
 
     /// Handle FAST_COMMIT(id) — single-shard optimisation.
@@ -413,8 +430,39 @@ impl ShardState {
         }
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
+        self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
+        self.compact_versions();
         FastCommitResult::Ok(commit_ts)
+    }
+
+    /// Discard MVCC versions that can never be read by any active transaction.
+    ///
+    /// Compaction watermark = min `start_ts` across all transactions that currently
+    /// have a write buffer on this shard (`write_start_ts`).  If there are no such
+    /// transactions the watermark is 0 and nothing is compacted (conservative: we
+    /// cannot observe the start_ts of read-only transactions).
+    ///
+    /// For each key, among all versions with `timestamp < watermark`, only the one
+    /// with the highest timestamp can ever be the result of `LatestVersionBefore`
+    /// for any active snapshot — all older ones are permanently shadowed and safe
+    /// to discard.
+    ///
+    /// Matches `ShardCompactVersions` in the TLA+ spec.
+    pub fn compact_versions(&mut self) {
+        let watermark = match self.write_start_ts.values().copied().min() {
+            Some(w) => w,
+            None => return, // no active write-buffered transactions; nothing to compact
+        };
+        for versions in self.versions.values_mut() {
+            // Index of the first version with timestamp >= watermark.
+            let cutoff = versions.partition_point(|v| v.timestamp < watermark);
+            // versions[..cutoff] are all below the watermark.
+            // Keep versions[cutoff-1] (latest before watermark); drain the rest.
+            if cutoff > 1 {
+                versions.drain(..cutoff - 1);
+            }
+        }
     }
 
     /// Prune entries from `aborted` that are safe to discard.
@@ -485,6 +533,7 @@ impl ShardState {
                 }
             }
             self.prepared.remove(&tx_id);
+            self.write_start_ts.remove(&tx_id);
         }
 
         if !expired.is_empty() {

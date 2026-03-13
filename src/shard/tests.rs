@@ -2676,3 +2676,160 @@ fn write_lock_released_after_expire_and_commit_rejected() {
     // T2 should now be able to acquire K1 without conflict.
     assert_eq!(s.handle_update(T2, 2, K1, v(20)), UpdateResult::Ok);
 }
+
+// -----------------------------------------------------------------------
+// compact_versions
+// -----------------------------------------------------------------------
+
+// Helper: commit N sequential single-key transactions to build up a version list.
+// Returns the shard clock after all commits.
+fn commit_versions(s: &mut ShardState, key: Key, values: &[(TxId, u64)]) {
+    for &(tx_id, val) in values {
+        let start_ts = s.clock + 1;
+        s.handle_update(tx_id, start_ts, key, Value(val));
+        s.handle_fast_commit(tx_id);
+    }
+}
+
+// Trace: 3 versions for a key, active writer on a different key establishes
+// watermark above all 3.  Compact must keep only the latest (highest ts) and
+// discard the older two.
+#[test]
+fn compact_removes_shadowed_versions_below_watermark() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    let v_count_before = s.versions[&K1].len();
+    assert_eq!(v_count_before, 3);
+
+    // Active writer with a high start_ts on K2 sets watermark above all versions.
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+
+    s.compact_versions();
+
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1, "all but latest should be compacted");
+    assert_eq!(vs[0].value, Value(30));
+}
+
+// Trace: watermark sits between two versions; the one below watermark must be
+// kept (latest before watermark), the one above must also be kept.
+#[test]
+fn compact_keeps_version_just_below_and_versions_above_watermark() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    // ts values are 1, 2, 3 after the three fast-commits.
+
+    // Active writer with start_ts=2 → watermark=2.
+    // Versions below watermark: [ts=1].  Only 1 version below, nothing to remove.
+    // Versions at/above watermark: [ts=2, ts=3] — kept.
+    s.handle_update(200, 2, K2, Value(99));
+    s.compact_versions();
+
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(
+        vs.len(),
+        3,
+        "watermark=2 protects ts=1 (latest below 2); ts=2,3 above watermark"
+    );
+}
+
+// Trace: no active write-buffered transactions → watermark is 0 → nothing compacted.
+#[test]
+fn compact_noop_when_no_active_writes() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    assert_eq!(s.versions[&K1].len(), 3);
+
+    s.compact_versions(); // nothing in write_start_ts
+
+    assert_eq!(s.versions[&K1].len(), 3);
+}
+
+// Trace: only one version exists below watermark — the "latest before watermark"
+// IS that single version, so nothing is removed.
+#[test]
+fn compact_noop_with_single_version_below_watermark() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10)]);
+    assert_eq!(s.versions[&K1].len(), 1);
+
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+    s.compact_versions();
+
+    assert_eq!(s.versions[&K1].len(), 1);
+}
+
+// Trace: compact is called automatically on commit.  After a transaction
+// commits, the version list for a heavily-written key should be trimmed.
+#[test]
+fn compact_triggered_automatically_on_commit() {
+    let mut s = shard();
+
+    // Build 3 versions for K1.
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    assert_eq!(s.versions[&K1].len(), 3);
+
+    // Start an active writer to establish the watermark, then commit it.
+    // The commit itself triggers compact_versions internally.
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+    // After this update, watermark = high_start; ts 1,2,3 are all below it.
+    // Committing tx 200 removes it from write_start_ts first, leaving no
+    // active writers → watermark=0 → no compaction on commit of 200 itself.
+    // So: start a *second* active writer that survives the commit of 200.
+    let high_start2 = s.clock + 200;
+    s.handle_update(201, high_start2, K3, Value(77));
+
+    // Now commit tx 200.  write_start_ts still has tx 201 → watermark = high_start2.
+    s.handle_fast_commit(200);
+    // compact_versions() is called inside handle_fast_commit; tx 201 survives.
+
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(
+        vs.len(),
+        1,
+        "auto-compact on commit should trim K1 to 1 version"
+    );
+    assert_eq!(vs[0].value, Value(30));
+}
+
+// Trace: reads still return correct values after compaction.
+#[test]
+fn reads_correct_after_compaction() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    // ts=1 → v10, ts=2 → v20, ts=3 → v30
+
+    let high_start = s.clock + 100;
+    s.handle_update(200, high_start, K2, Value(99));
+    s.compact_versions();
+    // Only ts=3/v30 remains for K1.
+
+    let inq = no_inquiries();
+    // A fresh reader at start_ts=high_start should see v30.
+    assert_eq!(
+        s.handle_read(201, high_start, K1, &inq),
+        ReadResult::Value(Value(30))
+    );
+}
+
+// Trace: watermark tracks the minimum across multiple active writers.
+#[test]
+fn compact_watermark_is_minimum_of_active_start_ts() {
+    let mut s = shard();
+    commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
+    // versions at ts=1,2,3
+
+    // Two active writers: start_ts=10 and start_ts=50.  Watermark should be 10.
+    s.handle_update(200, 10, K2, Value(1));
+    s.handle_update(201, 50, K3, Value(2));
+    s.compact_versions();
+
+    // Watermark=10; all 3 versions (ts=1,2,3) are < 10, but only ts=3 is the
+    // latest — ts=1 and ts=2 should be removed.
+    let vs = s.versions.get(&K1).unwrap();
+    assert_eq!(vs.len(), 1);
+    assert_eq!(vs[0].value, Value(30));
+}
