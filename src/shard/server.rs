@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
 
@@ -15,14 +15,36 @@ use crate::shard::{CommitResult, InquiryStatus, ShardState};
 pub use crate::proto::shard_service_server::ShardServiceServer;
 
 pub struct ShardServer {
-    state: Mutex<ShardState>,
+    state: Arc<Mutex<ShardState>>,
 }
 
 impl ShardServer {
+    /// Default interval between background compaction passes.
+    pub const DEFAULT_COMPACT_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Construct a shard server and spawn a background task that calls
+    /// `compact_versions()` every `compact_interval`.
+    ///
+    /// Compaction holds the shard mutex only for the duration of a single
+    /// scan-and-drain pass (typically microseconds), then releases it.
+    /// RPCs may be briefly delayed when the compactor runs, but it is no
+    /// longer on the per-commit hot path.
     pub fn new(state: ShardState) -> Self {
-        Self {
-            state: Mutex::new(state),
-        }
+        Self::with_compact_interval(state, Self::DEFAULT_COMPACT_INTERVAL)
+    }
+
+    pub fn with_compact_interval(state: ShardState, compact_interval: Duration) -> Self {
+        let state = Arc::new(Mutex::new(state));
+        let bg_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(compact_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                bg_state.lock().unwrap().compact_versions();
+            }
+        });
+        Self { state }
     }
 }
 

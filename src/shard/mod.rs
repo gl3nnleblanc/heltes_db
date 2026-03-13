@@ -374,7 +374,6 @@ impl ShardState {
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
-        self.compact_versions();
         CommitResult::Ok
     }
 
@@ -394,7 +393,6 @@ impl ShardState {
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
-        self.compact_versions();
     }
 
     /// Handle FAST_COMMIT(id) — single-shard optimisation.
@@ -432,7 +430,6 @@ impl ShardState {
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
         self.prune_aborted();
-        self.compact_versions();
         FastCommitResult::Ok(commit_ts)
     }
 

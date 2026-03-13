@@ -2761,8 +2761,9 @@ fn compact_noop_with_single_version_below_watermark() {
     assert_eq!(s.versions[&K1].len(), 1);
 }
 
-// Trace: compact is called automatically on commit.  After a transaction
-// commits, the version list for a heavily-written key should be trimmed.
+// Trace: compact_versions trims correctly when called explicitly (as the
+// background task does).  Compaction is no longer triggered automatically
+// on every commit — it runs periodically via ShardServer's background task.
 #[test]
 fn compact_triggered_automatically_on_commit() {
     let mut s = shard();
@@ -2771,27 +2772,15 @@ fn compact_triggered_automatically_on_commit() {
     commit_versions(&mut s, K1, &[(T1, 10), (T2, 20), (T3, 30)]);
     assert_eq!(s.versions[&K1].len(), 3);
 
-    // Start an active writer to establish the watermark, then commit it.
-    // The commit itself triggers compact_versions internally.
+    // Active writer establishes a high watermark; ts 1,2,3 are all below it.
     let high_start = s.clock + 100;
     s.handle_update(200, high_start, K2, Value(99));
-    // After this update, watermark = high_start; ts 1,2,3 are all below it.
-    // Committing tx 200 removes it from write_start_ts first, leaving no
-    // active writers → watermark=0 → no compaction on commit of 200 itself.
-    // So: start a *second* active writer that survives the commit of 200.
-    let high_start2 = s.clock + 200;
-    s.handle_update(201, high_start2, K3, Value(77));
 
-    // Now commit tx 200.  write_start_ts still has tx 201 → watermark = high_start2.
-    s.handle_fast_commit(200);
-    // compact_versions() is called inside handle_fast_commit; tx 201 survives.
+    // Simulate the background compaction task firing.
+    s.compact_versions();
 
     let vs = s.versions.get(&K1).unwrap();
-    assert_eq!(
-        vs.len(),
-        1,
-        "auto-compact on commit should trim K1 to 1 version"
-    );
+    assert_eq!(vs.len(), 1, "compact_versions should trim K1 to 1 version");
     assert_eq!(vs[0].value, Value(30));
 }
 
