@@ -215,8 +215,13 @@ message TxAbortReply {}
 // ── Inquire ───────────────────────────────────────────────────────────────────
 
 message InquireRequest {
-  uint64 tx_id   = 1;
-  uint64 prep_ts = 2;
+  uint64 tx_id    = 1;
+  uint64 prep_ts  = 2;
+  // Hop counter for deadlock cycle detection (see CoordHandleInquire in spec).
+  // Initialised to 0 by the originating coordinator; incremented on each
+  // cross-coordinator forwarding step.  Rejected with deadline_exceeded when
+  // hop_count >= MAX_INQUIRY_HOPS, breaking A↔B circular-inquiry cycles.
+  uint32 hop_count = 3;
 }
 
 message InquireReply {

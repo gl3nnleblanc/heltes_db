@@ -45,6 +45,7 @@ CONSTANTS
                     \*   unlikely (probability ≈ aborted_set_size / 2^32 per transaction).
     ShardOf,        \* ShardOf[k]  : Key  -> Shard
     MaxTimestamp,   \* Upper bound on timestamps (for finite model checking)
+    MaxHops,        \* Maximum cross-coordinator inquiry hop depth; guards circular-inquiry deadlock
     ABORT,          \* Sentinel: abort signal (model value, not in Values)
     NONE            \* Sentinel: absent/not-found (model value, not in Timestamps or Values)
 
@@ -123,7 +124,7 @@ PrepareMsg(id)           == [type |-> "PREPARE",          txid |-> id]
 PrepareReply(id, r)      == [type |-> "PREPARE_REPLY",    txid |-> id, result |-> r]
 CommitMsg(id, t)         == [type |-> "COMMIT",           txid |-> id, ts |-> t]
 AbortMsg(id)             == [type |-> "ABORT",            txid |-> id]
-InquireMsg(id, t, asker) == [type |-> "INQUIRE",          txid |-> id, ts |-> t,    from |-> asker]
+InquireMsg(id, t, asker, hops) == [type |-> "INQUIRE",    txid |-> id, ts |-> t,    from |-> asker, hops |-> hops]
 InquireReply(id, r, t, dest) ==
     [type |-> "INQUIRE_REPLY", txid |-> id, result |-> r, ts |-> t, to |-> dest]
 \* Fast-path: combines Prepare+Commit into a single shard-side operation.
@@ -418,7 +419,7 @@ CoordSendCommit(id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, participants,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
 
-\* Coordinator handles INQUIRE(id, t) from shard s.
+\* Coordinator handles INQUIRE(id, t, hops) from shard s.
 \*
 \* When the INQUIRE is for a transaction owned by a different coordinator, the
 \* implementation forwards the request over gRPC to that coordinator. The spec
@@ -429,6 +430,28 @@ CoordSendCommit(id) ==
 \* full address from a config-supplied table (coordinator_uris: port → URI),
 \* NOT from a hardcoded host such as [::1]. This enables multi-machine deployments.
 \* If the port is absent from coordinator_uris the RPC returns UNAVAILABLE.
+\*
+\* Deadlock guard — hop counter:
+\*   A circular inquiry deadlock arises if coordinator A calls B's inquire() for
+\*   T_B while B concurrently calls A's inquire() for T_A, and each handler waits
+\*   on the other before answering.  The A-awaits-B-awaits-A cycle cannot be broken
+\*   by shard_rpc_timeout alone because both sides are blocked inside the same
+\*   timeout window.
+\*
+\*   Fix: each InquireMsg carries a hop counter initialised to 0 by ShardSendInquire.
+\*   A handler that needs to forward the inquiry to a peer increments hops before
+\*   sending.  When hops >= MaxHops the handler is disabled; the inquiry is never
+\*   answered; CoordAbortReadDeadline fires for the blocked reader, breaking the cycle.
+\*
+\*   In the current implementation the inquire() handler answers from local state and
+\*   never forwards, so hop_count stays 0 and the guard never fires.  The guard is
+\*   defensive: it prevents an infinite loop if forwarding is ever added.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   T1: hops=0 < MaxHops → action enabled → reply sent (normal path)
+\*   T2: hops=MaxHops-1 → action enabled (last allowed hop)
+\*   T3: hops=MaxHops → action DISABLED → CoordAbortReadDeadline fires for reader
+\*   T4: A↔B mutual inquiry with hops=0 on both sides → both resolve immediately
 CoordHandleInquire(id, s) ==
     LET coord == CoordOf[id]
         m     == CHOOSE msg \in msgs :
@@ -440,6 +463,7 @@ CoordHandleInquire(id, s) ==
                  ELSE InquireReply(id, "ACTIVE",    NONE,         s)
     IN
     /\ \E msg \in msgs : msg.type = "INQUIRE" /\ msg.txid = id /\ msg.from = s
+    /\ m.hops < MaxHops
     /\ c_clock' = [c_clock EXCEPT ![coord] =
                       IF m.ts > c_clock[coord] THEN m.ts ELSE c_clock[coord]]
     /\ Send(reply)
@@ -502,7 +526,7 @@ ShardSendInquire(s, id, prepId, k) ==
              /\ r.type = "INQUIRE_REPLY"
              /\ r.txid = prepId
              /\ r.to   = s)
-    /\ Send(InquireMsg(prepId, t, s))
+    /\ Send(InquireMsg(prepId, t, s, 0))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
 

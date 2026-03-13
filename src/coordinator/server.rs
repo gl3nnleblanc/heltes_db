@@ -26,6 +26,12 @@ use crate::shard::InquiryStatus;
 
 pub use crate::proto::coordinator_service_server::CoordinatorServiceServer;
 
+/// Maximum number of cross-coordinator inquiry forwarding hops before the request
+/// is rejected with `deadline_exceeded`.  Matches `MaxHops` in the TLA+ spec.
+/// Breaking A↔B circular-inquiry cycles: when hop_count reaches this limit the
+/// handler refuses to answer, and the caller's read_loop_timeout aborts the tx.
+pub const MAX_INQUIRY_HOPS: u32 = 2;
+
 // ── Server struct ─────────────────────────────────────────────────────────────
 
 pub struct CoordinatorServer {
@@ -136,6 +142,7 @@ impl CoordinatorServer {
             .inquire(InquireRequest {
                 tx_id,
                 prep_ts: reader_start_ts,
+                hop_count: 0,
             })
             .await?
             .into_inner();
@@ -607,11 +614,20 @@ impl CoordinatorService for CoordinatorServer {
     }
 
     /// CoordHandleInquire: answer a shard's question about tx_id commit status.
+    ///
+    /// Rejects requests with `hop_count >= MAX_INQUIRY_HOPS` to break circular
+    /// inquiry deadlock cycles (see `CoordHandleInquire` in the TLA+ spec).
     async fn inquire(
         &self,
         request: Request<InquireRequest>,
     ) -> Result<Response<InquireReply>, Status> {
         let req = request.into_inner();
+        if req.hop_count >= MAX_INQUIRY_HOPS {
+            return Err(Status::deadline_exceeded(format!(
+                "inquiry hop limit exceeded (hop_count={} >= MAX_INQUIRY_HOPS={})",
+                req.hop_count, MAX_INQUIRY_HOPS,
+            )));
+        }
         let status = self
             .state
             .lock()
@@ -977,6 +993,58 @@ mod tests {
             server.state.lock().unwrap().tx_phase(tx_id),
             Some(TxPhase::Preparing),
             "abort RPC must not change phase from Preparing (CoordAbortOnReply requires ACTIVE)"
+        );
+    }
+
+    // Trace T1: hop_count=0 < MAX_INQUIRY_HOPS → CoordHandleInquire enabled → returns Ok.
+    #[tokio::test]
+    async fn inquire_with_zero_hop_count_succeeds() {
+        let server = test_server(50052, vec![]);
+        let reply = server
+            .inquire(Request::new(InquireRequest {
+                tx_id: 1,
+                prep_ts: 0,
+                hop_count: 0,
+            }))
+            .await;
+        assert!(reply.is_ok(), "hop_count=0 must succeed");
+    }
+
+    // Trace T2: hop_count=MAX-1 → last allowed hop → returns Ok.
+    #[tokio::test]
+    async fn inquire_with_hop_count_just_below_max_succeeds() {
+        let server = test_server(50052, vec![]);
+        let reply = server
+            .inquire(Request::new(InquireRequest {
+                tx_id: 1,
+                prep_ts: 0,
+                hop_count: MAX_INQUIRY_HOPS - 1,
+            }))
+            .await;
+        assert!(
+            reply.is_ok(),
+            "hop_count=MAX-1 must succeed (last allowed hop)"
+        );
+    }
+
+    // Trace T3: hop_count=MAX_INQUIRY_HOPS → CoordHandleInquire disabled →
+    // returns deadline_exceeded, which propagates as an error in the read() loop
+    // and causes CoordAbortReadDeadline to fire for the blocked reader.
+    #[tokio::test]
+    async fn inquire_with_hop_count_at_max_returns_deadline_exceeded() {
+        let server = test_server(50052, vec![]);
+        let reply = server
+            .inquire(Request::new(InquireRequest {
+                tx_id: 1,
+                prep_ts: 0,
+                hop_count: MAX_INQUIRY_HOPS,
+            }))
+            .await;
+        assert!(reply.is_err(), "hop_count=MAX must be rejected");
+        assert_eq!(
+            reply.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded,
+            "must return deadline_exceeded, not another error"
         );
     }
 }
