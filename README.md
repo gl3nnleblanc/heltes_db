@@ -1,4 +1,4 @@
-# HeltesDB
+# HeltesDB - ᠬᠡᠯᠲᠡᠰ
 
 This project was built as a test of [Claude Code](https://claude.ai/claude-code), Anthropic's CLI coding agent.
 
