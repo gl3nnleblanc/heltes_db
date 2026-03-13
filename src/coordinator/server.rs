@@ -134,10 +134,7 @@ impl CoordinatorServer {
     ) -> Result<InquiryStatus, Status> {
         let port = coord_port_from_tx_id(tx_id);
         if port == self.my_port {
-            return Ok(self
-                .state
-                .lock()
-                .handle_inquire(tx_id, reader_start_ts));
+            return Ok(self.state.lock().handle_inquire(tx_id, reader_start_ts));
         }
         let mut client = self
             .coordinator_clients
@@ -352,9 +349,7 @@ impl CoordinatorService for CoordinatorServer {
             .ok_or_else(|| Status::unavailable("no shards registered"))?
             .port() as u64;
 
-        self.state
-            .lock()
-            .add_participant(tx_id, shard_port);
+        self.state.lock().add_participant(tx_id, shard_port);
 
         let mut client = self.shard_client(shard_port)?;
         let reply = tokio::time::timeout(
@@ -428,11 +423,7 @@ impl CoordinatorService for CoordinatorServer {
                 use crate::proto::fast_commit_reply::Result as R;
                 return match reply.result {
                     Some(R::CommitTs(commit_ts)) => {
-                        match self
-                            .state
-                            .lock()
-                            .finalize_fast_commit(tx_id, commit_ts)
-                        {
+                        match self.state.lock().finalize_fast_commit(tx_id, commit_ts) {
                             FinalizeFastCommitResult::Ok => {}
                             FinalizeFastCommitResult::NotReady => {
                                 return Err(Status::internal("unexpected state after fast commit"));
@@ -524,11 +515,7 @@ impl CoordinatorService for CoordinatorServer {
         let mut prepare_aborted = false;
         for result in prepare_results {
             let (port, ts) = result?;
-            match self
-                .state
-                .lock()
-                .collect_prepare_reply(tx_id, port, ts)
-            {
+            match self.state.lock().collect_prepare_reply(tx_id, port, ts) {
                 CollectPrepareResult::Done { commit_ts: ct, .. } => commit_ts = Some(ct),
                 CollectPrepareResult::Aborted => {
                     prepare_aborted = true;
@@ -635,7 +622,9 @@ impl CoordinatorService for CoordinatorServer {
             }
             BeginFastCommitResult::NotSingleShard => {
                 // Cannot happen: we just added exactly one participant above.
-                return Err(Status::internal("unexpected NotSingleShard in write_and_commit"));
+                return Err(Status::internal(
+                    "unexpected NotSingleShard in write_and_commit",
+                ));
             }
         };
 
@@ -726,10 +715,7 @@ impl CoordinatorService for CoordinatorServer {
                 req.hop_count, MAX_INQUIRY_HOPS,
             )));
         }
-        let status = self
-            .state
-            .lock()
-            .handle_inquire(req.tx_id, req.prep_ts);
+        let status = self.state.lock().handle_inquire(req.tx_id, req.prep_ts);
         use crate::proto::inquire_reply::Status as S;
         let proto_status = match status {
             InquiryStatus::Committed(ts) => S::CommittedAt(ts),

@@ -3443,8 +3443,14 @@ fn write_and_fast_commit_on_aborted_tx_returns_abort() {
     let old_clock = s.clock;
     let r = s.handle_write_and_fast_commit(T1, 5, K1, v(1));
     assert_eq!(r, FastCommitResult::Abort);
-    assert_eq!(s.clock, old_clock, "clock must not change for pre-aborted tx");
-    assert!(s.versions.get(&K1).is_none(), "no version must be installed");
+    assert_eq!(
+        s.clock, old_clock,
+        "clock must not change for pre-aborted tx"
+    );
+    assert!(
+        s.versions.get(&K1).is_none(),
+        "no version must be installed"
+    );
 }
 
 // Trace WF1+WF2: two concurrent writes to same key — second one aborted by CommittedConflict.
