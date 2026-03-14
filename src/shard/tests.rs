@@ -431,7 +431,10 @@ fn write_buff_limit_exceeded_aborts_tx() {
     // Third distinct key exceeds limit.
     let r = s.handle_update(T1, 1, K3, v(30));
     assert_eq!(r, UpdateResult::Abort, "third write must be aborted");
-    assert!(s.aborted.contains(&T1), "T1 must be in aborted set after limit abort");
+    assert!(
+        s.aborted.contains(&T1),
+        "T1 must be in aborted set after limit abort"
+    );
 }
 
 // Trace WL3: overwriting an already-buffered key does NOT count against the limit.
@@ -446,7 +449,11 @@ fn write_buff_limit_overwrite_same_key_is_not_limited() {
         UpdateResult::Ok,
         "overwrite of already-buffered key must succeed even at limit"
     );
-    assert_eq!(s.write_buff[&T1][&K1], v(99), "K1 must hold the updated value");
+    assert_eq!(
+        s.write_buff[&T1][&K1],
+        v(99),
+        "K1 must hold the updated value"
+    );
 }
 
 // Trace WL4: pre-aborted tx returns Abort immediately; limit check is not reached.
