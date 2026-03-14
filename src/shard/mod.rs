@@ -168,6 +168,20 @@ pub struct ShardState {
     /// `expire_reads` discards it. Defaults to the same value as `prepare_ttl`.
     /// Should be set to at least the maximum expected client transaction duration.
     pub read_ttl: Duration,
+
+    /// Maximum number of distinct keys a single transaction may buffer on this shard.
+    ///
+    /// When `handle_update` is called and the write would add a new key to
+    /// `write_buff[tx_id]` but `write_buff[tx_id].len() >= max_writes_per_tx`, the
+    /// transaction is immediately aborted and `UpdateResult::Abort` is returned.
+    /// Overwriting an already-buffered key does not count against the limit.
+    ///
+    /// Prevents a misbehaving or very large transaction from exhausting shard memory
+    /// by issuing unlimited Update calls.  Set to `usize::MAX` (the default) to
+    /// disable the limit.  Configurable via `--max-writes-per-tx` in the shard binary.
+    ///
+    /// Matches `MaxWritesPerTx` in the TLA+ spec.
+    pub max_writes_per_tx: usize,
 }
 
 impl Default for ShardState {
@@ -196,6 +210,7 @@ impl ShardState {
             read_ttl: Duration::from_secs(30),
             dirty_keys: HashSet::new(),
             fast_committed: HashMap::new(),
+            max_writes_per_tx: usize::MAX,
         }
     }
 
@@ -357,6 +372,21 @@ impl ShardState {
             .map(|&owner| owner != tx_id)
             .unwrap_or(false);
         if write_buff_conflict {
+            self.aborted.insert(tx_id);
+            return UpdateResult::Abort;
+        }
+
+        // Write buffer limit: abort if this would add a NEW distinct key to
+        // write_buff[tx_id] and the current count already equals the limit.
+        // Overwriting an already-buffered key is allowed (the set cardinality
+        // doesn't grow), matching the spec's isNewKey guard.
+        let is_new_key = !self
+            .write_buff
+            .get(&tx_id)
+            .map(|wb| wb.contains_key(&key))
+            .unwrap_or(false);
+        let current_key_count = self.write_buff.get(&tx_id).map(|wb| wb.len()).unwrap_or(0);
+        if is_new_key && current_key_count >= self.max_writes_per_tx {
             self.aborted.insert(tx_id);
             return UpdateResult::Abort;
         }

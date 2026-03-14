@@ -403,6 +403,66 @@ fn update_no_conflict_when_prepared_writer_wrote_different_key() {
 }
 
 // -----------------------------------------------------------------------
+// handle_update — write buffer limit (max_writes_per_tx)
+//
+// TLA+ traces WL1–WL4 from ShardHandleUpdate spec note.
+// The fix adds a check: if this write would add a NEW distinct key to
+// write_buff and |write_buff[id]| >= max_writes_per_tx, abort the tx.
+// -----------------------------------------------------------------------
+
+// Trace WL1: writes up to the limit succeed; the (limit)th new key is accepted.
+#[test]
+fn write_buff_limit_writes_within_limit_succeed() {
+    let mut s = shard();
+    s.max_writes_per_tx = 2;
+    assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
+    assert_eq!(s.handle_update(T1, 1, K2, v(20)), UpdateResult::Ok);
+    // Both keys are buffered.
+    assert_eq!(s.write_buff[&T1].len(), 2);
+}
+
+// Trace WL2: adding a new key beyond the limit → Abort, tx marked aborted.
+#[test]
+fn write_buff_limit_exceeded_aborts_tx() {
+    let mut s = shard();
+    s.max_writes_per_tx = 2;
+    s.handle_update(T1, 1, K1, v(10));
+    s.handle_update(T1, 1, K2, v(20));
+    // Third distinct key exceeds limit.
+    let r = s.handle_update(T1, 1, K3, v(30));
+    assert_eq!(r, UpdateResult::Abort, "third write must be aborted");
+    assert!(s.aborted.contains(&T1), "T1 must be in aborted set after limit abort");
+}
+
+// Trace WL3: overwriting an already-buffered key does NOT count against the limit.
+#[test]
+fn write_buff_limit_overwrite_same_key_is_not_limited() {
+    let mut s = shard();
+    s.max_writes_per_tx = 1; // limit = 1 distinct key
+    assert_eq!(s.handle_update(T1, 1, K1, v(10)), UpdateResult::Ok);
+    // K1 is already buffered — overwrite is not a new key → limit not hit.
+    assert_eq!(
+        s.handle_update(T1, 1, K1, v(99)),
+        UpdateResult::Ok,
+        "overwrite of already-buffered key must succeed even at limit"
+    );
+    assert_eq!(s.write_buff[&T1][&K1], v(99), "K1 must hold the updated value");
+}
+
+// Trace WL4: pre-aborted tx returns Abort immediately; limit check is not reached.
+#[test]
+fn write_buff_limit_pre_aborted_tx_returns_abort_without_limit_check() {
+    let mut s = shard();
+    s.max_writes_per_tx = 1;
+    s.aborted.insert(T1);
+    // T1 is already aborted; returns Abort before even checking the limit.
+    assert_eq!(s.handle_update(T1, 1, K1, v(5)), UpdateResult::Abort);
+    // Aborted flag remains; write_buff is unaffected.
+    assert!(s.aborted.contains(&T1));
+    assert!(s.write_buff.get(&T1).is_none());
+}
+
+// -----------------------------------------------------------------------
 // handle_prepare
 // -----------------------------------------------------------------------
 

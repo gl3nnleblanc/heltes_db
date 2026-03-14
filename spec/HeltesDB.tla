@@ -46,10 +46,18 @@ CONSTANTS
     ShardOf,        \* ShardOf[k]  : Key  -> Shard
     MaxTimestamp,   \* Upper bound on timestamps (for finite model checking)
     MaxHops,        \* Maximum cross-coordinator inquiry hop depth; guards circular-inquiry deadlock
+    MaxWritesPerTx, \* Per-transaction write-buffer limit (number of distinct keys per tx per shard)
+                    \*   Prevents a misbehaving client from exhausting shard memory by issuing
+                    \*   unlimited Update calls.  When a write would add a new key to write_buff[id]
+                    \*   and |write_buff[id]| >= MaxWritesPerTx, the shard aborts the transaction.
+                    \*   Overwriting an already-buffered key does not count against the limit.
+                    \*   In the implementation this is a configurable field on ShardState
+                    \*   (--max-writes-per-tx CLI flag), defaulting to usize::MAX (unlimited).
     ABORT,          \* Sentinel: abort signal (model value, not in Values)
     NONE            \* Sentinel: absent/not-found (model value, not in Timestamps or Values)
 
 ASSUME ABORT \notin Values
+ASSUME MaxWritesPerTx >= 1
 ASSUME \A id \in TxIds    : CoordOf[id] \in Coordinators
 ASSUME \A k  \in Keys     : ShardOf[k]  \in Shards
 
@@ -648,9 +656,21 @@ ShardSendInquire(s, id, prepId, k) ==
 \* Write-write conflict check (corrected from proof typo):
 \*   Abort if ∃ committed version of k with ts >= start_t(id)   [committed conflict]
 \*   Abort if ∃ prepared tx that wrote k with prep_t >= start_t(id)  [prepared conflict]
+\*
+\* Write buffer limit (MaxWritesPerTx):
+\*   Abort if this write would add a NEW distinct key to write_buff[id] AND
+\*   |write_buff[id]| >= MaxWritesPerTx.  Overwriting an already-buffered key
+\*   does not count — only new keys consume the quota.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   WL1: |write_buff[id]| < MaxWritesPerTx, new key → buffer succeeds
+\*   WL2: |write_buff[id]| = MaxWritesPerTx, new key → LimitExceeded abort
+\*   WL3: key already in write_buff[id], |write_buff| = MaxWritesPerTx → overwrite succeeds (no limit hit)
+\*   WL4: pre-aborted tx → Abort returned immediately (limit not even checked)
 ShardHandleUpdate(s, id, k, v) ==
     LET t == start_t[id]
         m == UpdateKeyMsg(id, t, k, v)
+        isNewKey == ~(\E kv \in write_buff[id] : kv[1] = k)
     IN
     /\ m \in msgs
     /\ ShardOf[k] = s
@@ -666,15 +686,21 @@ ShardHandleUpdate(s, id, k, v) ==
                  /\ Send(UpdateKeyReply(id, k, ABORT))
                  /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
                                 tx_state, s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, s_readers>>
-            ELSE \* No conflict — buffer the write (overwrite any prior write to k by id)
-                 /\ write_buff' = [write_buff EXCEPT ![id] =
-                        (@ \ {kv \in @ : kv[1] = k}) \cup {<<k, v>>}]
-                 /\ write_key_owner' = [write_key_owner EXCEPT ![k] = id]
-                 /\ s_clock' = [s_clock EXCEPT ![s] =
-                        IF t > s_clock[s] THEN t ELSE s_clock[s]]
-                 /\ Send(UpdateKeyReply(id, k, "OK"))
-                 /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
-                                tx_state, versions, s_prepared, s_aborted, dirty_keys, s_readers>>
+            ELSE IF isNewKey /\ Cardinality(write_buff[id]) >= MaxWritesPerTx
+                 THEN \* Write buffer limit exceeded — abort to prevent unbounded memory growth
+                      /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
+                      /\ Send(UpdateKeyReply(id, k, ABORT))
+                      /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                                     tx_state, s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, s_readers>>
+                 ELSE \* No conflict, within limit — buffer the write (overwrite any prior write to k by id)
+                      /\ write_buff' = [write_buff EXCEPT ![id] =
+                             (@ \ {kv \in @ : kv[1] = k}) \cup {<<k, v>>}]
+                      /\ write_key_owner' = [write_key_owner EXCEPT ![k] = id]
+                      /\ s_clock' = [s_clock EXCEPT ![s] =
+                             IF t > s_clock[s] THEN t ELSE s_clock[s]]
+                      /\ Send(UpdateKeyReply(id, k, "OK"))
+                      /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                                     tx_state, versions, s_prepared, s_aborted, dirty_keys, s_readers>>
 
 \* Shard handles PREPARE(id) — assign a prepare timestamp and record it.
 \* Guard: not already prepared (message set is persistent; prevent re-firing).
