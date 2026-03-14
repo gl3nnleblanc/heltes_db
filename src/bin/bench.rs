@@ -17,12 +17,23 @@
 //!   --updates-per-tx <N>        writes per write transaction (default: 1)
 //!   --profile <name>            preset: uniform-write | hot-key | read-heavy | multi-shard
 //!   --out <path>                write JSON to file instead of stdout
+//!   --save-baseline <path>      run benchmark and save result as a new baseline file
+//!   --check-baseline <path>     run benchmark and fail (exit 1) if it regresses vs baseline
 
-use heltes_db::bench::{run_benchmark, WorkloadConfig};
+use heltes_db::bench::{run_benchmark, BenchBaseline, WorkloadConfig};
 
-fn parse_args() -> Result<(WorkloadConfig, Option<String>), Box<dyn std::error::Error>> {
+struct Args {
+    config: WorkloadConfig,
+    out_path: Option<String>,
+    save_baseline: Option<String>,
+    check_baseline: Option<String>,
+}
+
+fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut config = WorkloadConfig::default();
     let mut out_path: Option<String> = None;
+    let mut save_baseline: Option<String> = None;
+    let mut check_baseline: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -92,6 +103,12 @@ fn parse_args() -> Result<(WorkloadConfig, Option<String>), Box<dyn std::error::
             "--out" => {
                 out_path = Some(args.next().ok_or("--out requires a value")?);
             }
+            "--save-baseline" => {
+                save_baseline = Some(args.next().ok_or("--save-baseline requires a value")?);
+            }
+            "--check-baseline" => {
+                check_baseline = Some(args.next().ok_or("--check-baseline requires a value")?);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -99,7 +116,12 @@ fn parse_args() -> Result<(WorkloadConfig, Option<String>), Box<dyn std::error::
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
-    Ok((config, out_path))
+    Ok(Args {
+        config,
+        out_path,
+        save_baseline,
+        check_baseline,
+    })
 }
 
 fn print_usage() {
@@ -122,17 +144,48 @@ fn print_usage() {
         "  --profile <name>            preset: uniform-write | hot-key | read-heavy | multi-shard"
     );
     eprintln!("  --out <path>                write JSON to file (default: stdout)");
+    eprintln!("  --save-baseline <path>      save current result as baseline for future checks");
+    eprintln!("  --check-baseline <path>     fail (exit 1) if result regresses vs stored baseline");
+    eprintln!();
+    eprintln!("Thresholds (when --check-baseline is used):");
+    eprintln!("  Fail if throughput drops more than 10 % below baseline.");
+    eprintln!("  Fail if p99 latency rises more than 20 % above baseline.");
 }
 
 #[tokio::main]
 async fn main() {
-    let (config, out_path) = match parse_args() {
+    let Args {
+        config,
+        out_path,
+        save_baseline,
+        check_baseline,
+    } = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {e}");
             print_usage();
             std::process::exit(1);
         }
+    };
+
+    // Load and validate the baseline file before running so a bad path fails fast.
+    let baseline = match &check_baseline {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("Error reading baseline file {path}: {e}");
+                std::process::exit(1);
+            });
+            let b = BenchBaseline::from_json(&text).unwrap_or_else(|e| {
+                eprintln!("Error parsing baseline file {path}: {e}");
+                std::process::exit(1);
+            });
+            eprintln!(
+                "Baseline: {:.0} tx/s  p99={} µs",
+                b.throughput_tps, b.latency_p99_us
+            );
+            Some(b)
+        }
+        None => None,
     };
 
     eprintln!(
@@ -178,5 +231,42 @@ async fn main() {
             eprintln!("JSON written to {path}");
         }
         None => println!("{json}"),
+    }
+
+    // ── --save-baseline ───────────────────────────────────────────────────────
+    if let Some(ref path) = save_baseline {
+        let b = BenchBaseline::from(&result);
+        let text = b.to_json();
+        std::fs::write(path, &text).unwrap_or_else(|e| {
+            eprintln!("Error writing baseline {path}: {e}");
+            std::process::exit(1);
+        });
+        eprintln!("Baseline saved to {path}");
+    }
+
+    // ── --check-baseline ──────────────────────────────────────────────────────
+    if let Some(b) = baseline {
+        // 10 % throughput drop  /  20 % p99 rise are the failure thresholds.
+        let reg = b.check(&result, 0.10, 0.20);
+        eprintln!(
+            "Regression check: tps_ratio={:.3}  p99_ratio={:.3}",
+            reg.tps_ratio, reg.p99_ratio
+        );
+        if reg.tps_regressed {
+            eprintln!(
+                "REGRESSION: throughput {:.0} tx/s is more than 10% below baseline {:.0} tx/s",
+                result.throughput_tps, b.throughput_tps
+            );
+        }
+        if reg.p99_regressed {
+            eprintln!(
+                "REGRESSION: p99 {} µs is more than 20% above baseline {} µs",
+                result.latency_p99_us, b.latency_p99_us
+            );
+        }
+        if reg.any_regression() {
+            std::process::exit(1);
+        }
+        eprintln!("No regression detected.");
     }
 }

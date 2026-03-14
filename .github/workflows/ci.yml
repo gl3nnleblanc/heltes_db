@@ -40,3 +40,18 @@ jobs:
 
       - name: Clippy (deny warnings)
         run: cargo clippy -- -D warnings
+
+      - name: Throughput regression gate
+        # Run a fixed workload and fail if throughput drops >10% or p99 rises >20%
+        # vs bench_baseline.json.  Catches catastrophic regressions (e.g. a change
+        # that serialises all shard operations or breaks the fast-commit path).
+        #
+        # To update the baseline after a legitimate performance change:
+        #   cargo run --release --bin bench -- \
+        #     --shards 2 --workers 8 --duration 5 --warmup 2 \
+        #     --save-baseline bench_baseline.json
+        # then commit the updated bench_baseline.json.
+        run: >
+          cargo run --release --bin bench --
+          --shards 2 --workers 8 --duration 5 --warmup 2
+          --check-baseline bench_baseline.json

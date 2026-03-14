@@ -1,0 +1,4 @@
+{
+  "throughput_tps": 1000.0,
+  "latency_p99_us": 100000
+}

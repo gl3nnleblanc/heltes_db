@@ -185,6 +185,129 @@ impl BenchResult {
     }
 }
 
+// ── Baseline & regression check ───────────────────────────────────────────────
+
+/// Minimum acceptable performance stored in `bench_baseline.json`.
+///
+/// The baseline is extracted from the `results` block of a full `BenchResult`
+/// JSON, so a result file produced with `--out` can be used directly as a
+/// baseline with `--check-baseline`.
+#[derive(Debug, Clone)]
+pub struct BenchBaseline {
+    /// Minimum acceptable throughput (tx/s).
+    pub throughput_tps: f64,
+    /// Maximum acceptable p99 latency (µs).
+    pub latency_p99_us: u64,
+}
+
+/// Outcome of a regression check.
+#[derive(Debug)]
+pub struct RegressionResult {
+    /// current_tps / baseline_tps  (< 1.0 means slower).
+    pub tps_ratio: f64,
+    /// current_p99 / baseline_p99  (> 1.0 means higher latency).
+    pub p99_ratio: f64,
+    /// True when tps_ratio < (1.0 - tps_threshold).
+    pub tps_regressed: bool,
+    /// True when p99_ratio > (1.0 + p99_threshold).
+    pub p99_regressed: bool,
+}
+
+impl RegressionResult {
+    /// True if any metric regressed.
+    pub fn any_regression(&self) -> bool {
+        self.tps_regressed || self.p99_regressed
+    }
+}
+
+impl BenchBaseline {
+    /// Parse from the JSON format produced by `BenchResult::to_json()`.
+    ///
+    /// Accepts either the full result envelope (with a `"results"` key) or a
+    /// flat JSON object containing `throughput_tps` and `latency_p99_us` directly.
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        let tps = Self::extract_f64(s, "throughput_tps")
+            .ok_or_else(|| "missing \"throughput_tps\" in baseline JSON".to_string())?;
+        let p99 = Self::extract_u64(s, "latency_p99_us")
+            .ok_or_else(|| "missing \"latency_p99_us\" in baseline JSON".to_string())?;
+        Ok(BenchBaseline {
+            throughput_tps: tps,
+            latency_p99_us: p99,
+        })
+    }
+
+    /// Serialise to a minimal JSON string suitable for committing as a baseline.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\n  \"throughput_tps\": {:.1},\n  \"latency_p99_us\": {}\n}}",
+            self.throughput_tps, self.latency_p99_us
+        )
+    }
+
+    /// Check `result` against this baseline.
+    ///
+    /// `tps_drop_threshold` is the fractional drop that counts as a regression
+    /// (e.g. `0.10` means "fail if tps falls below 90 % of baseline").
+    ///
+    /// `p99_rise_threshold` is the fractional rise that counts as a regression
+    /// (e.g. `0.20` means "fail if p99 exceeds 120 % of baseline").
+    pub fn check(
+        &self,
+        result: &BenchResult,
+        tps_drop_threshold: f64,
+        p99_rise_threshold: f64,
+    ) -> RegressionResult {
+        let tps_ratio = if self.throughput_tps > 0.0 {
+            result.throughput_tps / self.throughput_tps
+        } else {
+            1.0
+        };
+        let p99_ratio = if self.latency_p99_us > 0 {
+            result.latency_p99_us as f64 / self.latency_p99_us as f64
+        } else {
+            1.0
+        };
+        RegressionResult {
+            tps_ratio,
+            p99_ratio,
+            tps_regressed: tps_ratio < (1.0 - tps_drop_threshold),
+            p99_regressed: p99_ratio > (1.0 + p99_rise_threshold),
+        }
+    }
+
+    // ── JSON extraction helpers ───────────────────────────────────────────────
+
+    fn extract_f64(json: &str, key: &str) -> Option<f64> {
+        let needle = format!("\"{}\":", key);
+        let start = json.find(&needle)? + needle.len();
+        let rest = json[start..].trim_start();
+        // Consume an optional leading minus and digits/dot/exponent.
+        let end = rest
+            .find(|c: char| !matches!(c, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
+            .unwrap_or(rest.len());
+        rest[..end].trim().parse().ok()
+    }
+
+    fn extract_u64(json: &str, key: &str) -> Option<u64> {
+        let needle = format!("\"{}\":", key);
+        let start = json.find(&needle)? + needle.len();
+        let rest = json[start..].trim_start();
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].trim().parse().ok()
+    }
+}
+
+impl From<&BenchResult> for BenchBaseline {
+    fn from(r: &BenchResult) -> Self {
+        BenchBaseline {
+            throughput_tps: r.throughput_tps,
+            latency_p99_us: r.latency_p99_us,
+        }
+    }
+}
+
 // ── Zipf sampler ──────────────────────────────────────────────────────────────
 
 /// Zipf distribution sampler using the CDF-inversion method.
@@ -646,5 +769,170 @@ pub async fn run_benchmark(config: WorkloadConfig) -> BenchResult {
         total_committed,
         total_aborted,
         total_errors,
+    }
+}
+
+// ── BenchBaseline tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    fn fake_result(tps: f64, p99: u64) -> BenchResult {
+        BenchResult {
+            config: WorkloadConfig::default(),
+            throughput_tps: tps,
+            latency_p50_us: 0,
+            latency_p95_us: 0,
+            latency_p99_us: p99,
+            abort_rate: 0.0,
+            total_committed: 0,
+            total_aborted: 0,
+            total_errors: 0,
+        }
+    }
+
+    fn baseline(tps: f64, p99: u64) -> BenchBaseline {
+        BenchBaseline {
+            throughput_tps: tps,
+            latency_p99_us: p99,
+        }
+    }
+
+    // RT1: parse minimal JSON → fields extracted correctly.
+    #[test]
+    fn parse_minimal_json() {
+        let json = r#"{"throughput_tps": 12345.6, "latency_p99_us": 9876}"#;
+        let b = BenchBaseline::from_json(json).unwrap();
+        assert!((b.throughput_tps - 12345.6).abs() < 0.1);
+        assert_eq!(b.latency_p99_us, 9876);
+    }
+
+    // RT2: parse full BenchResult JSON (nested under "results") → fields found.
+    #[test]
+    fn parse_full_bench_result_json() {
+        let result = fake_result(5000.0, 3000);
+        let json = result.to_json();
+        let b = BenchBaseline::from_json(&json).unwrap();
+        assert!((b.throughput_tps - 5000.0).abs() < 1.0);
+        assert_eq!(b.latency_p99_us, 3000);
+    }
+
+    // RT3: throughput drops exactly 10% → NOT a regression (strict inequality).
+    #[test]
+    fn tps_drop_exactly_at_threshold_is_not_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(9000.0, 1000); // exactly 10% drop
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(
+            !reg.tps_regressed,
+            "exactly 10% drop is on the boundary — not a regression"
+        );
+        assert!((reg.tps_ratio - 0.9).abs() < 1e-9);
+    }
+
+    // RT4: throughput drops more than 10% → regression.
+    #[test]
+    fn tps_drop_over_threshold_is_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(8999.0, 1000); // 10.01% drop
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(reg.tps_regressed, "drop > 10% must be flagged");
+    }
+
+    // RT5: throughput drops < 10% → no regression.
+    #[test]
+    fn tps_drop_within_threshold_no_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(9500.0, 1000); // 5% drop — fine
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(!reg.tps_regressed);
+    }
+
+    // RT6: throughput improves → no regression.
+    #[test]
+    fn tps_improvement_is_not_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(15000.0, 1000);
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(!reg.tps_regressed);
+        assert!(reg.tps_ratio > 1.0);
+    }
+
+    // RT7: p99 rises exactly 20% → NOT a regression (strict inequality).
+    #[test]
+    fn p99_rise_exactly_at_threshold_is_not_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(10000.0, 1200); // exactly 20% higher
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(
+            !reg.p99_regressed,
+            "exactly 20% rise is on the boundary — not a regression"
+        );
+        assert!((reg.p99_ratio - 1.2).abs() < 1e-9);
+    }
+
+    // RT8: p99 rises more than 20% → regression.
+    #[test]
+    fn p99_rise_over_threshold_is_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(10000.0, 1201); // 20.1% higher
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(reg.p99_regressed, "p99 rise > 20% must be flagged");
+    }
+
+    // RT9: p99 rises < 20% → no regression.
+    #[test]
+    fn p99_rise_within_threshold_no_regression() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(10000.0, 1100); // 10% higher — fine
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(!reg.p99_regressed);
+    }
+
+    // RT10: both tps and p99 regress → any_regression = true.
+    #[test]
+    fn any_regression_true_when_both_regress() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(8000.0, 1300);
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(reg.tps_regressed);
+        assert!(reg.p99_regressed);
+        assert!(reg.any_regression());
+    }
+
+    // RT11: neither regresses → any_regression = false.
+    #[test]
+    fn any_regression_false_when_both_ok() {
+        let b = baseline(10000.0, 1000);
+        let r = fake_result(10000.0, 1000);
+        let reg = b.check(&r, 0.10, 0.20);
+        assert!(!reg.any_regression());
+    }
+
+    // RT12: missing field → parse error.
+    #[test]
+    fn parse_error_on_missing_tps_field() {
+        let json = r#"{"latency_p99_us": 1000}"#;
+        assert!(BenchBaseline::from_json(json).is_err());
+    }
+
+    // RT13: to_json / from_json round-trip.
+    #[test]
+    fn json_round_trip() {
+        let b = baseline(32000.5, 2500);
+        let json = b.to_json();
+        let b2 = BenchBaseline::from_json(&json).unwrap();
+        assert!((b2.throughput_tps - b.throughput_tps).abs() < 0.1);
+        assert_eq!(b2.latency_p99_us, b.latency_p99_us);
+    }
+
+    // RT14: From<&BenchResult> extracts the right fields.
+    #[test]
+    fn from_bench_result_extracts_fields() {
+        let r = fake_result(7777.0, 4321);
+        let b = BenchBaseline::from(&r);
+        assert!((b.throughput_tps - 7777.0).abs() < 0.1);
+        assert_eq!(b.latency_p99_us, 4321);
     }
 }

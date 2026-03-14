@@ -17,10 +17,6 @@
 - **Elle/Jepsen fault-injection correctness testing** — the TLA+ spec and unit tests verify correctness under sequential execution; Elle (Kyle Kingsbury's checker) can verify SI and serializability anomaly-freedom under real faults — process kills, network partitions, clock skew — against a running cluster; passing Elle's SI checker would be the strongest public proof of correctness achievable and puts this in the same tier as production databases that have undergone Jepsen testing _(13 pts)_
 - **Mechanized liveness proof with TLAPS** — the current TLA+ spec enforces safety invariants only; TLC cannot check liveness at scale; use TLAPS (the TLA+ Proof System) to write a mechanized proof that committed transactions eventually become durable and reads eventually terminate under fair scheduling; almost no open-source distributed systems carry a machine-checked liveness proof _(13 pts)_
 
-## Benchmarking & Validation ← CURRENT SPRINT — work only from this section until fully drained
-
-- **CI throughput regression gate** — run a fixed workload in CI on every PR and fail if throughput drops >10% or p99 latency increases >20% relative to the committed baseline; this prevents accidentally shipping regressions under the banner of "improvements" _(5 pts)_
-
 ## Performance
 
 - **Replace per-shard `Mutex<ShardState>` with fine-grained concurrency** — current design serializes all shard operations; could use per-key locking or an async actor model to allow genuine parallelism _(8 pts)_
