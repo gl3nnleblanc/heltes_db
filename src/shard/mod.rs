@@ -127,6 +127,20 @@ pub struct ShardState {
     /// (One of two inputs — see also `read_start_ts`.)
     write_start_ts: HashMap<TxId, Timestamp>,
 
+    /// Commit timestamps for transactions that completed via `handle_fast_commit`.
+    ///
+    /// Enables idempotent retries: if a coordinator crash+replay causes a second
+    /// `FAST_COMMIT` RPC for an already-committed transaction, `handle_fast_commit`
+    /// returns the stored commit_ts without advancing the shard clock.
+    ///
+    /// Without this map the original code advanced `s_clock` unconditionally before
+    /// checking `write_buff`, burning a second timestamp and returning a different
+    /// (wrong) commit_ts on every retry.
+    ///
+    /// Entries are pruned by `prune_aborted` using the same per-port seq-watermark
+    /// as `aborted`, so the map does not grow without bound.
+    pub fast_committed: HashMap<TxId, Timestamp>,
+
     /// Records the `start_ts` of every transaction that has issued a read to
     /// this shard and has not yet committed, aborted, or been TTL-expired.
     /// Populated by `handle_read`. Cleared by `handle_commit`, `handle_abort`,
@@ -181,6 +195,7 @@ impl ShardState {
             read_times: HashMap::new(),
             read_ttl: Duration::from_secs(30),
             dirty_keys: HashSet::new(),
+            fast_committed: HashMap::new(),
         }
     }
 
@@ -449,36 +464,63 @@ impl ShardState {
     /// clears the write buffer, advances the shard clock, and calls
     /// `prune_aborted`. This replaces the separate PREPARE + COMMIT round trip.
     ///
-    /// Returns `Abort` if the transaction is already aborted at this shard;
-    /// `Ok(commit_ts)` otherwise.
+    /// Returns:
+    /// - `Abort` if the transaction is already aborted at this shard.
+    /// - `Ok(commit_ts)` on success, storing the commit_ts in `fast_committed`.
+    /// - `Ok(commit_ts)` (same stored value) on an idempotent retry where
+    ///   `write_buff` is empty but `fast_committed` has an entry — the clock is
+    ///   NOT advanced a second time.
+    /// - `Abort` if `write_buff` is absent and no `fast_committed` entry exists
+    ///   (the transaction never buffered any writes on this shard).
+    ///
+    /// The bug this fixes: the previous code computed `commit_ts = clock + 1` and
+    /// advanced `clock` unconditionally before checking `write_buff`. On a retry
+    /// (coordinator crash+replay), that burned a second timestamp and returned a
+    /// different (wrong) `commit_ts`, breaking idempotency.
+    ///
+    /// Matches `ShardHandleFastCommit` in the TLA+ spec: the spec's
+    /// `write_buff[id] ≠ {}` guard prevents re-firing; the implementation enforces
+    /// the same invariant by checking `write_buff` before advancing `s_clock`.
     pub fn handle_fast_commit(&mut self, tx_id: TxId) -> FastCommitResult {
         if self.aborted.contains(&tx_id) {
             return FastCommitResult::Abort;
         }
+        // Idempotent retry: already committed via this fast path.
+        if let Some(&ct) = self.fast_committed.get(&tx_id) {
+            return FastCommitResult::Ok(ct);
+        }
+        // Check write_buff BEFORE advancing the clock (spec: write_buff[id] ≠ {}).
+        // If there is nothing to commit and we haven't recorded a prior commit,
+        // treat as Abort (transaction was never started on this shard).
+        let writes = match self.write_buff.remove(&tx_id) {
+            Some(w) => w,
+            None => return FastCommitResult::Abort,
+        };
+        // Clock advances only when we have real work to commit.
         let commit_ts = self.clock + 1;
         self.clock = commit_ts;
-        if let Some(writes) = self.write_buff.remove(&tx_id) {
-            for (key, value) in writes {
-                self.write_keys.remove(&key);
-                let vs = self.versions.entry(key).or_default();
-                // Idempotent + sorted insertion via binary search (same as handle_commit).
-                if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
-                    vs.insert(
-                        pos,
-                        Version {
-                            value,
-                            timestamp: commit_ts,
-                        },
-                    );
-                }
-                self.dirty_keys.insert(key);
+        for (key, value) in writes {
+            self.write_keys.remove(&key);
+            let vs = self.versions.entry(key).or_default();
+            // Idempotent + sorted insertion via binary search (same as handle_commit).
+            if let Err(pos) = vs.binary_search_by_key(&commit_ts, |v| v.timestamp) {
+                vs.insert(
+                    pos,
+                    Version {
+                        value,
+                        timestamp: commit_ts,
+                    },
+                );
             }
+            self.dirty_keys.insert(key);
         }
         self.prepared.remove(&tx_id);
         self.prepare_times.remove(&tx_id);
         self.write_start_ts.remove(&tx_id);
         self.read_start_ts.remove(&tx_id);
         self.read_times.remove(&tx_id);
+        // Record the commit_ts for idempotent retries.
+        self.fast_committed.insert(tx_id, commit_ts);
         self.prune_aborted();
         FastCommitResult::Ok(commit_ts)
     }
@@ -631,6 +673,18 @@ impl ShardState {
         // In both cases the coordinator at `port` has progressed past `seq` and
         // will never send new messages for this tx_id.
         self.aborted.retain(|&tx_id| {
+            let port = (tx_id >> 32) as u32;
+            let seq = tx_id as u32;
+            match min_active_seq.get(&port) {
+                Some(&min) => seq >= min,
+                None => false,
+            }
+        });
+        // Prune fast_committed entries using the same watermark.  Once the
+        // coordinator has no in-flight tx with a lower seq from the same port,
+        // it will never send another FAST_COMMIT for that tx_id, so the stored
+        // commit_ts is no longer needed for idempotent retries.
+        self.fast_committed.retain(|&tx_id, _| {
             let port = (tx_id >> 32) as u32;
             let seq = tx_id as u32;
             match min_active_seq.get(&port) {

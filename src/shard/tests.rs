@@ -2251,6 +2251,106 @@ fn handle_fast_commit_does_not_disturb_other_tx_write_buff() {
 }
 
 // -----------------------------------------------------------------------
+// handle_fast_commit — idempotency fix
+//
+// Traces FC-I and FC-E from ShardHandleFastCommit spec note.
+// The fix: check write_buff BEFORE advancing s_clock, and store commit_ts
+// in fast_committed for idempotent retries.
+// -----------------------------------------------------------------------
+
+// Trace FC-I: second call returns the same commit_ts without advancing the clock.
+#[test]
+fn handle_fast_commit_idempotent_returns_same_commit_ts() {
+    let mut s = shard();
+    // Anchor: a tx with the same coordinator port (port bits = T1's port bits = 0)
+    // but a LOWER seq (50 < 101 = T1's seq), so its presence in write_buff keeps
+    // min_active_seq[0] = 50, which is <= T1's seq=101, preventing prune_aborted()
+    // from discarding T1's fast_committed entry after the first commit.
+    const ANCHOR: TxId = 50; // port=0, seq=50
+    s.write_buff.entry(ANCHOR).or_default().insert(K2, v(0));
+
+    s.handle_update(T1, 1, K1, v(42));
+    let FastCommitResult::Ok(ct1) = s.handle_fast_commit(T1) else {
+        panic!("first call must succeed");
+    };
+    // Second call — write_buff is now empty but fast_committed has the entry.
+    let FastCommitResult::Ok(ct2) = s.handle_fast_commit(T1) else {
+        panic!("idempotent retry must return Ok");
+    };
+    assert_eq!(ct1, ct2, "idempotent retry must return the same commit_ts");
+}
+
+// Trace FC-I: idempotent retry must NOT advance the shard clock a second time.
+#[test]
+fn handle_fast_commit_idempotent_does_not_advance_clock() {
+    let mut s = shard();
+    // Same anchor as above: lower-seq tx keeps fast_committed entry alive.
+    const ANCHOR: TxId = 50; // port=0, seq=50
+    s.write_buff.entry(ANCHOR).or_default().insert(K2, v(0));
+
+    s.handle_update(T1, 1, K1, v(42));
+    s.handle_fast_commit(T1);
+    let clock_after_first = s.clock;
+    s.handle_fast_commit(T1);
+    assert_eq!(
+        s.clock, clock_after_first,
+        "idempotent retry must not burn a second timestamp"
+    );
+}
+
+// Trace FC-E: write_buff absent and not in fast_committed → Abort.
+// This guards against a spurious fast_commit for a tx that never buffered writes here.
+#[test]
+fn handle_fast_commit_empty_write_buff_never_committed_returns_abort() {
+    let mut s = shard();
+    // T1 never called handle_update on this shard — no write_buff, not fast_committed.
+    let r = s.handle_fast_commit(T1);
+    assert_eq!(
+        r,
+        FastCommitResult::Abort,
+        "tx with no write_buff and not fast_committed must abort"
+    );
+}
+
+// Trace FC-I: fast_committed entry is pruned by prune_aborted once the
+// coordinator has no more in-flight txs from the same port.
+#[test]
+fn handle_fast_commit_fast_committed_pruned_when_no_inflight() {
+    // port=1, tx_a has seq=2 (higher), tx_b has seq=1 (lower).
+    // With tx_b (seq=1) in write_buff, min_active_seq[1] = 1.
+    // tx_a (seq=2): 2 >= 1 → retained.
+    // After tx_b removed: no in-flight → None → tx_a seq=2 not retained → pruned.
+    let port: u64 = 1;
+    let tx_a: TxId = (port << 32) | 2; // seq=2 (the one we fast-commit)
+    let tx_b: TxId = (port << 32) | 1; // seq=1 (lower seq; anchors the watermark)
+
+    let mut s = shard();
+    // Buffer a write for tx_b (lower seq) so it anchors min_active_seq[1] = 1.
+    s.write_buff.entry(tx_b).or_default().insert(K2, v(99));
+
+    // Fast-commit tx_a.
+    s.handle_update(tx_a, 1, K1, v(42));
+    let FastCommitResult::Ok(_) = s.handle_fast_commit(tx_a) else {
+        panic!("fast commit must succeed");
+    };
+    // tx_a (seq=2) is in fast_committed; tx_b (seq=1) is still in write_buff.
+    // min_active_seq[1] = 1. tx_a seq=2 >= 1 → retained.
+    s.prune_aborted();
+    assert!(
+        s.fast_committed.contains_key(&tx_a),
+        "tx_a fast_committed entry must NOT be pruned while tx_b (lower seq) is in-flight"
+    );
+
+    // Remove tx_b from write_buff — no more in-flight txs from this port.
+    s.write_buff.remove(&tx_b);
+    s.prune_aborted();
+    assert!(
+        !s.fast_committed.contains_key(&tx_a),
+        "tx_a fast_committed entry must be pruned once no in-flight tx remains for this port"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Binary-search MVCC version lookup
 //
 // Traces derived from TLC enumeration of LatestVersionBefore(k, t):

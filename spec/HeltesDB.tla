@@ -695,19 +695,39 @@ ShardHandlePrepare(s, id) ==
 \* Shard handles FAST_COMMIT(id) — atomically prepare + commit for single-shard txns.
 \* Combines ShardHandlePrepare + ShardHandleCommit in one step.
 \* Guard write_buff[id] ≠ {} prevents re-firing after the first successful commit.
+\*
+\* Implementation note — idempotent retry:
+\*   The guard write_buff[id] ≠ {} prevents this spec action from firing twice,
+\*   because the spec assumes processes do not fail (no coordinator crash+replay).
+\*   The Rust implementation adds a fast_committed: HashMap<TxId, Timestamp> field
+\*   to ShardState.  handle_fast_commit checks write_buff BEFORE advancing the clock:
+\*     1. If write_buff has entry: advance clock, install versions, store commit_ts in
+\*        fast_committed, return Ok(commit_ts).
+\*     2. If write_buff absent AND fast_committed has entry: idempotent — return stored
+\*        commit_ts WITHOUT advancing the clock (the bug was doing this advance anyway).
+\*     3. If write_buff absent AND not in fast_committed: return Abort (never committed).
+\*   fast_committed is pruned alongside s_aborted in prune_aborted() using the same
+\*   per-port seq-watermark, so it does not grow without bound.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   FC-N: write_buff non-empty, not aborted → commit, clock advances, version installed
+\*   FC-I: already in fast_committed (retry) → same commit_ts, clock does NOT advance
+\*   FC-A: id ∈ s_aborted → reply abort, no state change
+\*   FC-E: write_buff absent AND not in fast_committed → Abort (never committed here)
 ShardHandleFastCommit(s, id) ==
-    LET ct == s_clock[s] + 1
-    IN
     /\ FastCommitMsg(id) \in msgs
     /\ s \in participants[id]
     /\ write_buff[id] # {}          \* idempotency: nothing left to commit after first fire
-    /\ ct \in Timestamps
     /\ IF id \in s_aborted[s]
-       THEN \* tx was aborted before the fast-commit arrived — reply abort
+       THEN \* tx was aborted before the fast-commit arrived — reply abort;
+            \* s_clock is NOT advanced (no ct needed for the abort path).
             /\ Send(FastCommitReply(id, NONE))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                            s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
-       ELSE \* prepare + commit atomically
+       ELSE \* prepare + commit atomically; clock advances only in this branch
+            LET ct == s_clock[s] + 1
+            IN
+            /\ ct \in Timestamps
             /\ versions' = [k \in Keys |->
                    LET kWrites == {kv \in write_buff[id] : kv[1] = k}
                    IN IF kWrites # {}
