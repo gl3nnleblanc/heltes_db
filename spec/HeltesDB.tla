@@ -502,6 +502,34 @@ CoordBeginCommit(id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
 
+\* CoordAbortFromPrepare(id): coordinator sees an ABORT reply from a shard during
+\* the PREPARE phase of 2PC.  At least one participating shard has voted Abort;
+\* the coordinator transitions to ABORTED and sends AbortMsg to all participants.
+\*
+\* This action closes the gap in the 2PC state machine: CoordFinalizePrepare only
+\* fires when no shard aborted (anyAbort = FALSE); CoordAbortFromPrepare fires in
+\* the complementary case.  Without this action the spec has no transition out of
+\* PREPARING when a shard votes Abort, leaving a dead state that TLC cannot explore.
+\*
+\* The implementation's post-prepare-abort notification (join_all(AbortMsg)) is
+\* bounded by shard_rpc_timeout so a hung shard cannot stall the commit() RPC.
+\* In the message-passing model this is captured by AbortMsg being sent to the
+\* network non-deterministically delivered: ShardHandleAbort may fire or not; if
+\* not, ShardTimeoutPrepared eventually cleans up the prepared entry on the shard.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   P1: 2 shards, shard 1 returns ABORT first, coordinator aborts (PREPARING → ABORTED)
+\*   P2: 2 shards, both return ABORT, coordinator aborts (same result)
+\*   P3: tx in COMMIT_WAIT → action disabled (requires PREPARING)
+\*   P4: tx in ACTIVE → action disabled (requires PREPARING; misrouted call)
+CoordAbortFromPrepare(id) ==
+    /\ tx_state[id] = "PREPARING"
+    /\ \E m \in msgs : m.type = "PREPARE_REPLY" /\ m.txid = id /\ m.result = ABORT
+    /\ tx_state' = [tx_state EXCEPT ![id] = "ABORTED"]
+    /\ SendAll({AbortMsg(id)})
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
+
 \* After receiving all PREPARE_REPLYs: compute commit_t, enter COMMIT_WAIT
 \* commit_t = max(clock, all prepare timestamps)
 CoordFinalizePrepare(id) ==
@@ -529,6 +557,12 @@ CoordFinalizePrepare(id) ==
 \* In the logical clock model we abstract TrueTime commit-wait as: some other
 \* coordinator's clock has advanced past commit_t[id], ensuring SI1.
 \* For model checking we allow this step unconditionally (soundly conservative).
+\*
+\* The coordinator marks is_committed=TRUE and sends CommitMsg before the client
+\* receives a reply.  In the implementation, the concurrent join_all(COMMIT RPCs)
+\* is bounded by shard_rpc_timeout; a timeout surfaces deadline_exceeded to the
+\* client but does not change the committed state.  ShardHandleCommit fires
+\* asynchronously: the message is already in the network.
 CoordSendCommit(id) ==
     LET ct == commit_t[id]
     IN
@@ -973,22 +1007,32 @@ ShardPruneOrphanedPort(s, coord) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, s_readers, msgs>>
 
-\* Coordinator reads s_clock[s] from a shard and advances its own clock.
+\* CoordSyncClockBatch(coord, S): coordinator issues GetClock concurrently to the
+\* shards in S ⊆ Shards and advances c_clock to max(c_clock[coord], all s_clock[s]
+\* for s ∈ S).  Shards absent from S did not respond within shard_rpc_timeout.
 \*
-\* This models the clock-sync step the implementation executes at coordinator
-\* startup (via the GetClock shard RPC) before serving any client requests.
+\* Modelling S as a free existentially-quantified subset captures the concurrent
+\* join_all(GetClock RPCs) wrapped in shard_rpc_timeout:
+\*   S = {}     — all shards timed out; c_clock is unchanged (safe: monotone)
+\*   S = Shards — all shards responded; c_clock advances to the global maximum
+\*   S ⊂ Shards — partial response; c_clock advances past the responding subset
+\*
+\* The action is monotone: it can only increase c_clock, and it never touches any
+\* transaction state, so SI1–SI4 remain satisfied in all executions that include it.
+\*
 \* Without this sync, a fresh coordinator starts with c_clock=0 and assigns
-\* start_ts values near 0; shards that have already committed versions at
-\* higher timestamps then reject every write with CommittedConflict.
+\* start_ts values near 0; shards that have already committed versions at higher
+\* timestamps then reject every write with CommittedConflict.
 \*
-\* The action is monotone: it can only increase c_clock, and it never touches
-\* any transaction state, so SI1–SI4 remain satisfied in all executions that
-\* include it.
-CoordSyncClock(coord, s) ==
+\* Concrete execution traces driving Phase-2 tests:
+\*   SC1: S = Shards → c_clock advances to max shard clock (normal startup)
+\*   SC2: S = {} → c_clock unchanged (all shards timed out; coordinator safe to proceed)
+\*   SC3: S ⊂ Shards → c_clock advances past responding shards only (partial timeout)
+CoordSyncClockBatch(coord, S) ==
+    /\ S \subseteq Shards
     /\ c_clock' = [c_clock EXCEPT ![coord] =
-                      IF s_clock[s] > c_clock[coord]
-                      THEN s_clock[s]
-                      ELSE c_clock[coord]]
+                      IF S = {} THEN c_clock[coord]
+                      ELSE MaxOf({s_clock[s] : s \in S} \cup {c_clock[coord]})]
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers, msgs>>
 
@@ -1001,12 +1045,14 @@ Next ==
            \/ CoordFastCommit(id)
            \/ CoordHandleFastCommitReply(id)
            \/ CoordBeginCommit(id)
+           \/ CoordAbortFromPrepare(id)
            \/ CoordFinalizePrepare(id)
            \/ CoordSendCommit(id)
            \/ CoordAbortOnReply(id)
            \/ CoordAbortReadDeadline(id)
+    \/ \E coord \in Coordinators, S \in SUBSET Shards :
+           \/ CoordSyncClockBatch(coord, S)
     \/ \E coord \in Coordinators, s \in Shards :
-           \/ CoordSyncClock(coord, s)
            \/ ShardPruneOrphanedPort(s, coord)
     \/ \E id \in TxIds, k \in Keys :
            \/ CoordRead(id, k)

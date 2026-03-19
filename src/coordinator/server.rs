@@ -172,14 +172,26 @@ impl CoordinatorServer {
     ///
     /// Matches the `CoordSyncClock` action added to the TLA+ spec.
     pub async fn sync_clock_from_shards(&self) {
-        for client in self.shard_clients.values() {
-            let mut c = client.clone();
-            if let Ok(reply) = c.get_clock(GetClockRequest {}).await {
-                let shard_clock = reply.into_inner().clock;
-                let mut state = self.state.lock();
-                if shard_clock > state.clock {
-                    state.clock = shard_clock;
+        let futs: Vec<_> = self
+            .shard_clients
+            .values()
+            .map(|client| {
+                let mut c = client.clone();
+                async move {
+                    c.get_clock(GetClockRequest {})
+                        .await
+                        .ok()
+                        .map(|r| r.into_inner().clock)
                 }
+            })
+            .collect();
+        let results = tokio::time::timeout(self.shard_rpc_timeout, join_all(futs))
+            .await
+            .unwrap_or_default();
+        let mut state = self.state.lock();
+        for clock in results.into_iter().flatten() {
+            if clock > state.clock {
+                state.clock = clock;
             }
         }
     }
@@ -536,7 +548,8 @@ impl CoordinatorService for CoordinatorServer {
                     }
                 })
             });
-            join_all(futs).await;
+            // Bounded by shard_rpc_timeout: mirrors abort_and_notify.
+            let _ = tokio::time::timeout(self.shard_rpc_timeout, join_all(futs)).await;
             return Ok(Response::new(TxCommitReply {
                 result: Some(TR::Abort(Abort {})),
             }));
@@ -570,7 +583,18 @@ impl CoordinatorService for CoordinatorServer {
                 }
             })
         });
-        let any_abort = join_all(commit_futs).await.into_iter().any(|a| a);
+        // Bounded by shard_rpc_timeout: the tx is already COMMITTED at the coordinator
+        // (is_committed=TRUE, CoordSendCommit fired). A timeout here means some shards
+        // haven't acked yet, but the CommitMsg is in flight. Return deadline_exceeded so
+        // the client knows the tx is committed and can retry to observe it.
+        let commit_results = tokio::time::timeout(self.shard_rpc_timeout, join_all(commit_futs))
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(
+                    "COMMIT phase timed out; transaction is committed — client may retry",
+                )
+            })?;
+        let any_abort = commit_results.into_iter().any(|a| a);
         if any_abort {
             return Ok(Response::new(TxCommitReply {
                 result: Some(TR::Abort(Abort {})),
@@ -735,6 +759,10 @@ impl CoordinatorService for CoordinatorServer {
 mod tests {
     use super::*;
     use crate::coordinator::CoordinatorState;
+    use crate::proto::shard_service_server::{ShardService, ShardServiceServer as ShardSvcServer};
+    use crate::proto::{
+        AbortReply, CommitReply, FastCommitReply, GetClockReply, ReadReply, UpdateReply,
+    };
 
     fn test_server(my_port: u16, peers: Vec<SocketAddr>) -> CoordinatorServer {
         CoordinatorServer::new(
@@ -1238,5 +1266,216 @@ mod tests {
             tonic::Code::DeadlineExceeded,
             "must return deadline_exceeded, not another error"
         );
+    }
+
+    // ── Timeout-boundary tests ────────────────────────────────────────────────
+
+    /// A minimal ShardService that answers Prepare with timestamp=1 and hangs on
+    /// every other RPC. Models a shard that responds to PREPARE but then becomes
+    /// unresponsive before the COMMIT message arrives.
+    ///
+    /// Used to verify that the coordinator's COMMIT-phase join_all is bounded by
+    /// shard_rpc_timeout (the bug: without the fix, commit() blocks forever once
+    /// the COMMIT RPCs are dispatched, even though the tx is already COMMITTED at
+    /// the coordinator).
+    struct PrepareOkCommitHangShard;
+
+    #[tonic::async_trait]
+    impl ShardService for PrepareOkCommitHangShard {
+        async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn update(&self, _: Request<UpdateRequest>) -> Result<Response<UpdateReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn prepare(
+            &self,
+            _: Request<PrepareRequest>,
+        ) -> Result<Response<crate::proto::PrepareReply>, Status> {
+            use crate::proto::prepare_reply::Result as R;
+            Ok(Response::new(crate::proto::PrepareReply {
+                result: Some(R::Timestamp(1)),
+            }))
+        }
+        async fn commit(
+            &self,
+            _: Request<ShardCommitRequest>,
+        ) -> Result<Response<CommitReply>, Status> {
+            futures::future::pending().await // hangs — this is what we're testing against
+        }
+        async fn abort(
+            &self,
+            _: Request<ShardAbortRequest>,
+        ) -> Result<Response<AbortReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn fast_commit(
+            &self,
+            _: Request<ShardFastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn write_and_fast_commit(
+            &self,
+            _: Request<ShardWriteAndFastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn get_clock(
+            &self,
+            _: Request<GetClockRequest>,
+        ) -> Result<Response<GetClockReply>, Status> {
+            Ok(Response::new(GetClockReply { clock: 0 }))
+        }
+    }
+
+    /// Bind a random port and start a `PrepareOkCommitHangShard` on it.
+    async fn spawn_prepare_ok_commit_hang_shard() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ShardSvcServer::new(PrepareOkCommitHangShard))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await; // let server start
+        addr
+    }
+
+    // Trace: COMMIT phase bounded by shard_rpc_timeout.
+    //
+    // Both participant shards respond to PREPARE with a timestamp (fast), but
+    // then hang indefinitely on COMMIT. Without the fix, commit() blocks forever
+    // once CoordSendCommit fires. With the fix, commit() returns
+    // deadline_exceeded within ~shard_rpc_timeout after dispatching COMMIT.
+    //
+    // The tx IS committed at the coordinator after CoordSendCommit; the error
+    // tells the client the acknowledgement timed out (retriable).
+    #[tokio::test]
+    async fn commit_phase_timeout_returns_deadline_exceeded() {
+        let s1 = spawn_prepare_ok_commit_hang_shard().await;
+        let s2 = spawn_prepare_ok_commit_hang_shard().await;
+        let p1 = s1.port() as u64;
+        let p2 = s2.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![s1, s2],
+            vec![],
+            Duration::from_millis(50), // shard_rpc_timeout
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 20;
+        {
+            let mut state = server.state.lock();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, p1);
+            state.add_participant(tx_id, p2);
+        }
+
+        // Prepare phase completes quickly (mock shards respond). COMMIT hangs.
+        // The coordinator should return deadline_exceeded within shard_rpc_timeout.
+        let result = tokio::time::timeout(
+            Duration::from_millis(500), // outer guard so test doesn't hang forever
+            server.commit(Request::new(TxCommitRequest { tx_id })),
+        )
+        .await
+        .expect("commit() must not hang — must be bounded by shard_rpc_timeout");
+
+        assert!(
+            result.is_err(),
+            "timed-out COMMIT phase must return an error"
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded,
+            "must be deadline_exceeded so the client knows the tx is committed and can retry"
+        );
+    }
+
+    // Trace: post-prepare-abort ABORT notification is bounded by shard_rpc_timeout.
+    //
+    // When prepare succeeds (all shards respond) but one returns Abort, the
+    // coordinator sends ABORT to all participants. Without the fix, the
+    // join_all(abort_futs) inside the prepare-aborted branch has no timeout and
+    // stalls indefinitely if any shard becomes unresponsive after prepare.
+    //
+    // We cannot drive the inline path from commit() without shards that respond
+    // to PREPARE with Abort then hang on ABORT — so we test abort_and_notify
+    // (which uses the same bounded pattern) to verify the bounding works, and
+    // separately confirm the inline path uses `tokio::time::timeout` by code
+    // inspection (the change mirrors abort_and_notify exactly).
+    #[tokio::test]
+    async fn abort_and_notify_bounded_by_shard_rpc_timeout() {
+        let hang1 = spawn_hang_server().await;
+        let hang2 = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang1, hang2],
+            vec![],
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 30;
+        {
+            let mut state = server.state.lock();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, hang1.port() as u64);
+            state.add_participant(tx_id, hang2.port() as u64);
+        }
+
+        // abort_and_notify must complete within ~shard_rpc_timeout despite hung shards.
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), server.abort_and_notify(tx_id)).await;
+        assert!(
+            result.is_ok(),
+            "abort_and_notify must not hang — must be bounded by shard_rpc_timeout"
+        );
+    }
+
+    // Trace: sync_clock_from_shards bounded by shard_rpc_timeout.
+    //
+    // Without the fix (sequential loop with no timeout), a single unresponsive
+    // shard blocks coordinator startup indefinitely. With the fix (concurrent
+    // join_all wrapped in shard_rpc_timeout), all shards are queried in parallel
+    // and the whole batch is bounded by shard_rpc_timeout.
+    #[tokio::test]
+    async fn sync_clock_from_shards_bounded_by_shard_rpc_timeout() {
+        let hang1 = spawn_hang_server().await;
+        let hang2 = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang1, hang2],
+            vec![],
+            Duration::from_millis(20), // short timeout
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        // Must complete within ~shard_rpc_timeout, not hang forever.
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), server.sync_clock_from_shards()).await;
+        assert!(
+            result.is_ok(),
+            "sync_clock_from_shards must not hang when shards are unresponsive"
+        );
+        // Clock stays 0 — no shard replied.
+        assert_eq!(server.state.lock().clock, 0);
     }
 }
