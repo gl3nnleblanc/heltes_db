@@ -446,9 +446,15 @@ CoordWriteAndFastCommit(id, k, v) ==
 \* Reuses FastCommitReply for the response.
 \*
 \* Conflict checks are identical to ShardHandleUpdate:
-\*   CommittedConflict(k, t) — another tx committed k at ts >= start_t
-\*   PreparedConflict(s, k, t) — another prepared tx holds k with prep_t >= start_t
-\* On conflict the shard aborts this tx and replies with NONE.
+\*   CommittedConflict(k, t)      — another tx committed k at ts >= start_t
+\*   PreparedConflict(s, k, t)    — another prepared tx holds k with prep_t >= start_t
+\*   WriteBuffConflictFast(k, id) — another tx currently holds the write lock for k
+\*                                   (write_key_owner[k] ≠ NONE and ≠ id)
+\*
+\* WriteBuffConflictFast is essential: if another tx has k buffered (not yet
+\* committed or aborted), it may commit k at any future timestamp, including one
+\* ≥ start_t[id], violating SI4.  Omitting this check allows two concurrent txns
+\* to both commit to the same key — an SI4 violation confirmed by TLC.
 ShardHandleWriteAndFastCommit(s, id, k, v) ==
     LET t  == start_t[id]
         ct == s_clock[s] + 1
@@ -463,7 +469,7 @@ ShardHandleWriteAndFastCommit(s, id, k, v) ==
             /\ Send(FastCommitReply(id, NONE))
             /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                            s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
-       ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t)
+       ELSE IF CommittedConflict(k, t) \/ PreparedConflict(s, k, t) \/ WriteBuffConflictFast(k, id)
             THEN \* write-write conflict — abort
                  /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
                  /\ Send(FastCommitReply(id, NONE))
@@ -737,12 +743,20 @@ ShardHandleUpdate(s, id, k, v) ==
                                      tx_state, versions, s_prepared, s_aborted, dirty_keys, s_readers>>
 
 \* Shard handles PREPARE(id) — assign a prepare timestamp and record it.
-\* Guard: not already prepared (message set is persistent; prevent re-firing).
+\* Guards:
+\*   tx_state[id] = "PREPARING" — coordinator must still be in the prepare phase;
+\*     prevents the shard from re-preparing a transaction that the coordinator has
+\*     already finalized (COMMIT_WAIT/COMMITTED).  Without this, the persistent
+\*     PrepareMsg message causes repeated prepare→commit cycles after the initial
+\*     commit, driving s_clock to MaxTimestamp and eventually violating TypeInvariant
+\*     when CoordSyncClockBatch computes s_clock+1 outside Timestamps.
+\*   not already prepared — message set is persistent; prevent re-firing within phase.
 ShardHandlePrepare(s, id) ==
     LET t == s_clock[s] + 1
     IN
     /\ PrepareMsg(id) \in msgs
     /\ s \in participants[id]
+    /\ tx_state[id] = "PREPARING"
     /\ id \notin s_aborted[s]
     /\ id \notin {p[1] : p \in s_prepared[s]}   \* not already prepared
     /\ t \in Timestamps
@@ -812,11 +826,11 @@ ShardHandleFastCommit(s, id) ==
 \* data loss when expire_prepared fires between the coordinator's PREPARE phase
 \* and the arrival of the COMMIT message.
 \*
-\* In the spec this guard is vacuously always satisfied: ShardTimeoutPrepared
-\* requires tx_state[id] = "PREPARING", but ShardHandleCommit requires
-\* is_committed[id] (set by CoordSendCommit which requires COMMIT_WAIT), so the
-\* two actions are mutually exclusive. The guard documents the implementation
-\* invariant that handle_commit must enforce defensively.
+\* This guard IS reachable: ShardTimeoutPrepared fires during PREPARING (removing
+\* the shard's prepared entry), then the coordinator later finalizes and calls
+\* CoordSendCommit (setting is_committed[id]=TRUE), so both can fire in the same
+\* execution.  The guard prevents the shard from silently installing a stale write
+\* whose coordinator already considers committed — a real implementation concern.
 ShardHandleCommit(s, id) ==
     LET ct == commit_t[id]
     IN
@@ -835,8 +849,12 @@ ShardHandleCommit(s, id) ==
     /\ s_prepared'      = [s_prepared      EXCEPT ![s]  = {p \in @ : p[1] # id}]
     /\ dirty_keys'      = [dirty_keys      EXCEPT ![s]  =
            @ \cup {k \in Keys : \E kv \in write_buff[id] : kv[1] = k}]
+    \* Advance s_clock to ct when the coordinator-assigned commit timestamp exceeds
+    \* the shard's current clock.  This prevents a subsequent WAFC from reusing a
+    \* timestamp already installed by this commit (SI3 violation confirmed by TLC).
+    /\ s_clock'         = [s_clock         EXCEPT ![s]  = IF ct > s_clock[s] THEN ct ELSE s_clock[s]]
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, s_aborted, s_readers, msgs>>
+                   s_aborted, s_readers, msgs>>
 
 \* Shard handles ABORT(id) — discard buffered writes, release prepared entry, unlock write_key_owner
 ShardHandleAbort(s, id) ==
@@ -862,12 +880,36 @@ ShardHandleAbort(s, id) ==
 \* aborting the prepared entry loses no durable data. Once the coordinator
 \* reaches COMMIT_WAIT or COMMITTED this action is disabled.
 \*
+\* This action also sends PrepareReply(id, ABORT) to notify the coordinator.
+\* This is essential for protocol correctness: without the abort notification,
+\* the coordinator could process the earlier OK PrepareReply and call
+\* CoordFinalizePrepare, assigning commit_ts = max(c_clock, prep_ts). A later
+\* WAFC could then claim the same timestamp (because the shard clock was not
+\* advanced by the aborted commit), violating SI2. The ABORT reply ensures
+\* anyAbort=TRUE in CoordFinalizePrepare (disabling it) and enables
+\* CoordAbortFromPrepare to fire instead.
+\*
 \* Implementation note: the Rust implementation records Instant::now() at
 \* handle_prepare time, then calls expire_prepared(Instant::now()) lazily at
 \* the start of each update/prepare/read RPC handler. Entries older than
 \* prepare_ttl are aborted with the same cleanup as handle_abort.
 \* prepare_ttl is configurable at startup via the --prepare-ttl-ms CLI flag
 \* on the shard binary (default: 30 000 ms).
+\*
+\* Implementation note — abort notification:
+\*   expire_prepared() must notify the coordinator when it aborts a prepared
+\*   entry. In the implementation this can be done by:
+\*     (a) Proactively sending AbortMsg(id) to CoordOf[id] in the background, OR
+\*     (b) Returning an error (ABORTED gRPC status) when handle_commit is called
+\*         for a tx in the aborted set, and having the coordinator detect this.
+\*   The spec models both via the persistent PrepareReply(id, ABORT) message;
+\*   whichever path the implementation uses, the coordinator must not mark
+\*   is_committed = true when a shard has aborted the prepared entry.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   TP1: tx_state=PREPARING, TTL fires → prepared entry removed, ABORT reply sent
+\*   TP2: coordinator processes ABORT reply via CoordAbortFromPrepare → tx ABORTED
+\*   TP3: ShardHandleCommit guard (id \notin s_aborted) prevents silent install
 ShardTimeoutPrepared(s, id) ==
     /\ id \in {pair[1] : pair \in s_prepared[s]}
     /\ tx_state[id] = "PREPARING"
@@ -876,8 +918,9 @@ ShardTimeoutPrepared(s, id) ==
     /\ write_key_owner' = [k \in Keys |->
            IF \E kv \in write_buff[id] : kv[1] = k THEN NONE ELSE write_key_owner[k]]
     /\ s_prepared'      = [s_prepared      EXCEPT ![s] = {p \in @ : p[1] # id}]
+    /\ Send(PrepareReply(id, ABORT))
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
-                   s_clock, versions, dirty_keys, s_readers, msgs>>
+                   s_clock, versions, dirty_keys, s_readers>>
 
 \* Shard compacts MVCC versions for key k, discarding versions that are
 \* permanently shadowed and can never be the result of LatestVersionBefore
@@ -996,8 +1039,17 @@ ShardPruneOrphanedPort(s, coord) ==
     LET coordTxIds == {id \in TxIds : CoordOf[id] = coord}
         noInFlight ==
             \A id \in coordTxIds :
+                \* Shard-local: no write buffered, no prepared entry
                 /\ write_buff[id] = {}
                 /\ \A pair \in s_prepared[s] : pair[1] # id
+                \* Coordinator-level: transaction has reached a terminal state.
+                \* In the implementation tx_ids are not reused (randomly seeded seq),
+                \* so this condition is implicit.  In the spec, TxIds are finite and
+                \* may be reused, so we require terminal state to prevent pruning an
+                \* aborted entry for a tx that is still in the PREPARING phase — which
+                \* would re-enable ShardHandlePrepare and create an unbounded re-prepare
+                \* loop driving s_clock past MaxTimestamp.
+                /\ tx_state[id] \in {"IDLE", "COMMITTED", "ABORTED"}
         hasOrphans == \E id \in coordTxIds : id \in s_aborted[s]
     IN
     /\ noInFlight
@@ -1024,15 +1076,28 @@ ShardPruneOrphanedPort(s, coord) ==
 \* start_ts values near 0; shards that have already committed versions at higher
 \* timestamps then reject every write with CommittedConflict.
 \*
+\* Advancing to s_clock[s]+1 (not s_clock[s]) ensures c_clock is strictly past the
+\* last-used shard timestamp.  s_clock[s] represents the last timestamp USED at
+\* shard s.  Setting c_clock = s_clock would allow commit_ts = max(c_clock, prep_ts)
+\* to equal an already-used timestamp if another transaction committed at s_clock
+\* between the prepare and finalize steps (confirmed by TLC: SI2 violated).
+\*
 \* Concrete execution traces driving Phase-2 tests:
-\*   SC1: S = Shards → c_clock advances to max shard clock (normal startup)
+\*   SC1: S = Shards → c_clock = max(c_clock, max(s_clock)+1) (normal startup)
 \*   SC2: S = {} → c_clock unchanged (all shards timed out; coordinator safe to proceed)
 \*   SC3: S ⊂ Shards → c_clock advances past responding shards only (partial timeout)
 CoordSyncClockBatch(coord, S) ==
+    LET newClock == IF S = {} THEN c_clock[coord]
+                   ELSE MaxOf({s_clock[s] + 1 : s \in S} \cup {c_clock[coord]})
+    IN
     /\ S \subseteq Shards
-    /\ c_clock' = [c_clock EXCEPT ![coord] =
-                      IF S = {} THEN c_clock[coord]
-                      ELSE MaxOf({s_clock[s] : s \in S} \cup {c_clock[coord]})]
+    \* Guard: the advanced clock value must still be within the model's timestamp
+    \* bounds.  In the implementation c_clock is unbounded (u64); in the model
+    \* Timestamps = 0..MaxTimestamp caps the state space.  Without this guard,
+    \* CoordSyncClockBatch fires when s_clock[s] = MaxTimestamp, computing
+    \* s_clock+1 = MaxTimestamp+1 outside Timestamps and violating TypeInvariant.
+    /\ newClock \in Timestamps
+    /\ c_clock' = [c_clock EXCEPT ![coord] = newClock]
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers, msgs>>
 
@@ -1115,14 +1180,28 @@ SI3 ==
 \*      "Concurrent" means neither committed strictly before the other started.
 \*      After both are committed, at most one can have been the writer.
 \*      (The write_buff is cleared on commit, so we track via MVCC history.)
+\*
+\* tv1 # tv2 is required for correctness in the multi-coordinator case.
+\* In a multi-coordinator deployment, two transactions can receive the same
+\* commit_t when they write to disjoint shards (each shard's clock starts at
+\* 0 independently and the coordinators never directly exchange clocks).
+\* Without the tv1 # tv2 guard, if t1 commits k1@ts=2 and t2 commits k2@ts=2,
+\* then for key k1: tv1 = <<v1,2>> (t1's version) and tv2 = <<v1,2>> (the same
+\* tuple, because commit_t[t2]=2 also matches).  tv1 = tv2, so they are NOT
+\* two distinct committed versions — t2 never wrote k1 — and SI4 must not fire.
+\* The guard ensures we only flag the case where two genuinely distinct versions
+\* coexist for the same key inside the concurrent windows, i.e., both txs actually
+\* wrote that key. (SI3 separately catches the impossible case of two different
+\* values at the same timestamp for the same key.)
 SI4 ==
     \A id1, id2 \in TxIds :
         (id1 # id2 /\ is_committed[id1] /\ is_committed[id2])
         =>
         \A k \in Keys :
-            \* At most one can have installed a version in their concurrent window
+            \* At most one can have installed a DISTINCT version in their concurrent window
             ~( \E tv1 \in versions[k] : tv1[2] = commit_t[id1]
             /\ \E tv2 \in versions[k] : tv2[2] = commit_t[id2]
+            /\ tv1 # tv2
             /\ commit_t[id1] > start_t[id2]
             /\ commit_t[id2] > start_t[id1])
 

@@ -190,8 +190,13 @@ impl CoordinatorServer {
             .unwrap_or_default();
         let mut state = self.state.lock();
         for clock in results.into_iter().flatten() {
-            if clock > state.clock {
-                state.clock = clock;
+            // Advance to shard_clock + 1, not shard_clock itself.
+            // shard_clock is the last-used timestamp at the shard; setting our clock
+            // equal to it allows commit_ts = max(c_clock, prep_ts) to collide with
+            // a version already installed at that timestamp (SI2 violation confirmed by TLC).
+            let next = clock.saturating_add(1);
+            if next > state.clock {
+                state.clock = next;
             }
         }
     }
@@ -1477,5 +1482,96 @@ mod tests {
         );
         // Clock stays 0 — no shard replied.
         assert_eq!(server.state.lock().clock, 0);
+    }
+
+    // Trace SC1: sync_clock_from_shards advances coordinator clock to shard_clock + 1.
+    //
+    // shard_clock is the last-used timestamp at the shard. Setting c_clock = shard_clock
+    // allows commit_ts = max(c_clock, prep_ts) to equal another transaction's commit
+    // timestamp (SI2 violation confirmed by TLC). The fix: advance to shard_clock + 1.
+    #[tokio::test]
+    async fn sync_clock_from_shards_advances_to_shard_clock_plus_one() {
+        // A shard that responds immediately with clock=5.
+        struct FixedClockShard(u64);
+        #[tonic::async_trait]
+        impl ShardService for FixedClockShard {
+            async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn update(
+                &self,
+                _: Request<UpdateRequest>,
+            ) -> Result<Response<UpdateReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn prepare(
+                &self,
+                _: Request<PrepareRequest>,
+            ) -> Result<Response<crate::proto::PrepareReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn commit(
+                &self,
+                _: Request<ShardCommitRequest>,
+            ) -> Result<Response<CommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn abort(
+                &self,
+                _: Request<ShardAbortRequest>,
+            ) -> Result<Response<AbortReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn fast_commit(
+                &self,
+                _: Request<ShardFastCommitRequest>,
+            ) -> Result<Response<FastCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn write_and_fast_commit(
+                &self,
+                _: Request<ShardWriteAndFastCommitRequest>,
+            ) -> Result<Response<FastCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn get_clock(
+                &self,
+                _: Request<GetClockRequest>,
+            ) -> Result<Response<GetClockReply>, Status> {
+                Ok(Response::new(GetClockReply { clock: self.0 }))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ShardSvcServer::new(FixedClockShard(5)))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![addr],
+            vec![],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        server.sync_clock_from_shards().await;
+        // Must advance to shard_clock + 1 = 6, not 5.
+        assert_eq!(
+            server.state.lock().clock,
+            6,
+            "clock must be shard_clock+1 to avoid commit_ts collision with last-used shard timestamp"
+        );
     }
 }

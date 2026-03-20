@@ -608,6 +608,16 @@ impl ShardState {
             return FastCommitResult::Abort;
         }
 
+        // WriteBuffConflict: another tx already holds the write lock for this key.
+        // If omitted, two concurrent txns can both commit to the same key (SI4 violation
+        // confirmed by TLC: PREPARING tx has key in write_buff, WAFC to same key succeeds).
+        if let Some(&owner) = self.write_keys.get(&key) {
+            if owner != tx_id {
+                self.aborted.insert(tx_id);
+                return FastCommitResult::Abort;
+            }
+        }
+
         // No conflict — install version directly, bypassing write_buff.
         let commit_ts = self.clock + 1;
         self.clock = commit_ts;

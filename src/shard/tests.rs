@@ -3648,6 +3648,24 @@ fn write_and_fast_commit_prepared_conflict_only_fires_at_or_above_start_ts() {
     };
 }
 
+// Trace WF-WBC: WriteBuffConflict — T2 holds write lock on K1 (via handle_update),
+// T1 WAFC to K1 must abort even if no PreparedConflict or CommittedConflict.
+//
+// This is the SI4-violation scenario confirmed by TLC: T2 in PREPARING with K1
+// in write_buff; T1 WAFC to K1 succeeded (bug), allowing both to commit K1.
+// Fix: check write_keys before installing the version.
+#[test]
+fn write_and_fast_commit_aborts_on_write_buff_conflict() {
+    let mut s = shard();
+    // T2 acquires write lock on K1 via handle_update (sets write_keys[K1] = T2).
+    assert_eq!(s.handle_update(T2, 1, K1, v(77)), UpdateResult::Ok);
+    assert_eq!(s.write_keys.get(&K1), Some(&T2), "T2 must hold write lock on K1");
+    // T1 WAFC to K1: T2 holds the lock → WriteBuffConflict → Abort.
+    let r = s.handle_write_and_fast_commit(T1, 5, K1, v(42));
+    assert_eq!(r, FastCommitResult::Abort, "must abort: T2 holds write lock on K1");
+    assert!(s.aborted.contains(&T1), "T1 must be in aborted set");
+}
+
 // Trace WF1: write does not disturb write_buff (bypass path — no write_buff entry created).
 #[test]
 fn write_and_fast_commit_does_not_use_write_buff() {

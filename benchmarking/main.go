@@ -71,6 +71,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "CoordinatorService not found")
 		os.Exit(1)
 	}
+  fmt.Fprintln(os.Stderr, "Found CoordinatorService")
+
 	stub := grpcdynamic.NewStub(conn)
 	mBegin  := svc.FindMethodByName("Begin")
 	mUpdate := svc.FindMethodByName("Update")
@@ -92,6 +94,7 @@ func main() {
 					// Begin
 					beginRaw, err := stub.InvokeRpc(ctx, mBegin, newMsg(mBegin.GetInputType()))
 					if err != nil {
+            fmt.Fprintf(os.Stderr, "begin failed: %v\n", err)
 						nErrors.Add(1)
 						continue
 					}
@@ -106,6 +109,7 @@ func main() {
 						req.SetFieldByName("value", rng.Uint64())
 						resp, err := stub.InvokeRpc(ctx, mUpdate, req)
 						if err != nil {
+              fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 							nErrors.Add(1)
 							abrt = true
 							break
@@ -127,6 +131,7 @@ func main() {
 					commitReq.SetFieldByName("tx_id", txId)
 					commitResp, err := stub.InvokeRpc(ctx, mCommit, commitReq)
 					if err != nil {
+            fmt.Fprintf(os.Stderr, "commit failed: %v\n", err)
 						nErrors.Add(1)
 						continue
 					}
