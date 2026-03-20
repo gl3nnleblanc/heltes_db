@@ -886,8 +886,8 @@ mod tests {
         let server = CoordinatorServer::new(
             CoordinatorState::new(),
             50052,
-            vec![],           // no shard clients
-            vec![hang_addr],  // peer coordinator = hang server
+            vec![],          // no shard clients
+            vec![hang_addr], // peer coordinator = hang server
             Duration::from_millis(20),
             Duration::from_secs(5),
             ReadRetryPolicy::no_backoff(),
@@ -901,7 +901,10 @@ mod tests {
         let result = server.resolve_inquiry(tx_id, 1).await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_err(), "expected timeout error but got: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected timeout error but got: {result:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(200),
             "resolve_inquiry should have timed out quickly, took: {elapsed:?}",

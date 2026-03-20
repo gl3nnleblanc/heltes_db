@@ -3659,10 +3659,18 @@ fn write_and_fast_commit_aborts_on_write_buff_conflict() {
     let mut s = shard();
     // T2 acquires write lock on K1 via handle_update (sets write_keys[K1] = T2).
     assert_eq!(s.handle_update(T2, 1, K1, v(77)), UpdateResult::Ok);
-    assert_eq!(s.write_keys.get(&K1), Some(&T2), "T2 must hold write lock on K1");
+    assert_eq!(
+        s.write_keys.get(&K1),
+        Some(&T2),
+        "T2 must hold write lock on K1"
+    );
     // T1 WAFC to K1: T2 holds the lock → WriteBuffConflict → Abort.
     let r = s.handle_write_and_fast_commit(T1, 5, K1, v(42));
-    assert_eq!(r, FastCommitResult::Abort, "must abort: T2 holds write lock on K1");
+    assert_eq!(
+        r,
+        FastCommitResult::Abort,
+        "must abort: T2 holds write lock on K1"
+    );
     assert!(s.aborted.contains(&T1), "T1 must be in aborted set");
 }
 
