@@ -208,13 +208,7 @@ mod tests {
     // must not affect the other.
     #[test]
     fn read_ttl_and_prepare_ttl_are_independent() {
-        let a = parse_args(args(&[
-            "--prepare-ttl-ms",
-            "1000",
-            "--read-ttl-ms",
-            "2000",
-        ]))
-        .unwrap();
+        let a = parse_args(args(&["--prepare-ttl-ms", "1000", "--read-ttl-ms", "2000"])).unwrap();
         assert_eq!(a.prepare_ttl, Duration::from_millis(1000));
         assert_eq!(a.read_ttl, Duration::from_millis(2000));
     }
