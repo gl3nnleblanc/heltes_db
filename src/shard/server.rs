@@ -59,6 +59,12 @@ impl ShardServer {
                 // when a coordinator port goes permanently quiescent.
                 // (ShardPruneOrphanedPort in TLA+)
                 state.prune_aborted();
+                // Prune read_aborted entries for the same reason: expire_reads() above
+                // may have just populated read_aborted for transactions from a crashed
+                // coordinator port that will never send another RPC.  Without this call,
+                // those entries would only be pruned when a subsequent commit/abort RPC
+                // arrives from the same port — which may never happen.
+                state.prune_read_aborted();
             }
         });
         Self { state }
