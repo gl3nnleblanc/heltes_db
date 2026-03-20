@@ -922,6 +922,45 @@ ShardTimeoutPrepared(s, id) ==
     /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
                    s_clock, versions, dirty_keys, s_readers>>
 
+\* Shard TTL-expires a stale read-only tracker (models expire_reads()).
+\*
+\* An abandoned read-only transaction (client crashed, etc.) whose start_ts
+\* anchors the compaction watermark can prevent MVCC history from shrinking
+\* indefinitely.  expire_reads() evicts the tracker after read_ttl to reclaim
+\* the watermark anchor.
+\*
+\* The guard write_buff[id] = {} ensures we only expire pure readers: write-path
+\* transactions are evicted by ShardTimeoutPrepared, not this action.
+\*
+\* After eviction the tx is added to s_aborted[s], blocking subsequent
+\* ShardHandleRead calls (which guard on id \notin s_aborted[s]).  The client
+\* receives ReadResult::Abort rather than re-registering with a stale snapshot
+\* and potentially seeing NotFound for a key whose version was later compacted.
+\*
+\* Note: ShardPruneOrphanedPort cannot remove the s_aborted entry while the
+\* coordinator still has the tx in state ACTIVE (its guard requires terminal
+\* tx_state), so the abort signal is durable for the lifetime of the transaction.
+\* The implementation uses a separate `read_aborted` set (not `aborted`) for the
+\* same reason: prune_aborted() would immediately remove entries for read-only txs
+\* since they have no write_buff or prepared anchor.
+\*
+\* Concrete execution traces driving Phase-2 tests:
+\*   ER1: id ∈ s_readers[s], write_buff[id]={}, tx_state=ACTIVE →
+\*        add to s_aborted, remove from s_readers
+\*   ER2: After ER1, ShardCompactVersions can raise watermark (reader no longer active)
+\*   ER3: After ER1 + compaction, ShardHandleRead(s,id,k) → blocked (id ∈ s_aborted[s]);
+\*        client receives Abort rather than NotFound for a compacted version
+\*   ER4: id ∈ write_buff → action disabled; write-path tx not evicted by expire_reads
+ShardExpireRead(s, id) ==
+    /\ id \in s_readers[s]
+    /\ tx_state[id] = "ACTIVE"
+    /\ write_buff[id] = {}
+    /\ id \notin s_aborted[s]
+    /\ s_aborted' = [s_aborted EXCEPT ![s] = @ \cup {id}]
+    /\ s_readers' = [s_readers EXCEPT ![s] = @ \ {id}]
+    /\ UNCHANGED <<c_clock, start_t, commit_t, is_committed, participants, tx_state,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, dirty_keys, msgs>>
+
 \* Shard compacts MVCC versions for key k, discarding versions that are
 \* permanently shadowed and can never be the result of LatestVersionBefore
 \* for any active transaction's snapshot.
@@ -1135,6 +1174,7 @@ Next ==
            \/ ShardPruneAborted(s, id)
            \/ ShardHandleFastCommit(s, id)
            \/ ShardTimeoutPrepared(s, id)
+           \/ ShardExpireRead(s, id)
     \/ \E s \in Shards, k \in Keys :
            ShardCompactVersions(s, k)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :

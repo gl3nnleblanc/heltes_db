@@ -169,6 +169,24 @@ pub struct ShardState {
     /// Should be set to at least the maximum expected client transaction duration.
     pub read_ttl: Duration,
 
+    /// TxIds whose read-tracking was evicted by `expire_reads`.
+    ///
+    /// Any subsequent `handle_read` for a tx_id in this set returns
+    /// `ReadResult::Abort` immediately, preventing the client from
+    /// re-registering with a stale snapshot whose needed MVCC versions may
+    /// have been compacted away in the eviction window.
+    ///
+    /// Distinct from `aborted`: `prune_aborted` would immediately remove
+    /// entries for read-only transactions (no write_buff / prepared anchor),
+    /// so we keep expired reads in a dedicated set that is not subject to
+    /// the write-watermark pruning logic.
+    ///
+    /// Cleared by `handle_commit`, `handle_abort`, and `handle_fast_commit`
+    /// if those eventually arrive (they won't for truly abandoned clients).
+    /// Matches `s_aborted[s]` in the TLA+ spec (which uses `ShardPruneOrphanedPort`
+    /// with a tx_state guard that prevents premature removal).
+    pub read_aborted: HashSet<TxId>,
+
     /// Maximum number of distinct keys a single transaction may buffer on this shard.
     ///
     /// When `handle_update` is called and the write would add a new key to
@@ -208,6 +226,7 @@ impl ShardState {
             read_start_ts: HashMap::new(),
             read_times: HashMap::new(),
             read_ttl: Duration::from_secs(30),
+            read_aborted: HashSet::new(),
             dirty_keys: HashSet::new(),
             fast_committed: HashMap::new(),
             max_writes_per_tx: usize::MAX,
@@ -232,7 +251,7 @@ impl ShardState {
         key: Key,
         inquiry_results: &HashMap<TxId, InquiryStatus>,
     ) -> ReadResult {
-        if self.aborted.contains(&tx_id) {
+        if self.aborted.contains(&tx_id) || self.read_aborted.contains(&tx_id) {
             return ReadResult::Abort;
         }
 
@@ -463,6 +482,7 @@ impl ShardState {
         self.write_start_ts.remove(&tx_id);
         self.read_start_ts.remove(&tx_id);
         self.read_times.remove(&tx_id);
+        self.read_aborted.remove(&tx_id);
         self.prune_aborted();
         CommitResult::Ok
     }
@@ -484,6 +504,7 @@ impl ShardState {
         self.write_start_ts.remove(&tx_id);
         self.read_start_ts.remove(&tx_id);
         self.read_times.remove(&tx_id);
+        self.read_aborted.remove(&tx_id);
         self.prune_aborted();
     }
 
@@ -549,6 +570,7 @@ impl ShardState {
         self.write_start_ts.remove(&tx_id);
         self.read_start_ts.remove(&tx_id);
         self.read_times.remove(&tx_id);
+        self.read_aborted.remove(&tx_id);
         // Record the commit_ts for idempotent retries.
         self.fast_committed.insert(tx_id, commit_ts);
         self.prune_aborted();
@@ -793,13 +815,24 @@ impl ShardState {
         let expired: Vec<TxId> = self
             .read_times
             .iter()
-            .filter(|(_, &t)| now.saturating_duration_since(t) >= self.read_ttl)
+            .filter(|(&tx_id, &t)| {
+                now.saturating_duration_since(t) >= self.read_ttl
+                    && !self.write_buff.contains_key(&tx_id)
+            })
             .map(|(&tx_id, _)| tx_id)
             .collect();
 
         for tx_id in expired {
             self.read_times.remove(&tx_id);
             self.read_start_ts.remove(&tx_id);
+            // Mark the tx as read-expired so any subsequent handle_read call
+            // returns Abort rather than re-registering with a stale snapshot
+            // whose MVCC versions may have been compacted away in the window
+            // between eviction and the client's retry.
+            // We use read_aborted (not aborted) because prune_aborted() would
+            // immediately remove pure-reader entries from aborted — there is
+            // no write_buff or prepared anchor to keep them alive.
+            self.read_aborted.insert(tx_id);
         }
     }
 

@@ -3521,6 +3521,112 @@ fn expire_reads_clears_stale_reader_allowing_compaction() {
     );
 }
 
+// ── expire_reads: abort-on-eviction (ER1–ER4) ───────────────────────────
+
+// Trace ER1: read-only tx T1 is evicted by expire_reads → subsequent
+// handle_read must return Abort, not re-register with a stale snapshot.
+#[test]
+fn expire_reads_aborts_evicted_transaction() {
+    let mut s = shard();
+    // T1 reads K1 — enters read tracking.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+    assert!(s.read_start_ts.contains_key(&T1));
+
+    // Simulate TTL expiry.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+
+    // After eviction, read tracking must be gone.
+    assert!(!s.read_start_ts.contains_key(&T1));
+
+    // Subsequent handle_read must return Abort, not re-register.
+    let r = s.handle_read(T1, 5, K1, &no_inquiries());
+    assert_eq!(r, ReadResult::Abort, "evicted tx must return Abort on re-read");
+    assert!(
+        !s.read_start_ts.contains_key(&T1),
+        "expired tx must not re-enter read_start_ts"
+    );
+}
+
+// Trace ER3: after T1 is evicted and compaction prunes versions that T1's
+// snapshot needed, a retry by T1 must return Abort — not a stale NotFound.
+// Without the fix, handle_read would re-register T1 and return NotFound for
+// a key that had a committed value at T1's start_ts (SI violation).
+#[test]
+fn expire_reads_prevents_stale_not_found_after_compaction() {
+    let mut s = shard();
+    // Install two committed versions: K1@ts=1 (older) and K1@ts=3 (newer).
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(10),
+        timestamp: 1,
+    });
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(30),
+        timestamp: 3,
+    });
+    s.dirty_keys.insert(K1);
+
+    // T1 reads K1 with start_ts=5: sees K1@ts=3 (latest strictly before 5).
+    let r = s.handle_read(T1, 5, K1, &no_inquiries());
+    assert_eq!(r, ReadResult::Value(v(30)));
+
+    // T2 has a write buffer anchoring watermark at start_ts=100.
+    s.handle_update(T2, 100, K2, v(0));
+
+    // Evict T1's read tracking.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+
+    // With T1 gone, watermark = T2.start_ts = 100.
+    // compact_versions: among {K1@ts=1, K1@ts=3}, both < 100; keep latest (ts=3), prune ts=1.
+    s.compact_versions();
+
+    // Prune ts=1 and install K1@ts=8 (above T1's snapshot) to also prune ts=3.
+    // Simulate a later commit that raises the watermark further via a second writer.
+    s.handle_update(T3, 200, K3, v(0));
+    s.versions.entry(K1).or_default().push(Version {
+        value: v(80),
+        timestamp: 8,
+    });
+    s.dirty_keys.insert(K1);
+    // watermark = min(T2.start_ts=100, T3.start_ts=200) = 100
+    // K1@ts=3 and K1@ts=8: both at ts=3 < 100 and ts=8 < 100; keep latest (ts=8), prune ts=3.
+    s.compact_versions();
+
+    // K1@ts=3 is now gone. A re-read by T1 (start_ts=5) would see NotFound without the fix.
+    // With the fix it must return Abort.
+    let r = s.handle_read(T1, 5, K1, &no_inquiries());
+    assert_eq!(
+        r,
+        ReadResult::Abort,
+        "expired tx must get Abort, not stale NotFound after compaction"
+    );
+}
+
+// Trace ER4: write-path transactions (those with a write buffer) must NOT be
+// evicted by expire_reads — they are handled by expire_prepared.
+#[test]
+fn expire_reads_does_not_evict_write_path_transactions() {
+    let mut s = shard();
+    // T1 reads then writes K1 — has both read tracking and a write buffer.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+    s.handle_update(T1, 5, K1, v(42));
+    assert!(s.write_buff.contains_key(&T1));
+
+    // Force expire.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+
+    // T1's write buffer is untouched; expire_reads must not have aborted it.
+    assert!(
+        s.write_buff.contains_key(&T1),
+        "write-path tx must not be evicted by expire_reads"
+    );
+    // handle_read must not return Abort for T1 (it can still proceed).
+    let r = s.handle_read(T1, 5, K1, &no_inquiries());
+    assert_ne!(r, ReadResult::Abort, "write-path tx must not be aborted by expire_reads");
+}
+
 // -----------------------------------------------------------------------
 // handle_write_and_fast_commit — single-write fast path
 // -----------------------------------------------------------------------
