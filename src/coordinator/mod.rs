@@ -167,6 +167,12 @@ struct TxEntry {
     commit_ts: Option<Timestamp>,
     is_committed: bool,
     participants: HashSet<ShardId>,
+    /// Shards that served reads for this transaction (may overlap with participants).
+    /// Populated by add_read_participant() when the coordinator routes a read RPC.
+    /// Included in abort_tx() so abort_and_notify() can fan-out AbortMsg to read-only
+    /// shards, prompting them to clear read_start_ts / read_times without waiting for
+    /// expire_reads() TTL.  Matches read_participants[id] in the TLA+ spec.
+    read_participants: HashSet<ShardId>,
     phase: TxPhase,
     /// PREPARE_REPLYs collected so far: shard → prep_t.
     prepare_replies: HashMap<ShardId, Timestamp>,
@@ -216,6 +222,7 @@ impl CoordinatorState {
                 commit_ts: None,
                 is_committed: false,
                 participants: HashSet::new(),
+                read_participants: HashSet::new(),
                 phase: TxPhase::Active,
                 prepare_replies: HashMap::new(),
             },
@@ -229,6 +236,20 @@ impl CoordinatorState {
         if let Some(tx) = self.transactions.get_mut(&tx_id) {
             if tx.phase == TxPhase::Active {
                 tx.participants.insert(shard_id);
+            }
+        }
+    }
+
+    /// CoordRead (read-participant tracking): record shard_id as a shard that
+    /// served a read for tx_id. Called when the coordinator routes a read RPC.
+    ///
+    /// These shards are included in the abort fan-out (abort_tx) so they can
+    /// promptly clear read_start_ts and read_times without waiting for the
+    /// expire_reads() TTL. Matches read_participants[id] in the TLA+ spec.
+    pub fn add_read_participant(&mut self, tx_id: TxId, shard_id: ShardId) {
+        if let Some(tx) = self.transactions.get_mut(&tx_id) {
+            if tx.phase == TxPhase::Active {
+                tx.read_participants.insert(shard_id);
             }
         }
     }
@@ -371,14 +392,17 @@ impl CoordinatorState {
     }
 
     /// CoordAbortOnReply / manual abort: mark ABORTED.
-    /// Returns participants so the caller can dispatch ABORT RPCs.
-    pub fn abort_tx(&mut self, tx_id: TxId) -> HashSet<ShardId> {
+    /// Returns `(write_participants, read_participants)` so the caller can dispatch
+    /// ABORT RPCs to all shards that touched this transaction — both write-path shards
+    /// (participants) and read-path shards (read_participants).
+    /// Matches the abort fan-out in CoordAbortOnReply / CoordAbortReadDeadline (TLA+).
+    pub fn abort_tx(&mut self, tx_id: TxId) -> (HashSet<ShardId>, HashSet<ShardId>) {
         match self.transactions.get_mut(&tx_id) {
             Some(tx) => {
                 tx.phase = TxPhase::Aborted;
-                tx.participants.clone()
+                (tx.participants.clone(), tx.read_participants.clone())
             }
-            None => HashSet::new(),
+            None => (HashSet::new(), HashSet::new()),
         }
     }
 

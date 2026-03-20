@@ -271,15 +271,17 @@ fn abort_tx_returns_participants() {
     c.start_tx(1);
     c.add_participant(1, 10);
     c.add_participant(1, 20);
-    let participants = c.abort_tx(1);
-    assert_eq!(participants, shards(&[10, 20]));
+    let (write_ps, _) = c.abort_tx(1);
+    assert_eq!(write_ps, shards(&[10, 20]));
     assert_eq!(c.tx_phase(1), Some(TxPhase::Aborted));
 }
 
 #[test]
 fn abort_tx_unknown_tx_returns_empty() {
     let mut c = coord();
-    assert_eq!(c.abort_tx(99), HashSet::new());
+    let (write_ps, read_ps) = c.abort_tx(99);
+    assert!(write_ps.is_empty());
+    assert!(read_ps.is_empty());
 }
 
 #[test]
@@ -988,4 +990,97 @@ fn retry_policy_sleep_duration_is_deterministic() {
             "sleep_duration({retry}) is not deterministic"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// add_read_participant / abort_tx (read_participants fan-out)
+// ---------------------------------------------------------------------------
+
+// Trace RN1: tx reads k → serving shard recorded in read_participants.
+// abort_tx must return (write_participants, read_participants) so abort_and_notify
+// can fan-out AbortMsg to read-only shards.
+#[test]
+fn add_read_participant_records_shard() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_read_participant(1, 100);
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert!(write_ps.is_empty(), "no write participant was added");
+    assert_eq!(
+        read_ps,
+        shards(&[100]),
+        "abort_tx must return the read shard"
+    );
+}
+
+// Trace RN3: tx reads k1 (shard s1) and k2 (shard s2) → read_participants = {s1, s2}.
+#[test]
+fn add_read_participant_multiple_shards() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_read_participant(1, 10);
+    c.add_read_participant(1, 20);
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert!(write_ps.is_empty());
+    assert_eq!(read_ps, shards(&[10, 20]));
+}
+
+// Trace RN2: tx reads k then writes k2 on same shard → participants = read_participants = {s}.
+#[test]
+fn add_read_participant_same_shard_as_write() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 10); // write on shard 10
+    c.add_read_participant(1, 10); // read also on shard 10
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert_eq!(write_ps, shards(&[10]));
+    assert_eq!(read_ps, shards(&[10]));
+}
+
+// Trace RN4: write-only tx → read_participants empty; abort notifies write participants only.
+#[test]
+fn abort_tx_write_only_tx_returns_empty_read_participants() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 50);
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert_eq!(write_ps, shards(&[50]));
+    assert!(
+        read_ps.is_empty(),
+        "write-only tx must have no read participants"
+    );
+}
+
+// Trace RN5: tx with both read and write participants → abort returns both.
+#[test]
+fn abort_tx_returns_both_write_and_read_participants() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.add_participant(1, 10); // write on shard 10
+    c.add_read_participant(1, 20); // read on shard 20
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert_eq!(write_ps, shards(&[10]));
+    assert_eq!(read_ps, shards(&[20]));
+}
+
+// Edge case: add_read_participant ignored after abort (tx already terminal).
+#[test]
+fn add_read_participant_ignored_after_abort() {
+    let mut c = coord();
+    c.start_tx(1);
+    c.abort_tx(1);
+    c.add_read_participant(1, 100); // should be a no-op
+                                    // Aborting again returns empty sets (already aborted — no double-notification risk).
+    let (write_ps, read_ps) = c.abort_tx(1);
+    assert!(write_ps.is_empty());
+    assert!(read_ps.is_empty());
+}
+
+// Edge case: abort_tx on unknown tx returns empty sets (no panic).
+#[test]
+fn abort_tx_unknown_tx_returns_empty_sets() {
+    let mut c = coord();
+    let (write_ps, read_ps) = c.abort_tx(999);
+    assert!(write_ps.is_empty());
+    assert!(read_ps.is_empty());
 }

@@ -254,12 +254,17 @@ impl CoordinatorServer {
         });
     }
 
-    /// Mark `tx_id` aborted in state and best-effort ABORT to every participant shard.
+    /// Mark `tx_id` aborted in state and best-effort ABORT to every shard that touched
+    /// the transaction — both write-path shards (participants) and read-path shards
+    /// (read_participants).  Prompts read shards to clear read_start_ts / read_times
+    /// immediately rather than waiting for the expire_reads() TTL.
     /// The abort RPCs are bounded by `shard_rpc_timeout`; hung shards are abandoned.
-    /// Matches CoordAbortOnReply in the TLA+ spec.
+    /// Matches CoordAbortOnReply / CoordAbortReadDeadline fan-out in the TLA+ spec.
     async fn abort_and_notify(&self, tx_id: u64) {
-        let participants = self.state.lock().abort_tx(tx_id);
-        let futs = participants.into_iter().filter_map(|port| {
+        let (write_ps, read_ps) = self.state.lock().abort_tx(tx_id);
+        // Union of write and read participants: each receives exactly one AbortMsg.
+        let all_shards = write_ps.union(&read_ps).copied().collect::<Vec<_>>();
+        let futs = all_shards.into_iter().filter_map(|port| {
             self.shard_clients.get(&port).map(|c| {
                 let mut client = c.clone();
                 async move {
@@ -312,6 +317,10 @@ impl CoordinatorService for CoordinatorServer {
             .shard_for_key(key)
             .ok_or_else(|| Status::unavailable("no shards registered"))?
             .port() as u64;
+        // Record this shard as a read participant so abort_and_notify can notify it
+        // promptly, clearing read_start_ts / read_times without waiting for expire_reads().
+        // Matches read_participants' = read_participants ∪ {ShardOf[k]} in CoordRead (TLA+).
+        self.state.lock().add_read_participant(tx_id, shard_port);
         let mut client = self.shard_client(shard_port)?;
 
         use crate::proto::read_reply::Result as R;
@@ -1836,6 +1845,204 @@ mod tests {
             server.state.lock().clock,
             6,
             "clock must be shard_clock+1 to avoid commit_ts collision with last-used shard timestamp"
+        );
+    }
+
+    // ── abort_and_notify notifies read participants ────────────────────────────
+    //
+    // Traces RN1, RN4, RN5: abort_and_notify must fan-out AbortMsg to both
+    // write participants and read participants so read-serving shards can
+    // promptly clear read_start_ts / read_times (rather than waiting for
+    // expire_reads() TTL).
+
+    /// A mock shard that records every abort tx_id it receives.
+    struct AbortRecordingShard {
+        aborted: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[tonic::async_trait]
+    impl ShardService for AbortRecordingShard {
+        async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn update(&self, _: Request<UpdateRequest>) -> Result<Response<UpdateReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn prepare(
+            &self,
+            _: Request<PrepareRequest>,
+        ) -> Result<Response<crate::proto::PrepareReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn commit(
+            &self,
+            _: Request<crate::proto::CommitRequest>,
+        ) -> Result<Response<CommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn abort(
+            &self,
+            req: Request<crate::proto::AbortRequest>,
+        ) -> Result<Response<AbortReply>, Status> {
+            self.aborted.lock().push(req.into_inner().tx_id);
+            Ok(Response::new(AbortReply {}))
+        }
+        async fn get_clock(
+            &self,
+            _: Request<GetClockRequest>,
+        ) -> Result<Response<GetClockReply>, Status> {
+            Ok(Response::new(GetClockReply { clock: 0 }))
+        }
+        async fn fast_commit(
+            &self,
+            _: Request<crate::proto::FastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn write_and_fast_commit(
+            &self,
+            _: Request<crate::proto::WriteAndFastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+    }
+
+    async fn spawn_abort_recording_shard() -> (SocketAddr, Arc<Mutex<Vec<u64>>>) {
+        let aborted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let shard = AbortRecordingShard {
+            aborted: Arc::clone(&aborted),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ShardSvcServer::new(shard))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        (addr, aborted)
+    }
+
+    // Trace RN1: tx reads from shard s (no writes) → abort_and_notify sends
+    // AbortMsg to s even though s is not in write participants.
+    #[tokio::test]
+    async fn abort_and_notify_sends_to_read_only_shard() {
+        let (read_shard_addr, read_aborted) = spawn_abort_recording_shard().await;
+        let read_port = read_shard_addr.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![read_shard_addr],
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 1;
+        {
+            let mut state = server.state.lock();
+            state.start_tx(tx_id);
+            // Only a read participant — no write participants.
+            state.add_read_participant(tx_id, read_port);
+        }
+
+        server.abort_and_notify(tx_id).await;
+
+        // Give the mock shard a moment to process the RPC.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let aborted = read_aborted.lock().clone();
+        assert!(
+            aborted.contains(&tx_id),
+            "abort_and_notify must send AbortMsg to read-only shard; got: {aborted:?}"
+        );
+    }
+
+    // Trace RN4: write-only tx → abort_and_notify only notifies write shard;
+    // read shard (not registered) is not contacted (no regression).
+    #[tokio::test]
+    async fn abort_and_notify_write_only_tx_does_not_contact_unrelated_shard() {
+        let (write_shard_addr, write_aborted) = spawn_abort_recording_shard().await;
+        let (other_shard_addr, other_aborted) = spawn_abort_recording_shard().await;
+        let write_port = write_shard_addr.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![write_shard_addr, other_shard_addr],
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 2;
+        {
+            let mut state = server.state.lock();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, write_port);
+            // No read participants.
+        }
+
+        server.abort_and_notify(tx_id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            write_aborted.lock().contains(&tx_id),
+            "write shard must be notified"
+        );
+        assert!(
+            !other_aborted.lock().contains(&tx_id),
+            "unrelated shard must not be contacted"
+        );
+    }
+
+    // Trace RN5: tx has both write and read participants (different shards) →
+    // abort_and_notify notifies both.
+    #[tokio::test]
+    async fn abort_and_notify_notifies_both_write_and_read_shards() {
+        let (write_shard_addr, write_aborted) = spawn_abort_recording_shard().await;
+        let (read_shard_addr, read_aborted) = spawn_abort_recording_shard().await;
+        let write_port = write_shard_addr.port() as u64;
+        let read_port = read_shard_addr.port() as u64;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![write_shard_addr, read_shard_addr],
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        let tx_id: u64 = (50052u64 << 32) | 3;
+        {
+            let mut state = server.state.lock();
+            state.start_tx(tx_id);
+            state.add_participant(tx_id, write_port);
+            state.add_read_participant(tx_id, read_port);
+        }
+
+        server.abort_and_notify(tx_id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            write_aborted.lock().contains(&tx_id),
+            "write shard must be notified"
+        );
+        assert!(
+            read_aborted.lock().contains(&tx_id),
+            "read shard must be notified"
         );
     }
 }
