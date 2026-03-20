@@ -145,14 +145,17 @@ impl CoordinatorServer {
                 Status::unavailable(format!("no address configured for coordinator port {port}"))
             })?
             .clone();
-        let reply = client
-            .inquire(InquireRequest {
+        let reply = tokio::time::timeout(
+            self.shard_rpc_timeout,
+            client.inquire(InquireRequest {
                 tx_id,
                 prep_ts: reader_start_ts,
                 hop_count: 0,
-            })
-            .await?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("coordinator inquire timed out"))??
+        .into_inner();
         use crate::proto::inquire_reply::Status as S;
         match reply.status {
             Some(S::CommittedAt(ts)) => Ok(InquiryStatus::Committed(ts)),
@@ -869,6 +872,40 @@ mod tests {
         let result = server.resolve_inquiry(tx_id, 1).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    // Trace: resolve_inquiry for a peer that hangs (TCP connected, no bytes) →
+    // shard_rpc_timeout fires → returns an error promptly (not stuck for read_loop_timeout).
+    // Models CoordAbortReadDeadline: the per-call timeout prevents one hung coordinator
+    // from blocking the reader for the full outer deadline.
+    #[tokio::test]
+    async fn resolve_inquiry_times_out_on_hung_coordinator() {
+        let hang_addr = spawn_hang_server().await;
+        let hang_port = hang_addr.port();
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],           // no shard clients
+            vec![hang_addr],  // peer coordinator = hang server
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        // tx_id encodes hang_port → resolve_inquiry routes to the hung coordinator.
+        let tx_id: u64 = (hang_port as u64) << 32 | 1;
+
+        let start = std::time::Instant::now();
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected timeout error but got: {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "resolve_inquiry should have timed out quickly, took: {elapsed:?}",
+        );
     }
 
     // Trace: resolve_inquiry for a configured remote port attempts the right URI
