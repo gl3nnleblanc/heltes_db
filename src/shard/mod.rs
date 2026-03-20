@@ -484,6 +484,7 @@ impl ShardState {
         self.read_times.remove(&tx_id);
         self.read_aborted.remove(&tx_id);
         self.prune_aborted();
+        self.prune_read_aborted();
         CommitResult::Ok
     }
 
@@ -506,6 +507,7 @@ impl ShardState {
         self.read_times.remove(&tx_id);
         self.read_aborted.remove(&tx_id);
         self.prune_aborted();
+        self.prune_read_aborted();
     }
 
     /// Handle FAST_COMMIT(id) — single-shard optimisation.
@@ -574,6 +576,7 @@ impl ShardState {
         // Record the commit_ts for idempotent retries.
         self.fast_committed.insert(tx_id, commit_ts);
         self.prune_aborted();
+        self.prune_read_aborted();
         FastCommitResult::Ok(commit_ts)
     }
 
@@ -655,6 +658,7 @@ impl ShardState {
         }
         self.dirty_keys.insert(key);
         self.prune_aborted();
+        self.prune_read_aborted();
         FastCommitResult::Ok(commit_ts)
     }
 
@@ -756,6 +760,49 @@ impl ShardState {
         });
     }
 
+    /// Prune stale entries from `read_aborted`.
+    ///
+    /// `read_aborted` holds tx_ids for pure-reader transactions that were
+    /// evicted by `expire_reads` (they had no write-buffer entry, so
+    /// `prune_aborted` would immediately discard them).  Like `prune_aborted`,
+    /// we use a port/seq watermark to decide when an entry is safe to drop.
+    ///
+    /// The watermark is extended to include `read_times` keys (transactions
+    /// currently mid-read) in addition to `write_buff` and `prepared`:
+    ///
+    /// ```text
+    /// min_active_seq[port] = min seq of all tx_ids in
+    ///     write_buff ∪ prepared ∪ read_times  from that port
+    /// ```
+    ///
+    /// A `read_aborted` entry `(port, seq)` is pruned when:
+    ///   - No active tx from `port` exists at all, OR
+    ///   - `min_active_seq[port] > seq`  (coordinator has moved past this tx)
+    ///
+    /// Modelled by `ShardPruneOrphanedPort` in the TLA+ spec.
+    pub fn prune_read_aborted(&mut self) {
+        let mut min_active_seq: HashMap<u32, u32> = HashMap::new();
+        for &tx_id in self
+            .write_buff
+            .keys()
+            .chain(self.prepared.keys())
+            .chain(self.read_times.keys())
+        {
+            let port = (tx_id >> 32) as u32;
+            let seq = tx_id as u32;
+            let e = min_active_seq.entry(port).or_insert(u32::MAX);
+            *e = (*e).min(seq);
+        }
+        self.read_aborted.retain(|&tx_id| {
+            let port = (tx_id >> 32) as u32;
+            let seq = tx_id as u32;
+            match min_active_seq.get(&port) {
+                Some(&min) => seq >= min,
+                None => false,
+            }
+        });
+    }
+
     /// Auto-abort prepared entries that have been waiting longer than `prepare_ttl`.
     ///
     /// This implements `ShardTimeoutPrepared` from the TLA+ spec: when a coordinator
@@ -793,6 +840,7 @@ impl ShardState {
 
         if !expired.is_empty() {
             self.prune_aborted();
+            self.prune_read_aborted();
         }
 
         expired

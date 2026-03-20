@@ -3880,6 +3880,90 @@ fn write_and_fast_commit_aborts_on_write_buff_conflict() {
     assert!(s.aborted.contains(&T1), "T1 must be in aborted set");
 }
 
+// -----------------------------------------------------------------------
+// prune_read_aborted — bounded read_aborted HashSet
+//
+// read_aborted is pruned using the same port/seq watermark as prune_aborted,
+// extended to also include read_times keys as "in-flight" anchors.
+// -----------------------------------------------------------------------
+
+// Trace PA1: read_aborted entry retained while a lower-seq tx from the same
+// port is still active in read_times (min_active = low seq → higher seq retained).
+#[test]
+fn prune_read_aborted_retains_entry_when_older_tx_in_read_times() {
+    let mut s = shard();
+    // P1_S3 was a read-only tx that expired → in read_aborted.
+    s.read_aborted.insert(P1_S3);
+    // P1_S1 is still mid-read (in read_times).
+    s.read_times.insert(P1_S1, Instant::now());
+    // min_active_seq[port1] = 1; seq3 >= 1 → retained.
+    s.prune_read_aborted();
+    assert!(
+        s.read_aborted.contains(&P1_S3),
+        "P1_S3 must be retained: P1_S1 (seq=1) is still active in read_times"
+    );
+}
+
+// Trace PA2: read_aborted entry pruned when no activity from that port remains.
+#[test]
+fn prune_read_aborted_drops_entry_when_port_has_no_active_tx() {
+    let mut s = shard();
+    s.read_aborted.insert(P1_S1);
+    // No write_buff, prepared, or read_times entries from port 1.
+    s.prune_read_aborted();
+    assert!(
+        !s.read_aborted.contains(&P1_S1),
+        "P1_S1 must be pruned: no active tx from port 1"
+    );
+}
+
+// Trace PA2b: read_aborted entry with lower seq pruned when higher-seq tx is
+// active (min_active_seq = higher seq > aborted seq → drop).
+#[test]
+fn prune_read_aborted_drops_lower_seq_when_higher_seq_active_in_read_times() {
+    let mut s = shard();
+    s.read_aborted.insert(P1_S1); // seq=1
+    s.read_times.insert(P1_S3, Instant::now()); // seq=3 active
+                                                // min_active_seq[port1] = 3; seq1 < 3 → drop.
+    s.prune_read_aborted();
+    assert!(
+        !s.read_aborted.contains(&P1_S1),
+        "P1_S1 must be pruned: min_active_seq=3 > seq=1"
+    );
+}
+
+// Trace PA3: read_aborted entry retained while a lower-seq tx from the same
+// port is active in write_buff (write-path tx also anchors the watermark).
+#[test]
+fn prune_read_aborted_retains_entry_when_older_tx_in_write_buff() {
+    let mut s = shard();
+    s.read_aborted.insert(P1_S3); // seq=3 read-expired
+    s.write_buff.entry(P1_S1).or_default().insert(K1, v(10)); // seq=1 active
+                                                              // min_active_seq[port1] = 1; seq3 >= 1 → retained.
+    s.prune_read_aborted();
+    assert!(
+        s.read_aborted.contains(&P1_S3),
+        "P1_S3 must be retained: P1_S1 (seq=1) is active in write_buff"
+    );
+}
+
+// Trace PA4: prune_read_aborted does not touch the write-path aborted set.
+#[test]
+fn prune_read_aborted_does_not_affect_write_path_aborted_set() {
+    let mut s = shard();
+    // P1_S1 in write-path aborted; P1_S3 in read_aborted; no active tx.
+    s.aborted.insert(P1_S1);
+    s.read_aborted.insert(P1_S3);
+    s.prune_read_aborted();
+    // read_aborted drops P1_S3 (no active tx from port 1).
+    assert!(!s.read_aborted.contains(&P1_S3));
+    // aborted set is not touched by prune_read_aborted.
+    assert!(
+        s.aborted.contains(&P1_S1),
+        "aborted set must be unchanged by prune_read_aborted"
+    );
+}
+
 // Trace WF1: write does not disturb write_buff (bypass path — no write_buff entry created).
 #[test]
 fn write_and_fast_commit_does_not_use_write_buff() {
