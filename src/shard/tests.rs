@@ -3657,7 +3657,11 @@ fn handle_update_aborts_read_expired_transaction() {
 
     // handle_update must return Abort — T1 is read-expired and must not write.
     let r = s.handle_update(T1, 5, K1, v(99));
-    assert_eq!(r, UpdateResult::Abort, "read-expired tx must not buffer writes");
+    assert_eq!(
+        r,
+        UpdateResult::Abort,
+        "read-expired tx must not buffer writes"
+    );
     assert!(
         !s.write_buff.contains_key(&T1),
         "no write must be buffered for a read-expired tx"
