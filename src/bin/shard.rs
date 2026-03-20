@@ -11,6 +11,7 @@ use heltes_db::shard::{
 struct ShardArgs {
     addr: SocketAddr,
     prepare_ttl: Duration,
+    read_ttl: Duration,
     max_writes_per_tx: usize,
 }
 
@@ -19,6 +20,7 @@ fn parse_args(
 ) -> Result<ShardArgs, Box<dyn std::error::Error>> {
     let mut addr: SocketAddr = "[::1]:50051".parse().unwrap();
     let mut prepare_ttl = Duration::from_secs(30);
+    let mut read_ttl = Duration::from_secs(30);
     let mut max_writes_per_tx: usize = usize::MAX;
     let mut addr_parsed = false;
 
@@ -30,6 +32,13 @@ fn parse_args(
                     .parse()
                     .map_err(|_| format!("invalid --prepare-ttl-ms value: {v}"))?;
                 prepare_ttl = Duration::from_millis(ms);
+            }
+            "--read-ttl-ms" => {
+                let v = args.next().ok_or("--read-ttl-ms requires a value")?;
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --read-ttl-ms value: {v}"))?;
+                read_ttl = Duration::from_millis(ms);
             }
             "--max-writes-per-tx" => {
                 let v = args.next().ok_or("--max-writes-per-tx requires a value")?;
@@ -45,6 +54,9 @@ fn parse_args(
                 eprintln!("  BIND_ADDR              bind address (default: [::1]:50051)");
                 eprintln!(
                     "  --prepare-ttl-ms N     prepared-entry TTL in milliseconds (default: 30000)"
+                );
+                eprintln!(
+                    "  --read-ttl-ms N        read-tracking entry TTL in milliseconds (default: 30000)"
                 );
                 eprintln!(
                     "  --max-writes-per-tx N  max distinct keys per tx write buffer (default: unlimited)"
@@ -64,6 +76,7 @@ fn parse_args(
     Ok(ShardArgs {
         addr,
         prepare_ttl,
+        read_ttl,
         max_writes_per_tx,
     })
 }
@@ -73,11 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ShardArgs {
         addr,
         prepare_ttl,
+        read_ttl,
         max_writes_per_tx,
     } = parse_args(std::env::args().skip(1))?;
 
     eprintln!(
-        "shard listening on {addr} (prepare_ttl={prepare_ttl:?}, max_writes_per_tx={})",
+        "shard listening on {addr} (prepare_ttl={prepare_ttl:?}, read_ttl={read_ttl:?}, max_writes_per_tx={})",
         if max_writes_per_tx == usize::MAX {
             "unlimited".to_string()
         } else {
@@ -87,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = ShardState::new();
     state.prepare_ttl = prepare_ttl;
+    state.read_ttl = read_ttl;
     state.max_writes_per_tx = max_writes_per_tx;
 
     Server::builder()
@@ -105,12 +120,14 @@ mod tests {
         s.iter().map(|a| a.to_string())
     }
 
-    // Trace: default invocation — no flags → default addr, 30 s TTL, unlimited writes.
+    // Trace: default invocation — no flags → default addr, 30 s prepare TTL,
+    // 30 s read TTL, unlimited writes.
     #[test]
     fn defaults() {
         let a = parse_args(std::iter::empty()).unwrap();
         assert_eq!(a.addr, "[::1]:50051".parse::<SocketAddr>().unwrap());
         assert_eq!(a.prepare_ttl, Duration::from_secs(30));
+        assert_eq!(a.read_ttl, Duration::from_secs(30));
         assert_eq!(a.max_writes_per_tx, usize::MAX);
     }
 
@@ -173,5 +190,52 @@ mod tests {
     #[test]
     fn unknown_flag() {
         assert!(parse_args(args(&["--unknown"])).is_err());
+    }
+
+    // ── --read-ttl-ms traces (derived from ShardExpireRead ER1-ER4 in spec) ──
+
+    // Trace ER1: --read-ttl-ms overrides the read-tracking entry TTL.
+    // Models the operator tuning the window after which ShardExpireRead fires.
+    #[test]
+    fn read_ttl_flag_sets_value() {
+        let a = parse_args(args(&["--read-ttl-ms", "5000"])).unwrap();
+        assert_eq!(a.read_ttl, Duration::from_millis(5000));
+        // prepare_ttl must be unaffected.
+        assert_eq!(a.prepare_ttl, Duration::from_secs(30));
+    }
+
+    // Trace ER1 (edge): read_ttl and prepare_ttl are independent — setting one
+    // must not affect the other.
+    #[test]
+    fn read_ttl_and_prepare_ttl_are_independent() {
+        let a = parse_args(args(&[
+            "--prepare-ttl-ms",
+            "1000",
+            "--read-ttl-ms",
+            "2000",
+        ]))
+        .unwrap();
+        assert_eq!(a.prepare_ttl, Duration::from_millis(1000));
+        assert_eq!(a.read_ttl, Duration::from_millis(2000));
+    }
+
+    // Trace ER1 (edge): read_ttl=0 is a valid value — operators may want
+    // instant expiry of idle readers (aggressive compaction).
+    #[test]
+    fn read_ttl_zero_is_valid() {
+        let a = parse_args(args(&["--read-ttl-ms", "0"])).unwrap();
+        assert_eq!(a.read_ttl, Duration::ZERO);
+    }
+
+    // Trace ER1 (error path): --read-ttl-ms with no following value → error.
+    #[test]
+    fn read_ttl_missing_value() {
+        assert!(parse_args(args(&["--read-ttl-ms"])).is_err());
+    }
+
+    // Trace ER1 (error path): --read-ttl-ms with non-numeric value → error.
+    #[test]
+    fn read_ttl_invalid_value() {
+        assert!(parse_args(args(&["--read-ttl-ms", "not_a_number"])).is_err());
     }
 }
