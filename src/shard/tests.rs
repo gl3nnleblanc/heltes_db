@@ -3541,7 +3541,11 @@ fn expire_reads_aborts_evicted_transaction() {
 
     // Subsequent handle_read must return Abort, not re-register.
     let r = s.handle_read(T1, 5, K1, &no_inquiries());
-    assert_eq!(r, ReadResult::Abort, "evicted tx must return Abort on re-read");
+    assert_eq!(
+        r,
+        ReadResult::Abort,
+        "evicted tx must return Abort on re-read"
+    );
     assert!(
         !s.read_start_ts.contains_key(&T1),
         "expired tx must not re-enter read_start_ts"
@@ -3624,7 +3628,11 @@ fn expire_reads_does_not_evict_write_path_transactions() {
     );
     // handle_read must not return Abort for T1 (it can still proceed).
     let r = s.handle_read(T1, 5, K1, &no_inquiries());
-    assert_ne!(r, ReadResult::Abort, "write-path tx must not be aborted by expire_reads");
+    assert_ne!(
+        r,
+        ReadResult::Abort,
+        "write-path tx must not be aborted by expire_reads"
+    );
 }
 
 // -----------------------------------------------------------------------
