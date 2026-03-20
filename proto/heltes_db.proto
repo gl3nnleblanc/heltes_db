@@ -269,4 +269,10 @@ message InquireReply {
     uint64 committed_at = 1;  // Committed(ts)
     Active active       = 2;  // Active
   }
+  // Responding coordinator's Lamport clock after handling the inquiry.
+  // The caller must advance its own clock to max(local_clock, coordinator_clock)
+  // so that future Begin calls assign start_ts values that are visible past all
+  // commits the responding coordinator has seen.  Matches the cc field added to
+  // InquireReply in the TLA+ spec (CoordHandleInquire / CoordSyncFromInquireReply).
+  uint64 coordinator_clock = 3;
 }

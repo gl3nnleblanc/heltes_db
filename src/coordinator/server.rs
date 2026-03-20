@@ -157,6 +157,15 @@ impl CoordinatorServer {
         .await
         .map_err(|_| Status::deadline_exceeded("coordinator inquire timed out"))??
         .into_inner();
+        // CoordSyncFromInquireReply: advance local clock from peer's coordinator_clock.
+        // Closes the SI gap where coordinator A (clock=100) could assign start_ts=101
+        // after learning coordinator B committed at ts=5000.
+        if reply.coordinator_clock > 0 {
+            let mut state = self.state.lock();
+            if reply.coordinator_clock > state.clock {
+                state.clock = reply.coordinator_clock;
+            }
+        }
         use crate::proto::inquire_reply::Status as S;
         match reply.status {
             Some(S::CommittedAt(ts)) => Ok(InquiryStatus::Committed(ts)),
@@ -816,6 +825,7 @@ impl CoordinatorService for CoordinatorServer {
         };
         Ok(Response::new(InquireReply {
             status: Some(proto_status),
+            coordinator_clock: self.state.lock().clock,
         }))
     }
 }
@@ -1369,6 +1379,273 @@ mod tests {
             reply.unwrap_err().code(),
             tonic::Code::DeadlineExceeded,
             "must return deadline_exceeded, not another error"
+        );
+    }
+
+    // ── Lamport clock propagation through InquireReply ──────────────────────
+    //
+    // Traces CI1–CI4 (CoordSyncFromInquireReply in TLA+ spec).
+    //
+    // The inquire() handler must echo the coordinator's current clock in
+    // coordinator_clock so that callers (resolve_inquiry) can advance their own
+    // Lamport clock from the response.  This closes the SI gap where coordinator A
+    // at clock=100 could assign start_ts=101, missing writes committed by
+    // coordinator B at ts=102–5000.
+
+    // Trace CI1: inquire() on a committed tx returns coordinator_clock matching
+    // the coordinator's current clock (which must be >= commit_ts after collect_prepare_reply
+    // advanced it to commit_ts + 1).
+    #[tokio::test]
+    async fn inquire_returns_coordinator_clock_for_committed_tx() {
+        let server = test_server(50052, vec![]);
+        let tx_id: u64 = (50052u64 << 32) | 1;
+        {
+            let mut st = server.state.lock();
+            st.clock = 6;
+            st.start_tx(tx_id);
+            st.add_participant(tx_id, 50051);
+            let _ = st.begin_commit(tx_id);
+            // Prepare reply at ts=7 → commit_ts=7, clock advances to 8.
+            let _ = st.collect_prepare_reply(tx_id, 50051, Some(7));
+            let _ = st.send_commit(tx_id);
+        }
+        let reply = server
+            .inquire(Request::new(InquireRequest {
+                tx_id,
+                prep_ts: 1,
+                hop_count: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // coordinator_clock must be >= commit_ts=7 so callers advance past it.
+        assert!(
+            reply.coordinator_clock >= 7,
+            "coordinator_clock must be >= commit_ts; got {}",
+            reply.coordinator_clock
+        );
+    }
+
+    // Trace CI2: inquire() on an active (unknown) tx returns coordinator_clock
+    // reflecting the current coordinator clock, not zero.
+    #[tokio::test]
+    async fn inquire_returns_coordinator_clock_for_active_tx() {
+        let server = test_server(50052, vec![]);
+        // Advance clock manually to 42.
+        server.state.lock().clock = 42;
+        let reply = server
+            .inquire(Request::new(InquireRequest {
+                tx_id: 0xDEAD,
+                prep_ts: 5,
+                hop_count: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            reply.coordinator_clock, 42,
+            "coordinator_clock must match coordinator's current clock"
+        );
+    }
+
+    // Trace CI3 (monotone): resolve_inquiry for a remote peer advances local
+    // clock when coordinator_clock > current clock (cross-coordinator sync).
+    //
+    // Models CoordSyncFromInquireReply: coord A (clock=1) learns from coord B's
+    // InquireReply that B's clock=5 → A advances to 5.
+    #[tokio::test]
+    async fn resolve_inquiry_advances_local_clock_from_coordinator_clock() {
+        use crate::proto::coordinator_service_server::{
+            CoordinatorService, CoordinatorServiceServer as CoordSvcServer,
+        };
+
+        // Spawn a peer coordinator that always replies Active with coordinator_clock=5.
+        struct FixedClockCoord;
+        #[tonic::async_trait]
+        impl CoordinatorService for FixedClockCoord {
+            async fn begin(
+                &self,
+                _: Request<TxBeginRequest>,
+            ) -> Result<Response<TxBeginReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn read(
+                &self,
+                _: Request<TxReadRequest>,
+            ) -> Result<Response<TxReadReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn update(
+                &self,
+                _: Request<TxUpdateRequest>,
+            ) -> Result<Response<TxUpdateReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn commit(
+                &self,
+                _: Request<TxCommitRequest>,
+            ) -> Result<Response<TxCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn abort(
+                &self,
+                _: Request<TxAbortRequest>,
+            ) -> Result<Response<TxAbortReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn write_and_commit(
+                &self,
+                _: Request<TxWriteAndCommitRequest>,
+            ) -> Result<Response<TxWriteAndCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn inquire(
+                &self,
+                _: Request<InquireRequest>,
+            ) -> Result<Response<InquireReply>, Status> {
+                use crate::proto::inquire_reply::Status as S;
+                Ok(Response::new(InquireReply {
+                    status: Some(S::Active(Active {})),
+                    coordinator_clock: 5,
+                }))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_port = peer_addr.port();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CoordSvcServer::new(FixedClockCoord))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Local coordinator starts with clock=1.
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],
+            vec![peer_addr],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+        server.state.lock().clock = 1;
+
+        // tx_id encodes peer_port → resolve_inquiry routes to the fixed-clock peer.
+        let tx_id: u64 = (peer_port as u64) << 32 | 99;
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        assert!(result.is_ok(), "resolve_inquiry must succeed");
+
+        // Clock must have advanced to 5 (peer's coordinator_clock).
+        assert_eq!(
+            server.state.lock().clock,
+            5,
+            "local clock must advance to peer's coordinator_clock after cross-coordinator inquiry"
+        );
+    }
+
+    // Trace CI4 (monotone): if coordinator_clock from peer <= local clock, clock does NOT decrease.
+    #[tokio::test]
+    async fn resolve_inquiry_does_not_decrease_local_clock_from_coordinator_clock() {
+        use crate::proto::coordinator_service_server::{
+            CoordinatorService, CoordinatorServiceServer as CoordSvcServer,
+        };
+
+        // Peer replies with coordinator_clock=3.
+        struct LowClockCoord;
+        #[tonic::async_trait]
+        impl CoordinatorService for LowClockCoord {
+            async fn begin(
+                &self,
+                _: Request<TxBeginRequest>,
+            ) -> Result<Response<TxBeginReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn read(
+                &self,
+                _: Request<TxReadRequest>,
+            ) -> Result<Response<TxReadReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn update(
+                &self,
+                _: Request<TxUpdateRequest>,
+            ) -> Result<Response<TxUpdateReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn commit(
+                &self,
+                _: Request<TxCommitRequest>,
+            ) -> Result<Response<TxCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn abort(
+                &self,
+                _: Request<TxAbortRequest>,
+            ) -> Result<Response<TxAbortReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn write_and_commit(
+                &self,
+                _: Request<TxWriteAndCommitRequest>,
+            ) -> Result<Response<TxWriteAndCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn inquire(
+                &self,
+                _: Request<InquireRequest>,
+            ) -> Result<Response<InquireReply>, Status> {
+                use crate::proto::inquire_reply::Status as S;
+                Ok(Response::new(InquireReply {
+                    status: Some(S::Active(Active {})),
+                    coordinator_clock: 3,
+                }))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_port = peer_addr.port();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CoordSvcServer::new(LowClockCoord))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Local coordinator starts with clock=100 (well above peer's 3).
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![],
+            vec![peer_addr],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+        server.state.lock().clock = 100;
+
+        let tx_id: u64 = (peer_port as u64) << 32 | 99;
+        let result = server.resolve_inquiry(tx_id, 1).await;
+        assert!(result.is_ok(), "resolve_inquiry must succeed");
+
+        // Clock must NOT decrease — monotone property.
+        assert_eq!(
+            server.state.lock().clock,
+            100,
+            "local clock must not decrease when peer coordinator_clock is lower"
         );
     }
 

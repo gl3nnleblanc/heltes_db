@@ -185,8 +185,8 @@ PrepareReply(id, r)      == [type |-> "PREPARE_REPLY",    txid |-> id, result |-
 CommitMsg(id, t)         == [type |-> "COMMIT",           txid |-> id, ts |-> t]
 AbortMsg(id)             == [type |-> "ABORT",            txid |-> id]
 InquireMsg(id, t, asker, hops) == [type |-> "INQUIRE",    txid |-> id, ts |-> t,    from |-> asker, hops |-> hops]
-InquireReply(id, r, t, dest) ==
-    [type |-> "INQUIRE_REPLY", txid |-> id, result |-> r, ts |-> t, to |-> dest]
+InquireReply(id, r, t, dest, cc) ==
+    [type |-> "INQUIRE_REPLY", txid |-> id, result |-> r, ts |-> t, to |-> dest, cc |-> cc]
 \* Fast-path: combines Prepare+Commit into a single shard-side operation.
 \* Reply ts = NONE means the shard aborted; ts ≠ NONE is the assigned commit timestamp.
 FastCommitMsg(id)        == [type |-> "FAST_COMMIT",       txid |-> id]
@@ -634,19 +634,19 @@ CoordSendCommit(id) ==
 \*   T3: hops=MaxHops → action DISABLED → CoordAbortReadDeadline fires for reader
 \*   T4: A↔B mutual inquiry with hops=0 on both sides → both resolve immediately
 CoordHandleInquire(id, s) ==
-    LET coord == CoordOf[id]
-        m     == CHOOSE msg \in msgs :
-                     /\ msg.type = "INQUIRE"
-                     /\ msg.txid = id
-                     /\ msg.from = s
-        reply == IF is_committed[id]
-                 THEN InquireReply(id, "COMMITTED", commit_t[id], s)
-                 ELSE InquireReply(id, "ACTIVE",    NONE,         s)
+    LET coord  == CoordOf[id]
+        m      == CHOOSE msg \in msgs :
+                      /\ msg.type = "INQUIRE"
+                      /\ msg.txid = id
+                      /\ msg.from = s
+        new_cc == IF m.ts > c_clock[coord] THEN m.ts ELSE c_clock[coord]
+        reply  == IF is_committed[id]
+                  THEN InquireReply(id, "COMMITTED", commit_t[id], s, new_cc)
+                  ELSE InquireReply(id, "ACTIVE",    NONE,         s, new_cc)
     IN
     /\ \E msg \in msgs : msg.type = "INQUIRE" /\ msg.txid = id /\ msg.from = s
     /\ m.hops < MaxHops
-    /\ c_clock' = [c_clock EXCEPT ![coord] =
-                      IF m.ts > c_clock[coord] THEN m.ts ELSE c_clock[coord]]
+    /\ c_clock' = [c_clock EXCEPT ![coord] = new_cc]
     /\ Send(reply)
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, read_participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers>>
@@ -1172,6 +1172,42 @@ CoordSyncClockBatch(coord, S) ==
     /\ UNCHANGED <<start_t, commit_t, is_committed, participants, read_participants, tx_state,
                    s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers, msgs>>
 
+\* CoordSyncFromInquireReply(coord, prepId, s): coordinator coord advances its
+\* Lamport clock from the cc field carried in an INQUIRE_REPLY for prepId to
+\* shard s.
+\*
+\* In the implementation, resolve_inquiry() proxies the inquiry to the owning
+\* coordinator via gRPC.  The response now carries coordinator_clock, which the
+\* caller uses to advance its own clock:
+\*   c_clock = max(c_clock, reply.coordinator_clock)
+\* This closes the SI gap where coordinator A (clock=100) could assign
+\* start_ts=101 after learning that coordinator B committed at ts=5000.
+\*
+\* This action is only meaningful when coord /= CoordOf[prepId]: if coord owns
+\* prepId, CoordHandleInquire already advanced the same clock.  The guard
+\* new_cc > c_clock[coord] ensures the action is disabled once coord's clock is
+\* already >= reply.cc, bounding the state space.
+\*
+\* Concrete execution traces (Phase 2):
+\*   CI1: CommittedAt reply, cc=5 > c_clock[coord]=1 → c_clock[coord] advances to 5
+\*   CI2: Active reply,      cc=3 > c_clock[coord]=1 → c_clock[coord] advances to 3
+\*   CI3: reply.cc <= c_clock[coord] → action DISABLED (monotone, no advancement)
+\*   CI4: two coordinators, t2 on c2 commits, t1 on c1 reads → c1 syncs from c2's cc
+CoordSyncFromInquireReply(coord, prepId, s) ==
+    LET reply  == CHOOSE msg \in msgs :
+                      /\ msg.type = "INQUIRE_REPLY"
+                      /\ msg.txid = prepId
+                      /\ msg.to   = s
+        new_cc == IF reply.cc > c_clock[coord] THEN reply.cc ELSE c_clock[coord]
+    IN
+    /\ \E msg \in msgs : msg.type = "INQUIRE_REPLY" /\ msg.txid = prepId /\ msg.to = s
+    /\ coord /= CoordOf[prepId]        \* cross-coordinator case only
+    /\ new_cc > c_clock[coord]         \* only fire when clock actually advances
+    /\ new_cc \in Timestamps           \* model-bounds guard (same as CoordSyncClockBatch)
+    /\ c_clock' = [c_clock EXCEPT ![coord] = new_cc]
+    /\ UNCHANGED <<start_t, commit_t, is_committed, participants, read_participants, tx_state,
+                   s_clock, versions, write_buff, write_key_owner, s_prepared, s_aborted, dirty_keys, s_readers, msgs>>
+
 ------------------------------------------------------------------------
 (* Next-state relation *)
 
@@ -1211,6 +1247,8 @@ Next ==
            ShardCompactVersions(s, k)
     \/ \E id \in TxIds, prepId \in TxIds, k \in Keys, s \in Shards :
            ShardSendInquire(s, id, prepId, k)
+    \/ \E coord \in Coordinators, prepId \in TxIds, s \in Shards :
+           CoordSyncFromInquireReply(coord, prepId, s)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
