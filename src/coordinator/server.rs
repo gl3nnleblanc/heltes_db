@@ -371,8 +371,19 @@ impl CoordinatorService for CoordinatorServer {
                         }));
                     }
                     Some(R::NeedsInquiry(NeedsInquirySet { tx_ids })) => {
-                        for id in tx_ids {
-                            let status = self.resolve_inquiry(id, start_ts).await?;
+                        // Resolve all inquiries concurrently.  Previously this was a
+                        // serial `for` loop; with N prepared writers it took N × RTT.
+                        // try_join_all fires all futures at once and completes in
+                        // max(RTTs), matching the TLA+ spec which allows CoordHandleInquire
+                        // to fire for each prepId in any non-deterministic order.
+                        let statuses = futures::future::try_join_all(
+                            tx_ids
+                                .iter()
+                                .copied()
+                                .map(|id| self.resolve_inquiry(id, start_ts)),
+                        )
+                        .await?;
+                        for (id, status) in tx_ids.into_iter().zip(statuses) {
                             let proto_status = match status {
                                 InquiryStatus::Committed(ts) => {
                                     crate::proto::inquiry_result::Status::CommittedAt(ts)
@@ -2320,6 +2331,327 @@ mod tests {
         assert!(
             read_aborted.lock().contains(&tx_id),
             "read shard must be notified"
+        );
+    }
+
+    // ── NeedsInquiry parallel resolution tests ────────────────────────────────
+    //
+    // TLA+ trace: ShardHandleRead → NeedsInquiry([id1, id2]) → CoordHandleInquire
+    // fires for both ids non-deterministically → ShardHandleRead retries →
+    // returns Value.  The coordinator must resolve all inquiries concurrently
+    // so total latency is O(max) not O(sum).
+    //
+    // Traces:
+    //   PI1 (single inquiry):   1 prepared writer → 1 resolve_inquiry → Value returned
+    //   PI2 (parallel timing):  2 slow peers (D each) → completed in ~D, not ~2D
+    //   PI3 (error propagation): 1 inquiry fails → read() propagates the error
+
+    /// A CoordinatorService mock that delays `delay` before answering Inquire.
+    /// All other RPCs hang indefinitely. Models a peer coordinator under load.
+    struct SlowInquireCoord {
+        delay: Duration,
+    }
+
+    #[tonic::async_trait]
+    impl CoordinatorService for SlowInquireCoord {
+        async fn begin(
+            &self,
+            _: Request<TxBeginRequest>,
+        ) -> Result<Response<TxBeginReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn read(&self, _: Request<TxReadRequest>) -> Result<Response<TxReadReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn update(
+            &self,
+            _: Request<TxUpdateRequest>,
+        ) -> Result<Response<TxUpdateReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn commit(
+            &self,
+            _: Request<TxCommitRequest>,
+        ) -> Result<Response<TxCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn abort(
+            &self,
+            _: Request<TxAbortRequest>,
+        ) -> Result<Response<TxAbortReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn write_and_commit(
+            &self,
+            _: Request<TxWriteAndCommitRequest>,
+        ) -> Result<Response<TxWriteAndCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn inquire(
+            &self,
+            _: Request<InquireRequest>,
+        ) -> Result<Response<InquireReply>, Status> {
+            tokio::time::sleep(self.delay).await;
+            use crate::proto::inquire_reply::Status as S;
+            Ok(Response::new(InquireReply {
+                status: Some(S::Active(Active {})),
+                coordinator_clock: 0,
+            }))
+        }
+    }
+
+    async fn spawn_slow_inquire_coord(delay: Duration) -> SocketAddr {
+        use crate::proto::coordinator_service_server::CoordinatorServiceServer as CoordSvcServer;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CoordSvcServer::new(SlowInquireCoord { delay }))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        addr
+    }
+
+    /// A shard that returns NeedsInquiry([needs_inquiry_ids]) on the first Read,
+    /// then Value(42) on all subsequent Reads.  Used to drive the NeedsInquiry
+    /// resolution loop with controlled inquiry tx_ids.
+    struct NeedsInquiryThenValueShard {
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+        needs_inquiry_ids: Vec<u64>,
+    }
+
+    #[tonic::async_trait]
+    impl ShardService for NeedsInquiryThenValueShard {
+        async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
+            use crate::proto::read_reply::Result as R;
+            let call = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(Response::new(ReadReply {
+                    result: Some(R::NeedsInquiry(NeedsInquirySet {
+                        tx_ids: self.needs_inquiry_ids.clone(),
+                    })),
+                }))
+            } else {
+                Ok(Response::new(ReadReply {
+                    result: Some(R::Value(42)),
+                }))
+            }
+        }
+        async fn update(&self, _: Request<UpdateRequest>) -> Result<Response<UpdateReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn prepare(
+            &self,
+            _: Request<PrepareRequest>,
+        ) -> Result<Response<crate::proto::PrepareReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn commit(
+            &self,
+            _: Request<ShardCommitRequest>,
+        ) -> Result<Response<CommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn abort(
+            &self,
+            _: Request<ShardAbortRequest>,
+        ) -> Result<Response<AbortReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn fast_commit(
+            &self,
+            _: Request<ShardFastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn write_and_fast_commit(
+            &self,
+            _: Request<ShardWriteAndFastCommitRequest>,
+        ) -> Result<Response<FastCommitReply>, Status> {
+            futures::future::pending().await
+        }
+        async fn get_clock(
+            &self,
+            _: Request<GetClockRequest>,
+        ) -> Result<Response<GetClockReply>, Status> {
+            Ok(Response::new(GetClockReply { clock: 0 }))
+        }
+    }
+
+    async fn spawn_needs_inquiry_then_value_shard(
+        needs_inquiry_ids: Vec<u64>,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shard = NeedsInquiryThenValueShard {
+            call_count: Arc::clone(&call_count),
+            needs_inquiry_ids,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ShardSvcServer::new(shard))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        (addr, call_count)
+    }
+
+    // Trace PI1 (correctness): single NeedsInquiry tx_id resolved → read returns
+    // Value(42) and the shard is called exactly twice (once for NeedsInquiry,
+    // once with the resolved inquiry_results).
+    #[tokio::test]
+    async fn needs_inquiry_single_resolved_returns_value() {
+        // Spawn a slow coordinator to own tx_id1 (delay 1 ms — just functional).
+        let peer = spawn_slow_inquire_coord(Duration::from_millis(1)).await;
+        let peer_port = peer.port();
+
+        // tx_id owned by peer_port.
+        let inquiry_tx: u64 = (peer_port as u64) << 32 | 1;
+
+        let (shard_addr, call_count) = spawn_needs_inquiry_then_value_shard(vec![inquiry_tx]).await;
+
+        let tx_id: u64 = (50052u64 << 32) | 99;
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![shard_addr],
+            vec![peer],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+        server.state.lock().start_tx(tx_id);
+
+        let reply = server
+            .read(Request::new(TxReadRequest { tx_id, key: 1 }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        use crate::proto::tx_read_reply::Result as TR;
+        assert_eq!(
+            reply.result,
+            Some(TR::Value(42)),
+            "read must return Value(42) after NeedsInquiry resolved"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "shard must be called exactly twice: once for NeedsInquiry, once for Value"
+        );
+    }
+
+    // Trace PI2 (parallel timing): two slow peer coordinators, each delayed D ms.
+    // Sequential resolution takes ~2D; parallel resolution takes ~D.
+    // The test asserts total elapsed < 1.5D, which sequential cannot satisfy.
+    #[tokio::test]
+    async fn needs_inquiry_multiple_resolved_in_parallel() {
+        const DELAY: Duration = Duration::from_millis(100);
+
+        // Two slow peers, each delaying DELAY before responding to inquire.
+        let peer1 = spawn_slow_inquire_coord(DELAY).await;
+        let peer2 = spawn_slow_inquire_coord(DELAY).await;
+        let port1 = peer1.port();
+        let port2 = peer2.port();
+
+        let inquiry_tx1: u64 = (port1 as u64) << 32 | 1;
+        let inquiry_tx2: u64 = (port2 as u64) << 32 | 2;
+
+        let (shard_addr, _) =
+            spawn_needs_inquiry_then_value_shard(vec![inquiry_tx1, inquiry_tx2]).await;
+
+        let tx_id: u64 = (50052u64 << 32) | 99;
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![shard_addr],
+            vec![peer1, peer2],
+            Duration::from_secs(5), // shard_rpc_timeout — long enough for slow peers
+            Duration::from_secs(5), // read_loop_timeout
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+        server.state.lock().start_tx(tx_id);
+
+        let t_start = std::time::Instant::now();
+        let reply = server
+            .read(Request::new(TxReadRequest { tx_id, key: 1 }))
+            .await
+            .unwrap()
+            .into_inner();
+        let elapsed = t_start.elapsed();
+
+        use crate::proto::tx_read_reply::Result as TR;
+        assert_eq!(
+            reply.result,
+            Some(TR::Value(42)),
+            "read must succeed after parallel inquiry resolution"
+        );
+
+        // Sequential would take ~2*DELAY; parallel takes ~DELAY.
+        // Allow 1.5*DELAY as the threshold so sequential reliably fails
+        // and parallel reliably passes even with scheduling overhead.
+        let threshold = DELAY + DELAY / 2;
+        assert!(
+            elapsed < threshold,
+            "NeedsInquiry resolution must be parallel: elapsed {elapsed:?} \
+             exceeded threshold {threshold:?} (sequential would take ~{:?})",
+            DELAY * 2
+        );
+    }
+
+    // Trace PI3 (error propagation): if one inquiry RPC times out, the error
+    // is propagated and read() returns an error (not a stale Value).
+    // Models CoordAbortReadDeadline: the per-inquiry shard_rpc_timeout bounds
+    // how long a single hung coordinator can delay the read.
+    #[tokio::test]
+    async fn needs_inquiry_error_on_hung_coordinator_propagates() {
+        // A peer that hangs indefinitely (transport-level, never replies).
+        let hang = spawn_hang_server().await;
+        let hang_port = hang.port();
+        let inquiry_tx: u64 = (hang_port as u64) << 32 | 1;
+
+        let (shard_addr, _) = spawn_needs_inquiry_then_value_shard(vec![inquiry_tx]).await;
+
+        let tx_id: u64 = (50052u64 << 32) | 99;
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![shard_addr],
+            vec![hang],
+            Duration::from_millis(20), // shard_rpc_timeout — short so test is fast
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+        server.state.lock().start_tx(tx_id);
+
+        // The first shard read returns NeedsInquiry; resolve_inquiry times out;
+        // the error must propagate out of read().
+        let result = tokio::time::timeout(
+            Duration::from_millis(500), // outer guard — must not hang
+            server.read(Request::new(TxReadRequest { tx_id, key: 1 })),
+        )
+        .await
+        .expect("read() must not hang beyond the test guard");
+
+        // resolve_inquiry propagates the timeout as an error.
+        assert!(
+            result.is_err(),
+            "read() must return an error when an inquiry coordinator hangs"
         );
     }
 }
