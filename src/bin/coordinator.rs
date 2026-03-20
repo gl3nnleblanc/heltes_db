@@ -10,6 +10,7 @@ use heltes_db::coordinator::{
 
 /// Usage: coordinator [BIND_ADDR] [SHARD_ADDR...] [-- PEER_COORD_ADDR...]
 ///                    [--shard-rpc-timeout-ms N] [--read-loop-timeout-ms N]
+///                    [--clock-sync-interval-ms N]
 ///
 ///   coordinator [::1]:50052 [::1]:50051 -- [::1]:50053
 ///
@@ -17,19 +18,28 @@ use heltes_db::coordinator::{
 /// SHARD_ADDRs are the shards this coordinator routes to (before --).
 /// PEER_COORD_ADDRs (after --) are other coordinators this one may forward
 /// cross-coordinator Inquire RPCs to. Required for multi-coordinator deployments.
-/// --shard-rpc-timeout-ms  per-RPC shard timeout in milliseconds (default: 30000)
-/// --read-loop-timeout-ms  read inquiry-loop timeout in milliseconds (default: 30000)
+/// --shard-rpc-timeout-ms    per-RPC shard timeout in milliseconds (default: 30000)
+/// --read-loop-timeout-ms    read inquiry-loop timeout in milliseconds (default: 30000)
+/// --clock-sync-interval-ms  background clock re-sync cadence in milliseconds (default: 100)
+///                           Set to 0 to disable periodic re-sync (startup sync only).
 struct CoordArgs {
     bind: SocketAddr,
     shard_addrs: Vec<SocketAddr>,
     peer_coordinator_addrs: Vec<SocketAddr>,
     shard_rpc_timeout: Duration,
     read_loop_timeout: Duration,
+    clock_sync_interval: Option<Duration>,
 }
+
+/// Default interval between background coordinator clock re-syncs.
+/// Matches the shard's DEFAULT_COMPACT_INTERVAL so both background tasks
+/// tick at the same cadence, keeping drift bounded to one compact interval.
+const DEFAULT_CLOCK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CoordArgs, Box<dyn std::error::Error>> {
     let mut shard_rpc_timeout = Duration::from_secs(30);
     let mut read_loop_timeout = Duration::from_secs(30);
+    let mut clock_sync_interval: Option<Duration> = Some(DEFAULT_CLOCK_SYNC_INTERVAL);
     let mut positional: Vec<String> = Vec::new();
 
     let mut args = args.peekable();
@@ -53,11 +63,25 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CoordArgs, Box<dyn s
                     .map_err(|_| format!("invalid --read-loop-timeout-ms value: {v}"))?;
                 read_loop_timeout = Duration::from_millis(ms);
             }
+            "--clock-sync-interval-ms" => {
+                let v = args
+                    .next()
+                    .ok_or("--clock-sync-interval-ms requires a value")?;
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --clock-sync-interval-ms value: {v}"))?;
+                clock_sync_interval = if ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(ms))
+                };
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "Usage: coordinator [BIND_ADDR] [SHARD_ADDR...] \
                      [-- PEER_COORD_ADDR...]\n\
-                     \x20              [--shard-rpc-timeout-ms N] [--read-loop-timeout-ms N]"
+                     \x20              [--shard-rpc-timeout-ms N] [--read-loop-timeout-ms N]\n\
+                     \x20              [--clock-sync-interval-ms N]"
                 );
                 std::process::exit(0);
             }
@@ -96,6 +120,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CoordArgs, Box<dyn s
         peer_coordinator_addrs,
         shard_rpc_timeout,
         read_loop_timeout,
+        clock_sync_interval,
     })
 }
 
@@ -107,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_coordinator_addrs,
         shard_rpc_timeout,
         read_loop_timeout,
+        clock_sync_interval,
     } = parse_args(std::env::args().skip(1))?;
 
     let my_port = bind.port();
@@ -114,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "coordinator listening on {bind} (port={my_port}, shards={shard_addrs:?}, \
          peers={peer_coordinator_addrs:?}, shard_rpc_timeout={shard_rpc_timeout:?}, \
-         read_loop_timeout={read_loop_timeout:?})"
+         read_loop_timeout={read_loop_timeout:?}, clock_sync_interval={clock_sync_interval:?})"
     );
 
     if shard_addrs.is_empty() {
@@ -135,6 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This prevents CommittedConflict aborts when joining a cluster that already
     // has committed transactions (CoordSyncClock in TLA+).
     server.sync_clock_from_shards().await;
+
+    // Start periodic background clock re-sync so the coordinator's clock stays
+    // current even when it processes only reads and no commits.
+    // Matches CoordSyncClockBatch in TLA+, which fires any number of times.
+    if let Some(interval) = clock_sync_interval {
+        server.start_clock_sync(interval);
+    }
 
     Server::builder()
         .add_service(CoordinatorServiceServer::new(server))
@@ -161,6 +194,33 @@ mod tests {
         assert!(a.peer_coordinator_addrs.is_empty());
         assert_eq!(a.shard_rpc_timeout, Duration::from_secs(30));
         assert_eq!(a.read_loop_timeout, Duration::from_secs(30));
+        assert_eq!(a.clock_sync_interval, Some(DEFAULT_CLOCK_SYNC_INTERVAL));
+    }
+
+    // Trace: --clock-sync-interval-ms overrides the periodic sync cadence.
+    #[test]
+    fn custom_clock_sync_interval() {
+        let a = parse_args(args(&["--clock-sync-interval-ms", "500"])).unwrap();
+        assert_eq!(a.clock_sync_interval, Some(Duration::from_millis(500)));
+    }
+
+    // Trace: --clock-sync-interval-ms 0 disables periodic sync (startup sync only).
+    #[test]
+    fn clock_sync_interval_zero_disables_periodic_sync() {
+        let a = parse_args(args(&["--clock-sync-interval-ms", "0"])).unwrap();
+        assert_eq!(a.clock_sync_interval, None);
+    }
+
+    // Trace: --clock-sync-interval-ms with no value → error.
+    #[test]
+    fn clock_sync_interval_missing_value() {
+        assert!(parse_args(args(&["--clock-sync-interval-ms"])).is_err());
+    }
+
+    // Trace: --clock-sync-interval-ms with non-numeric value → error.
+    #[test]
+    fn clock_sync_interval_invalid_value() {
+        assert!(parse_args(args(&["--clock-sync-interval-ms", "abc"])).is_err());
     }
 
     // Trace: --shard-rpc-timeout-ms overrides the shard RPC timeout.

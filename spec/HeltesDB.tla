@@ -1111,6 +1111,14 @@ ShardPruneOrphanedPort(s, coord) ==
 \* The action is monotone: it can only increase c_clock, and it never touches any
 \* transaction state, so SI1–SI4 remain satisfied in all executions that include it.
 \*
+\* This action models BOTH the one-time startup sync (coordinator joins a cluster
+\* that has already processed transactions) AND periodic re-sync (a coordinator
+\* that processes only reads and no commits never advances c_clock through its own
+\* commit path; without periodic sync its c_clock drifts behind s_clock values
+\* advanced by other coordinators, producing start_ts values that miss recent
+\* writes from peer coordinators).  The Next relation admits this action at any
+\* step, so TLC verifies safety across both patterns in a single model.
+\*
 \* Without this sync, a fresh coordinator starts with c_clock=0 and assigns
 \* start_ts values near 0; shards that have already committed versions at higher
 \* timestamps then reject every write with CommittedConflict.
@@ -1125,6 +1133,10 @@ ShardPruneOrphanedPort(s, coord) ==
 \*   SC1: S = Shards → c_clock = max(c_clock, max(s_clock)+1) (normal startup)
 \*   SC2: S = {} → c_clock unchanged (all shards timed out; coordinator safe to proceed)
 \*   SC3: S ⊂ Shards → c_clock advances past responding shards only (partial timeout)
+\*   SC4: CoordSyncClockBatch fires with c_clock already > s_clock[s]+1 → clock unchanged
+\*        (monotone: periodic re-sync must never decrease c_clock even if shard is behind)
+\*   SC5: CoordSyncClockBatch fires twice in sequence → second fire is idempotent when
+\*        s_clock has not advanced (c_clock stays at prior synced value)
 CoordSyncClockBatch(coord, S) ==
     LET newClock == IF S = {} THEN c_clock[coord]
                    ELSE MaxOf({s_clock[s] + 1 : s \in S} \cup {c_clock[coord]})

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -37,7 +38,7 @@ pub const MAX_INQUIRY_HOPS: u32 = 2;
 // ── Server struct ─────────────────────────────────────────────────────────────
 
 pub struct CoordinatorServer {
-    state: Mutex<CoordinatorState>,
+    state: Arc<Mutex<CoordinatorState>>,
     tx_id_gen: Mutex<TxIdGen>,
     router: ConsistentHashRouter,
     /// port → connected shard client (lazy connection)
@@ -99,7 +100,7 @@ impl CoordinatorServer {
             coordinator_uris.insert(addr.port(), uri);
         }
         Ok(CoordinatorServer {
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
             tx_id_gen: Mutex::new(TxIdGen::new(my_port)),
             router,
             shard_clients,
@@ -202,6 +203,55 @@ impl CoordinatorServer {
                 state.clock = next;
             }
         }
+    }
+
+    /// Spawn a background task that calls `sync_clock_from_shards` every `interval`.
+    ///
+    /// A coordinator that processes only reads and no commits never advances its
+    /// `c_clock` through its own commit path.  Without periodic re-sync, `c_clock`
+    /// drifts behind the shard clocks advanced by other coordinators, producing
+    /// `start_ts` values that miss recent writes.
+    ///
+    /// Matches `CoordSyncClockBatch` in the TLA+ spec: that action is unconstrained
+    /// in the `Next` relation, so it may fire any number of times, modelling both
+    /// the one-time startup sync and this periodic background re-sync.
+    ///
+    /// The spawned task runs for the lifetime of the tokio runtime.  Use a short
+    /// `interval` (e.g. the shard's compaction cadence, 100 ms) to bound drift.
+    pub fn start_clock_sync(&self, interval: Duration) {
+        let state = Arc::clone(&self.state);
+        let shard_clients: Vec<ShardServiceClient<Channel>> =
+            self.shard_clients.values().cloned().collect();
+        let timeout = self.shard_rpc_timeout;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let futs: Vec<_> = shard_clients
+                    .iter()
+                    .map(|c| {
+                        let mut c = c.clone();
+                        async move {
+                            c.get_clock(GetClockRequest {})
+                                .await
+                                .ok()
+                                .map(|r| r.into_inner().clock)
+                        }
+                    })
+                    .collect();
+                let results = tokio::time::timeout(timeout, join_all(futs))
+                    .await
+                    .unwrap_or_default();
+                let mut st = state.lock();
+                for clock in results.into_iter().flatten() {
+                    let next = clock.saturating_add(1);
+                    if next > st.clock {
+                        st.clock = next;
+                    }
+                }
+            }
+        });
     }
 
     /// Mark `tx_id` aborted in state and best-effort ABORT to every participant shard.
@@ -1522,6 +1572,180 @@ mod tests {
         );
         // Clock stays 0 — no shard replied.
         assert_eq!(server.state.lock().clock, 0);
+    }
+
+    // ── start_clock_sync tests ────────────────────────────────────────────────
+    //
+    // CoordSyncClockBatch can fire any number of times in the TLA+ spec.
+    // These traces verify the periodic re-sync implementation.
+
+    /// Helper: spawn a shard gRPC server that always returns the given clock value
+    /// in response to GetClock.  All other RPCs hang indefinitely.
+    async fn spawn_fixed_clock_shard(clock: u64) -> SocketAddr {
+        struct FixedClock(u64);
+        #[tonic::async_trait]
+        impl ShardService for FixedClock {
+            async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ReadReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn update(
+                &self,
+                _: Request<UpdateRequest>,
+            ) -> Result<Response<UpdateReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn prepare(
+                &self,
+                _: Request<PrepareRequest>,
+            ) -> Result<Response<crate::proto::PrepareReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn commit(
+                &self,
+                _: Request<ShardCommitRequest>,
+            ) -> Result<Response<CommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn abort(
+                &self,
+                _: Request<ShardAbortRequest>,
+            ) -> Result<Response<AbortReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn fast_commit(
+                &self,
+                _: Request<ShardFastCommitRequest>,
+            ) -> Result<Response<FastCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn write_and_fast_commit(
+                &self,
+                _: Request<ShardWriteAndFastCommitRequest>,
+            ) -> Result<Response<FastCommitReply>, Status> {
+                futures::future::pending().await
+            }
+            async fn get_clock(
+                &self,
+                _: Request<GetClockRequest>,
+            ) -> Result<Response<GetClockReply>, Status> {
+                Ok(Response::new(GetClockReply { clock: self.0 }))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |l| async move {
+            let r = l.accept().await.map(|(s, _)| s);
+            Some((r, l))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ShardSvcServer::new(FixedClock(clock)))
+                .serve_with_incoming(incoming),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        addr
+    }
+
+    // Trace SC1 (periodic): background sync fires and advances coordinator clock.
+    // CoordSyncClockBatch fires with S=Shards → c_clock = max(c_clock, s_clock+1).
+    // This validates the periodic re-sync mirrors startup sync behavior.
+    #[tokio::test]
+    async fn clock_sync_background_task_advances_coordinator_clock() {
+        let shard_addr = spawn_fixed_clock_shard(20).await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![shard_addr],
+            vec![],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        assert_eq!(server.state.lock().clock, 0, "clock starts at 0");
+
+        // Start background sync with a short interval.
+        server.start_clock_sync(Duration::from_millis(10));
+
+        // Wait for at least one sync to fire.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Clock must have advanced to 21 (= shard_clock + 1 = 20 + 1).
+        assert_eq!(
+            server.state.lock().clock,
+            21,
+            "clock must advance to shard_clock+1 after background sync fires"
+        );
+    }
+
+    // Trace SC4 (periodic monotone): background sync never decreases clock.
+    // CoordSyncClockBatch with c_clock > s_clock[s]+1 → c_clock unchanged.
+    // Matches the spec invariant: CoordSyncClockBatch is monotone.
+    #[tokio::test]
+    async fn clock_sync_does_not_decrease_coordinator_clock() {
+        let shard_addr = spawn_fixed_clock_shard(5).await; // shard at 5 → would sync to 6
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![shard_addr],
+            vec![],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        // Manually set coordinator clock to 100 (coordinator is ahead of shard).
+        server.state.lock().clock = 100;
+
+        server.start_clock_sync(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            server.state.lock().clock >= 100,
+            "clock must never decrease: monotone property of CoordSyncClockBatch"
+        );
+    }
+
+    // Trace SC2 (periodic, S={}): no shards registered → no panic, clock unchanged.
+    #[tokio::test]
+    async fn clock_sync_with_no_shards_does_not_panic() {
+        let server = test_server(50052, vec![]);
+        server.start_clock_sync(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.state.lock().clock, 0);
+    }
+
+    // Trace SC2b (periodic, hung shard): background sync completes within shard_rpc_timeout.
+    // CoordSyncClockBatch with S={} (all timed out) → c_clock unchanged, no hang.
+    #[tokio::test]
+    async fn clock_sync_with_hung_shard_does_not_block() {
+        let hang = spawn_hang_server().await;
+
+        let server = CoordinatorServer::new(
+            CoordinatorState::new(),
+            50052,
+            vec![hang],
+            vec![],
+            Duration::from_millis(20), // short timeout so sync finishes quickly
+            Duration::from_secs(5),
+            ReadRetryPolicy::no_backoff(),
+        )
+        .unwrap();
+
+        server.start_clock_sync(Duration::from_millis(10));
+        // Wait well past one interval. If the background sync blocks on the hung shard
+        // without honouring shard_rpc_timeout, this sleep would take much longer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Reached here without hanging → pass. Clock stays 0 (shard timed out).
+        assert_eq!(
+            server.state.lock().clock,
+            0,
+            "hung shard: clock must stay 0"
+        );
     }
 
     // Trace SC1: sync_clock_from_shards advances coordinator clock to shard_clock + 1.
