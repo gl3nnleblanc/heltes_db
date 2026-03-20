@@ -352,7 +352,7 @@ impl ShardState {
         key: Key,
         value: Value,
     ) -> UpdateResult {
-        if self.aborted.contains(&tx_id) {
+        if self.aborted.contains(&tx_id) || self.read_aborted.contains(&tx_id) {
             return UpdateResult::Abort;
         }
 
@@ -425,7 +425,7 @@ impl ShardState {
     /// Assigns a prepare timestamp = clock + 1, advances clock, records
     /// (tx_id, prep_t) in `self.prepared`.
     pub fn handle_prepare(&mut self, tx_id: TxId) -> PrepareResult {
-        if self.aborted.contains(&tx_id) {
+        if self.aborted.contains(&tx_id) || self.read_aborted.contains(&tx_id) {
             return PrepareResult::Abort;
         }
         // Idempotent: if already prepared, return existing timestamp.
@@ -454,7 +454,7 @@ impl ShardState {
             self.aborted.remove(&tx_id);
             return CommitResult::Abort;
         }
-        if self.aborted.contains(&tx_id) {
+        if self.aborted.contains(&tx_id) || self.read_aborted.contains(&tx_id) {
             return CommitResult::Abort;
         }
         if let Some(writes) = self.write_buff.remove(&tx_id) {

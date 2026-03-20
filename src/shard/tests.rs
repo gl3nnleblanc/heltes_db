@@ -3635,6 +3635,94 @@ fn expire_reads_does_not_evict_write_path_transactions() {
     );
 }
 
+// ── read_aborted propagation: UH1–UH3 ───────────────────────────────────
+// Derived from spec: ShardHandleUpdate and ShardHandlePrepare are both
+// guarded by `id \notin s_aborted[s]`, which ShardExpireRead populates.
+// The implementation equivalent is read_aborted, which must be checked
+// by handle_update, handle_prepare, and handle_commit.
+
+// Trace UH1: read-expired tx must not be able to buffer a write.
+// Without the fix, handle_update succeeds (only checks `aborted`, not
+// `read_aborted`), buffering a write at a potentially-compacted snapshot.
+#[test]
+fn handle_update_aborts_read_expired_transaction() {
+    let mut s = shard();
+    // T1 reads K1 — enters read tracking.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+
+    // Expire T1's read tracking.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+    assert!(s.read_aborted.contains(&T1));
+
+    // handle_update must return Abort — T1 is read-expired and must not write.
+    let r = s.handle_update(T1, 5, K1, v(99));
+    assert_eq!(r, UpdateResult::Abort, "read-expired tx must not buffer writes");
+    assert!(
+        !s.write_buff.contains_key(&T1),
+        "no write must be buffered for a read-expired tx"
+    );
+}
+
+// Trace UH2: read-expired tx must not be able to prepare.
+// Spec: ShardHandlePrepare guarded by `id \notin s_aborted[s]`.
+#[test]
+fn handle_prepare_aborts_read_expired_transaction() {
+    let mut s = shard();
+    // T1 reads K1 — enters read tracking.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+
+    // Expire T1's read tracking.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+    assert!(s.read_aborted.contains(&T1));
+
+    // Directly inject a write buffer entry to simulate the scenario where
+    // handle_update somehow succeeded (old code) before the prepare call.
+    s.write_buff.insert(T1, {
+        let mut wb = std::collections::HashMap::new();
+        wb.insert(K1, v(99));
+        wb
+    });
+
+    // handle_prepare must return Abort — T1 is read-expired.
+    let r = s.handle_prepare(T1);
+    assert_eq!(r, PrepareResult::Abort, "read-expired tx must not prepare");
+    assert!(
+        !s.prepared.contains_key(&T1),
+        "no prepare entry must exist for a read-expired tx"
+    );
+}
+
+// Trace UH3: read-expired tx must not commit even if it somehow reached
+// the commit stage. handle_commit must also check read_aborted.
+#[test]
+fn handle_commit_aborts_read_expired_transaction() {
+    let mut s = shard();
+    // T1 reads K1 — enters read tracking.
+    s.handle_read(T1, 5, K1, &no_inquiries());
+
+    // Expire T1's read tracking.
+    s.force_read_time(T1, Instant::now() - Duration::from_secs(999_999));
+    s.expire_reads(Instant::now());
+    assert!(s.read_aborted.contains(&T1));
+
+    // Directly inject a write buffer to simulate a zombie write.
+    s.write_buff.insert(T1, {
+        let mut wb = std::collections::HashMap::new();
+        wb.insert(K1, v(99));
+        wb
+    });
+
+    // handle_commit must return Abort and must not install the write.
+    let r = s.handle_commit(T1, 10);
+    assert_eq!(r, CommitResult::Abort, "read-expired tx must not commit");
+    assert!(
+        s.versions.get(&K1).map(|vs| vs.is_empty()).unwrap_or(true),
+        "no version must be installed for a read-expired tx"
+    );
+}
+
 // -----------------------------------------------------------------------
 // handle_write_and_fast_commit — single-write fast path
 // -----------------------------------------------------------------------
